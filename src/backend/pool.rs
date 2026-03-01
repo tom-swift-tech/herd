@@ -1,8 +1,6 @@
 use crate::config::Backend;
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use anyhow::Result;
 
 #[derive(Debug, Clone)]
 pub struct BackendState {
@@ -22,6 +20,7 @@ pub struct GpuMetrics {
     pub temperature: f32,
 }
 
+#[derive(Clone)]
 pub struct BackendPool {
     backends: Arc<RwLock<Vec<BackendState>>>,
 }

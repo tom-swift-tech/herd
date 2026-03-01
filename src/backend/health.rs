@@ -1,9 +1,7 @@
 use crate::backend::BackendPool;
-use crate::config::Backend;
-use anyhow::Result;
 use std::time::Duration;
 use tokio::time::interval;
-use tracing::{info, warn};
+use tracing::warn;
 
 pub struct HealthChecker {
     client: reqwest::Client,

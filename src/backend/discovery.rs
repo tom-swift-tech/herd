@@ -3,7 +3,7 @@ use anyhow::Result;
 use serde::Deserialize;
 use std::time::Duration;
 use tokio::time::interval;
-use tracing::{info, warn};
+use tracing::info;
 
 #[derive(Debug, Deserialize)]
 struct OllamaModels {
@@ -13,17 +13,6 @@ struct OllamaModels {
 #[derive(Debug, Deserialize)]
 struct OllamaModel {
     name: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct OllamaRunning {
-    models: Vec<OllamaRunningModel>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OllamaRunningModel {
-    name: String,
-    size: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,13 +63,13 @@ impl ModelDiscovery {
             if let Some(state) = pool.get(&name).await {
                 // Discover available models
                 if let Err(e) = self.discover_models(&pool, &state.config).await {
-                    warn!("Failed to discover models for {}: {}", name, e);
+                    tracing::warn!("Failed to discover models for {}: {}", name, e);
                 }
 
                 // Discover GPU metrics if configured
                 if let Some(ref gpu_url) = state.config.gpu_hot_url {
                     if let Err(e) = self.discover_gpu_metrics(&pool, &name, gpu_url).await {
-                        warn!("Failed to get GPU metrics for {}: {}", name, e);
+                        tracing::warn!("Failed to get GPU metrics for {}: {}", name, e);
                     }
                 }
             }

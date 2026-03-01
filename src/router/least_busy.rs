@@ -1,14 +1,14 @@
 use crate::backend::BackendPool;
 use crate::router::Router;
-use anyhow::bail;
 use async_trait::async_trait;
+use std::sync::Arc;
 
 pub struct LeastBusyRouter {
-    pool: BackendPool,
+    pool: Arc<BackendPool>,
 }
 
 impl LeastBusyRouter {
-    pub fn new(pool: BackendPool) -> Self {
+    pub fn new(pool: Arc<BackendPool>) -> Self {
         Self { pool }
     }
 }

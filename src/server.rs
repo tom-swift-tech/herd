@@ -80,13 +80,22 @@ async fn proxy_handler(
 
     let url = format!("{}{}", backend_url, request.uri().path());
     
+    // Get method from original request
+    let method = match *request.method() {
+        axum::http::Method::GET => reqwest::Method::GET,
+        axum::http::Method::POST => reqwest::Method::POST,
+        axum::http::Method::PUT => reqwest::Method::PUT,
+        axum::http::Method::DELETE => reqwest::Method::DELETE,
+        _ => reqwest::Method::POST,
+    };
+    
     let body_bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
         .await
         .map_err(|_| axum::http::StatusCode::BAD_REQUEST)?;
 
     let response = state
         .client
-        .post(&url)
+        .request(method, &url)
         .body(body_bytes)
         .send()
         .await

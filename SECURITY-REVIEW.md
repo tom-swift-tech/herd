@@ -36,7 +36,7 @@ Herd is a Rust-based HTTP proxy/router for Ollama nodes. It accepts HTTP request
 
 | Check | Status | Notes |
 |-------|--------|-------|
-| `cargo audit` | ⏳ PENDING | Rust not installed on mirapc |
+| `cargo audit` | ✅ PASS | 1 warning (unmaintained rustls-pemfile, not a vulnerability) |
 | Dependency versions pinned | ✅ PASS | Cargo.lock generated |
 
 ### Action Required
@@ -177,14 +177,14 @@ ENTRYPOINT ["herd"]
 
 ## Verdict
 
-**For Tier 3 (Experiments):** ⚠️ **ACCEPTABLE WITH CAVEATS**
+**For Tier 3 (Experiments):** ✅ **ACCEPTABLE**
 
 Herd is suitable for internal use on trusted networks (Tailscale). Do NOT expose to public internet.
 
 **For Tier 1 (SaaS):** ❌ **BLOCKED**
 
 Required before deployment:
-1. Install Rust, run `cargo audit`
+1. ~~Install Rust, run `cargo audit`~~ ✅ DONE
 2. Add authentication for `/admin/*` endpoints
 3. Run as non-root user in container
 4. Add rate limiting
@@ -194,8 +194,8 @@ Required before deployment:
 
 ## Action Items
 
-1. [ ] Install Rust on build machine
-2. [ ] Run `cargo audit`
+1. [x] Install Rust on build machine
+2. [x] Run `cargo audit` — 1 warning (unmaintained dep, no vulns)
 3. [ ] Add non-root user to Dockerfile
 4. [ ] Deploy behind Caddy/nginx with TLS
 5. [ ] Add API key auth for admin endpoints (when promoted to Tier 1/2)

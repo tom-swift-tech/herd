@@ -22,7 +22,7 @@ pub struct GpuMetrics {
 
 #[derive(Clone)]
 pub struct BackendPool {
-    backends: Arc<RwLock<Vec<BackendState>>>,
+    pub backends: Arc<RwLock<Vec<BackendState>>>,
 }
 
 impl BackendPool {

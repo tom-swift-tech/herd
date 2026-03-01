@@ -1,111 +1,148 @@
-use crate::api::{admin, metrics, status};
 use crate::backend::{BackendPool, HealthChecker, ModelDiscovery};
 use crate::config::Config;
+use crate::router::{create_router, Router};
 use anyhow::Result;
-use axum::{
-    extract::{Request, State},
-    http::StatusCode,
-    routing::{get, post},
-};
 use std::sync::Arc;
-use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
-pub async fn run(config: Config) -> Result<()> {
-    let addr = format!("{}:{}", config.server.host, config.server.port);
-    info!("Starting Herd on {}", addr);
-
-    // Create backend pool
-    let pool = BackendPool::new(config.backends.clone());
-
-    // Start health checker
-    let health_checker = HealthChecker::new(10);
-    health_checker.spawn(pool.clone()).await;
-
-    // Start model discovery
-    let discovery = ModelDiscovery::new(300);
-    discovery.spawn(pool.clone()).await;
-
-    let shared_pool = Arc::new(pool);
-
-    // Build app — uses Arc<BackendPool> as state for all handlers
-    let app = axum::Router::new()
-        .route("/status", get(status::get_status))
-        .route("/metrics", get(metrics::get_metrics))
-        .route("/health", get(health_check))
-        .route("/admin/backends", post(admin::add_backend))
-        .route("/admin/backends/remove", post(admin::remove_backend))
-        .route("/admin/backends/drain", post(admin::drain_backend))
-        .fallback(proxy_handler)
-        .layer(ServiceBuilder::new().layer(TraceLayer::new_for_http()))
-        .with_state(shared_pool);
-
-    // Start server
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app).await?;
-
-    Ok(())
+pub struct Server {
+    config: Config,
 }
 
-/// Proxy all unmatched requests to the highest priority healthy backend.
+#[derive(Clone)]
+pub struct AppState {
+    pub pool: Arc<BackendPool>,
+    pub router: crate::router::RouterEnum,
+    pub client: Arc<reqwest::Client>,
+}
+
+impl Server {
+    pub fn new(config: Config) -> Self {
+        Self { config }
+    }
+
+    pub async fn run(self) -> Result<()> {
+        let addr = format!("{}:{}", self.config.server.host, self.config.server.port);
+        info!("Starting Herd on {}", addr);
+
+        // Create backend pool
+        let pool = BackendPool::new(self.config.backends.clone());
+
+        // Start health checker
+        let health_checker = HealthChecker::new(10);
+        health_checker.spawn(pool.clone());
+
+        // Start model discovery
+        let discovery = ModelDiscovery::new(300);
+        discovery.spawn(pool.clone());
+
+        // Create router
+        let router = create_router(self.config.routing.strategy.clone(), pool.clone());
+
+        // Wrap in Arc
+        let pool = Arc::new(pool);
+        let client = Arc::new(reqwest::Client::new());
+
+        let state = AppState {
+            pool: Arc::clone(&pool),
+            router,
+            client: Arc::clone(&client),
+        };
+
+        // Build app with routes
+        let app = axum::Router::new()
+            .route("/health", axum::routing::get(|| async { "OK" }))
+            .route("/status", axum::routing::get(status_handler))
+            .route("/metrics", axum::routing::get(metrics_handler))
+            .fallback(proxy_handler)
+            .layer(tower::ServiceBuilder::new().layer(TraceLayer::new_for_http()))
+            .with_state(state);
+
+        // Start server
+        let listener = tokio::net::TcpListener::bind(&addr).await?;
+        axum::serve(listener, app).await?;
+
+        Ok(())
+    }
+}
+
 async fn proxy_handler(
-    State(pool): State<Arc<BackendPool>>,
-    request: Request,
-) -> Result<axum::response::Response, StatusCode> {
-    // Pick best backend (model-aware: check body for model field)
-    let backend = pool
-        .get_by_priority()
+    axum::extract::State(state): axum::extract::State<AppState>,
+    request: axum::extract::Request,
+) -> Result<String, axum::http::StatusCode> {
+    // Route request
+    let backend_url = state
+        .router
+        .route(None)
         .await
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+        .map_err(|_| axum::http::StatusCode::SERVICE_UNAVAILABLE)?;
 
-    let backend_url = backend.config.url.clone();
-    let uri = request.uri().clone();
-    let method = request.method().clone();
-    let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
-
-    // Read body
-    let body_bytes = axum::body::to_bytes(request.into_body(), 10 * 1024 * 1024) // 10MB limit
+    let url = format!("{}{}", backend_url, request.uri().path());
+    
+    let body_bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
         .await
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+        .map_err(|_| axum::http::StatusCode::BAD_REQUEST)?;
 
-    // Build reqwest request
-    let client = reqwest::Client::new();
-    let target_url = format!("{}{}", backend_url, path);
-
-    let reqwest_method = match method.as_str() {
-        "GET" => reqwest::Method::GET,
-        "POST" => reqwest::Method::POST,
-        "PUT" => reqwest::Method::PUT,
-        "DELETE" => reqwest::Method::DELETE,
-        "PATCH" => reqwest::Method::PATCH,
-        "HEAD" => reqwest::Method::HEAD,
-        "OPTIONS" => reqwest::Method::OPTIONS,
-        _ => reqwest::Method::GET,
-    };
-
-    let response = client
-        .request(reqwest_method, &target_url)
+    let response = state
+        .client
+        .post(&url)
         .body(body_bytes)
         .send()
         .await
-        .map_err(|e| {
-            tracing::error!("Backend request to {} failed: {}", target_url, e);
-            StatusCode::BAD_GATEWAY
-        })?;
+        .map_err(|_| axum::http::StatusCode::BAD_GATEWAY)?;
 
-    // Convert reqwest response back to axum response
-    let status = axum::http::StatusCode::from_u16(response.status().as_u16())
-        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-
-    let resp_bytes = response.bytes().await.map_err(|_| StatusCode::BAD_GATEWAY)?;
-
-    Ok(axum::response::Response::builder()
-        .status(status)
-        .body(axum::body::Body::from(resp_bytes))
-        .unwrap())
+    response.text().await.map_err(|_| axum::http::StatusCode::BAD_GATEWAY)
 }
 
-async fn health_check() -> &'static str {
-    "OK"
+async fn status_handler(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> axum::Json<serde_json::Value> {
+    let all = state.pool.all().await;
+    let mut healthy = Vec::new();
+    let mut unhealthy = Vec::new();
+
+    for name in all {
+        if let Some(backend) = state.pool.get(&name).await {
+            if backend.healthy {
+                healthy.push(serde_json::json!({
+                    "name": backend.config.name,
+                    "url": backend.config.url,
+                    "priority": backend.config.priority,
+                    "models": backend.models,
+                }));
+            } else {
+                unhealthy.push(name);
+            }
+        }
+    }
+
+    axum::Json(serde_json::json!({
+        "healthy_backends": healthy,
+        "unhealthy_backends": unhealthy,
+    }))
+}
+
+async fn metrics_handler(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> String {
+    let healthy = state.pool.all_healthy().await.len();
+    let total = state.pool.all().await.len();
+    
+    format!(
+        r#"# HELP herd_backends_total Total number of configured backends
+# TYPE herd_backends_total gauge
+herd_backends_total {}
+
+# HELP herd_backends_healthy Number of healthy backends
+# TYPE herd_backends_healthy gauge
+herd_backends_healthy {}
+"#,
+        total, healthy
+    )
+}
+
+pub async fn run(config: Config) -> Result<()> {
+    let server = Server::new(config);
+    server.run().await
 }

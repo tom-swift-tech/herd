@@ -1,14 +1,14 @@
 use crate::backend::BackendPool;
 use crate::router::Router;
 use async_trait::async_trait;
-use std::sync::Arc;
 
+#[derive(Clone)]
 pub struct ModelAwareRouter {
-    pool: Arc<BackendPool>,
+    pool: BackendPool,
 }
 
 impl ModelAwareRouter {
-    pub fn new(pool: Arc<BackendPool>) -> Self {
+    pub fn new(pool: BackendPool) -> Self {
         Self { pool }
     }
 }

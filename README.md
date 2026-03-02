@@ -1,17 +1,32 @@
 # 🦙 Herd
 
-**Intelligent Ollama router with GPU awareness.**
+[![GitHub stars](https://img.shields.io/github/stars/swift-innovate/herd?style=social)](https://github.com/swift-innovate/herd/stargazers)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.70+-orange.svg)](https://www.rust-lang.org)
 
-Route your llama herd with intelligence — priority routing, circuit breakers, model awareness, and real-time GPU metrics.
+**Intelligent Ollama router with GPU awareness, analytics, and real-time monitoring.**
+
+Route your llama herd with intelligence — priority routing, circuit breakers, model awareness, real-time GPU metrics, and beautiful dashboards.
 
 ## Features
 
+### Core Routing
 - **Priority-based routing** — Route to the best GPU first
 - **Circuit breaker** — Auto-recover from failed nodes
 - **Model-aware** — Route to nodes with models already loaded
+- **Model homing** — Auto-load default models on idle nodes
+- **Hot reload** — Add/remove nodes without restart via API
+
+### Observability (New in v0.2.0) 📊
+- **Request analytics** — JSONL logging with 7-day auto-retention
+- **Interactive dashboard** — Real-time charts with Chart.js
+  - Request volume timeline (last 20 minutes)
+  - Requests by model (top 5)
+  - Requests by backend
 - **GPU metrics** — Real-time VRAM, utilization, temperature
+- **Latency tracking** — P50, P95, P99 percentiles
+- **Update checker** — Automatic GitHub release notifications
 - **Prometheus metrics** — `/metrics` endpoint for Grafana
-- **Hot reload** — Add/remove nodes without restart
 
 ## Quick Start
 
@@ -73,10 +88,68 @@ observability:
 |----------|-------------|
 | `GET /` | Proxy to highest priority backend |
 | `POST /api/*` | Forward Ollama API requests |
-| `GET /status` | Node health + GPU metrics |
+| `GET /dashboard` | Interactive analytics dashboard 📊 **New!** |
+| `GET /status` | Node health + GPU metrics (JSON) |
+| `GET /analytics?hours=N` | Request stats, latency, timeline **New!** |
+| `GET /update` | Check for new releases **New!** |
 | `GET /metrics` | Prometheus metrics |
 | `GET /health` | K8s liveness probe |
-| `POST /admin/backends` | Add/remove backends at runtime |
+| `POST /admin/backends` | Add backend at runtime |
+| `GET /admin/backends/:name` | Get backend details |
+| `PUT /admin/backends/:name` | Update backend config |
+| `DELETE /admin/backends/:name` | Remove backend |
+
+## Analytics & Monitoring (v0.2.0)
+
+### Dashboard
+Access the interactive dashboard at `http://your-herd:40114/dashboard`
+
+**Features:**
+- Real-time node status with GPU metrics
+- Live request volume chart (updates every 30s)
+- Top 5 models by request count
+- Backend utilization distribution
+- Model homing status and idle timers
+- One-click backend management (add/edit/remove)
+- Automatic update notifications
+
+### Request Logging
+All proxied requests are logged to `~/.herd/requests.jsonl`:
+
+```json
+{"timestamp":1709395200,"model":"glm-4.7-flash:latest","backend":"citadel-5090","duration_ms":234,"status":"success","path":"/api/generate"}
+```
+
+**Auto-cleanup:** Logs older than 7 days are automatically pruned at 3 AM daily.
+
+### Analytics API
+Query statistics programmatically:
+
+```bash
+# Last 24 hours (default)
+curl http://localhost:40114/analytics
+
+# Last hour
+curl http://localhost:40114/analytics?hours=1
+
+# Response
+{
+  "total_requests": 1523,
+  "latency_p50": 145,
+  "latency_p95": 892,
+  "latency_p99": 1204,
+  "model_counts": {
+    "glm-4.7-flash:latest": 892,
+    "qwen2.5-coder:32b": 431,
+    "llama3.1:8b": 200
+  },
+  "backend_counts": {
+    "citadel-5090": 1203,
+    "minipc-4080": 320
+  },
+  "timeline": [[1709395200, 45], [1709395260, 52], ...]
+}
+```
 
 ## Model Homing
 

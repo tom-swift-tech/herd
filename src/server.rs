@@ -108,6 +108,7 @@ impl Server {
             .route("/metrics", axum::routing::get(metrics_handler))
             .route("/analytics", axum::routing::get(analytics_handler))
             .route("/update", axum::routing::get(update_check_handler))
+            .route("/gpu", axum::routing::get(gpu_handler))
             // Dashboard
             .route("/dashboard", axum::routing::get(dashboard_handler))
             // Admin API
@@ -357,6 +358,27 @@ async fn update_check_handler() -> axum::Json<serde_json::Value> {
                 "error": format!("Failed to check for updates: {}", e)
             }))
         }
+    }
+}
+
+async fn gpu_handler(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> axum::Json<serde_json::Value> {
+    // Try to fetch GPU data from hot-gpu at 100.107.157.73:1312
+    match state
+        .client
+        .get("http://100.107.157.73:1312/api/gpu-data")
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            match resp.json::<serde_json::Value>().await {
+                Ok(data) => axum::Json(data),
+                Err(_) => axum::Json(serde_json::json!({"available": false, "error": "Failed to parse GPU data"})),
+            }
+        }
+        _ => axum::Json(serde_json::json!({"available": false, "error": "hot-gpu not reachable"})),
     }
 }
 

@@ -545,10 +545,30 @@
 
         async function refresh() {
             try {
-                const res = await fetch('/status');
-                const data = await res.json();
+                const [statusRes, gpuRes] = await Promise.all([
+                    fetch('/status'),
+                    fetch('/gpu').catch(() => null),
+                ]);
+                const data = await statusRes.json();
                 const all = [...(data.healthy_backends || []), ...(data.unhealthy_backends || [])];
                 const timeout = data.idle_timeout_minutes || 30;
+
+                // Build a map of backend name -> first GPU from /gpu endpoint
+                let gpuMap = {};
+                if (gpuRes && gpuRes.ok) {
+                    const gpuData = await gpuRes.json();
+                    if (gpuData.available && gpuData.backends) {
+                        for (const [name, backendData] of Object.entries(gpuData.backends)) {
+                            const gpus = Array.isArray(backendData.gpus) ? backendData.gpus : Object.values(backendData.gpus || {});
+                            if (gpus.length > 0) gpuMap[name] = gpus[0];
+                        }
+                    }
+                }
+
+                // Merge /gpu data onto each backend (prefer cached gpu_metrics, fall back to live /gpu)
+                for (const b of all) {
+                    if (!b.gpu && gpuMap[b.name]) b.gpu = gpuMap[b.name];
+                }
 
                 document.getElementById('strategy').textContent = data.routing_strategy || '--';
                 document.getElementById('idle-timeout').textContent = timeout;

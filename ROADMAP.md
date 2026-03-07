@@ -1,6 +1,6 @@
 # Herd Roadmap
 
-**Updated:** March 6, 2026
+**Updated:** March 7, 2026
 
 ## Vision
 
@@ -27,19 +27,21 @@ No cloud dependency. No API keys exposed. Full local control.
 
 ### v0.3.0 — Routing & Reliability (Target: April 2026)
 
-- Retry loop with configurable attempt count
-- Request timeout enforcement per routing strategy
-- Weighted round-robin routing strategy
+- ~~Retry loop with configurable attempt count~~ ✅ (shipped v0.2.1)
+- ~~Request timeout enforcement per routing strategy~~ ✅ (shipped v0.2.1)
+- ~~Weighted round-robin routing strategy~~ ✅
+- ~~OpenAI `/v1/chat/completions` full compatibility layer~~ ✅ (pulled forward from v0.4.0)
+- ~~Rate limiting (global token bucket)~~ ✅ (pulled forward from v0.5.0)
+- ~~Model filter (regex-based per-backend)~~ ✅
+- ~~Dashboard polish (stats, tabs, latency percentiles, mobile responsive)~~ ✅
 - Backend tagging and tag-based routing
 - Health check endpoint customization (configurable path and expected status)
 - Hot-reload configuration without restart
 
 ### v0.4.0 — Observability & Operations (Q2 2026)
 
-- OpenAI `/v1/chat/completions` full compatibility layer
 - Prometheus-native metrics export
 - Request tracing with correlation IDs
-- Dashboard improvements (latency graphs, per-model analytics)
 - Log rotation and retention policies
 
 ### v0.5.0+ — Scale & Ecosystem (Q3 2026)

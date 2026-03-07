@@ -122,6 +122,7 @@ impl Server {
             .route("/dashboard", axum::routing::get(dashboard_handler))
             // OpenAI-compatible API
             .route("/v1/models", axum::routing::get(openai::list_models))
+            .route("/v1/chat/completions", axum::routing::post(openai::chat_completions))
             // Update check
             .route("/update", axum::routing::get(update_check_handler))
             // GPU handler

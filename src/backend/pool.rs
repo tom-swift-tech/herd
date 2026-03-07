@@ -196,3 +196,139 @@ impl BackendPool {
         backends.len() < len_before
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Backend;
+    use std::time::Duration;
+
+    fn make_backend(name: &str, priority: u32) -> Backend {
+        Backend {
+            name: name.into(),
+            url: "http://localhost:11434".into(),
+            priority,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn add_and_remove_backend() {
+        let pool = BackendPool::new(vec![], 3, Duration::from_secs(60));
+
+        // Pool starts empty
+        assert!(pool.all().await.is_empty());
+
+        // Add a backend
+        pool.add(make_backend("gpu1", 100)).await;
+        let all = pool.all().await;
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0], "gpu1");
+
+        // Remove it
+        let removed = pool.remove("gpu1").await;
+        assert!(removed);
+        assert!(pool.all().await.is_empty());
+
+        // Removing non-existent returns false
+        let removed = pool.remove("gpu1").await;
+        assert!(!removed);
+    }
+
+    #[tokio::test]
+    async fn mark_healthy_unhealthy() {
+        let pool = BackendPool::new(
+            vec![make_backend("gpu1", 100)],
+            3,
+            Duration::from_secs(60),
+        );
+
+        // Initially healthy with failure_count 0
+        let state = pool.get("gpu1").await.unwrap();
+        assert!(state.healthy);
+        assert_eq!(state.failure_count, 0);
+
+        // One mark_unhealthy increments failure_count but keeps healthy (threshold=3)
+        pool.mark_unhealthy("gpu1").await;
+        let state = pool.get("gpu1").await.unwrap();
+        assert_eq!(state.failure_count, 1);
+        assert!(state.healthy);
+
+        // mark_healthy resets failure_count and keeps healthy
+        pool.mark_healthy("gpu1").await;
+        let state = pool.get("gpu1").await.unwrap();
+        assert_eq!(state.failure_count, 0);
+        assert!(state.healthy);
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_threshold() {
+        let pool = BackendPool::new(
+            vec![make_backend("gpu1", 100)],
+            3,
+            Duration::from_secs(60),
+        );
+
+        // Below threshold: still healthy
+        pool.mark_unhealthy("gpu1").await;
+        pool.mark_unhealthy("gpu1").await;
+        let state = pool.get("gpu1").await.unwrap();
+        assert_eq!(state.failure_count, 2);
+        assert!(state.healthy);
+
+        // At threshold: becomes unhealthy
+        pool.mark_unhealthy("gpu1").await;
+        let state = pool.get("gpu1").await.unwrap();
+        assert_eq!(state.failure_count, 3);
+        assert!(!state.healthy);
+    }
+
+    #[tokio::test]
+    async fn all_healthy_filters() {
+        let pool = BackendPool::new(
+            vec![make_backend("gpu1", 100), make_backend("gpu2", 50)],
+            1, // threshold of 1: single failure marks unhealthy
+            Duration::from_secs(60),
+        );
+
+        // Both healthy initially
+        let healthy = pool.all_healthy().await;
+        assert_eq!(healthy.len(), 2);
+
+        // Mark gpu1 unhealthy (threshold=1, so one call is enough)
+        pool.mark_unhealthy("gpu1").await;
+
+        let healthy = pool.all_healthy().await;
+        assert_eq!(healthy.len(), 1);
+        assert_eq!(healthy[0], "gpu2");
+
+        // all() still returns both
+        assert_eq!(pool.all().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn get_by_model_filters() {
+        let pool = BackendPool::new(
+            vec![make_backend("gpu1", 100), make_backend("gpu2", 50)],
+            3,
+            Duration::from_secs(60),
+        );
+
+        // No models loaded: get_by_model returns None
+        assert!(pool.get_by_model("llama3").await.is_none());
+
+        // Load model on gpu2 only
+        pool.update_models("gpu2", vec!["llama3".into()]).await;
+
+        let result = pool.get_by_model("llama3").await;
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().config.name, "gpu2");
+
+        // Load model on gpu1 as well; should prefer gpu1 (higher priority)
+        pool.update_models("gpu1", vec!["llama3".into()]).await;
+
+        let result = pool.get_by_model("llama3").await;
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().config.name, "gpu1");
+    }
+}

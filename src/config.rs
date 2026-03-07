@@ -88,6 +88,9 @@ pub enum RoutingStrategy {
     
     #[serde(rename = "least_busy")]
     LeastBusy,
+
+    #[serde(rename = "weighted_round_robin")]
+    WeightedRoundRobin,
 }
 
 fn default_strategy() -> RoutingStrategy { RoutingStrategy::ModelAware }

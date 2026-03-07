@@ -48,3 +48,69 @@ impl Router for ModelAwareRouter {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::BackendPool;
+    use crate::config::Backend;
+    use std::time::Duration;
+
+    fn make_backend(name: &str, priority: u32) -> Backend {
+        Backend {
+            name: name.into(),
+            url: "http://localhost:11434".into(),
+            priority,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn routes_to_backend_with_model() {
+        let pool = BackendPool::new(
+            vec![make_backend("gpu1", 100), make_backend("gpu2", 50)],
+            3,
+            Duration::from_secs(60),
+        );
+
+        // Only gpu2 has the model loaded
+        pool.update_models("gpu2", vec!["llama3".into()]).await;
+
+        let router = ModelAwareRouter::new(pool);
+        let result = router.route(Some("llama3")).await.unwrap();
+        assert_eq!(result.name, "gpu2");
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_priority() {
+        let pool = BackendPool::new(
+            vec![make_backend("gpu1", 100), make_backend("gpu2", 50)],
+            3,
+            Duration::from_secs(60),
+        );
+
+        // No backend has the requested model
+        let router = ModelAwareRouter::new(pool);
+        let result = router.route(Some("llama3")).await.unwrap();
+        // Falls back to highest priority
+        assert_eq!(result.name, "gpu1");
+    }
+
+    #[tokio::test]
+    async fn prefers_higher_priority_with_model() {
+        let pool = BackendPool::new(
+            vec![make_backend("gpu1", 100), make_backend("gpu2", 50)],
+            3,
+            Duration::from_secs(60),
+        );
+
+        // Both backends have the model loaded
+        pool.update_models("gpu1", vec!["llama3".into()]).await;
+        pool.update_models("gpu2", vec!["llama3".into()]).await;
+
+        let router = ModelAwareRouter::new(pool);
+        let result = router.route(Some("llama3")).await.unwrap();
+        // Should pick gpu1 since it has higher priority among model-bearing backends
+        assert_eq!(result.name, "gpu1");
+    }
+}

@@ -29,3 +29,70 @@ impl Router for PriorityRouter {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::BackendPool;
+    use crate::config::Backend;
+    use std::time::Duration;
+
+    fn make_backend(name: &str, priority: u32) -> Backend {
+        Backend {
+            name: name.into(),
+            url: "http://localhost:11434".into(),
+            priority,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn routes_to_highest_priority() {
+        let pool = BackendPool::new(
+            vec![make_backend("low", 10), make_backend("high", 100)],
+            3,
+            Duration::from_secs(60),
+        );
+        let router = PriorityRouter::new(pool);
+
+        let result = router.route(None).await.unwrap();
+        assert_eq!(result.name, "high");
+    }
+
+    #[tokio::test]
+    async fn skips_unhealthy_backends() {
+        let pool = BackendPool::new(
+            vec![make_backend("high", 100), make_backend("low", 10)],
+            1, // single failure marks unhealthy
+            Duration::from_secs(60),
+        );
+
+        // Mark the high-priority backend unhealthy
+        pool.mark_unhealthy("high").await;
+
+        let router = PriorityRouter::new(pool);
+        let result = router.route(None).await.unwrap();
+        assert_eq!(result.name, "low");
+    }
+
+    #[tokio::test]
+    async fn error_when_no_healthy() {
+        let pool = BackendPool::new(
+            vec![make_backend("only", 100)],
+            1,
+            Duration::from_secs(60),
+        );
+
+        pool.mark_unhealthy("only").await;
+
+        let router = PriorityRouter::new(pool);
+        let result = router.route(None).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("No healthy backends")
+        );
+    }
+}

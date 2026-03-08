@@ -4,7 +4,7 @@
 [![GitHub stars](https://img.shields.io/github/stars/swift-innovate/herd?style=social)](https://github.com/swift-innovate/herd/stargazers)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.70+-orange.svg)](https://www.rust-lang.org)
-[![Roadmap](https://img.shields.io/badge/roadmap-v0.3%20routing%20%26%20reliability-blue)](ROADMAP.md)
+[![Roadmap](https://img.shields.io/badge/roadmap-v0.4%20observability%20%26%20operations-blue)](ROADMAP.md)
 
 **Intelligent Ollama router with GPU awareness, analytics, and real-time monitoring.**
 
@@ -24,8 +24,11 @@ Route your llama herd with intelligence — priority routing, circuit breakers, 
 - **Rate limiting** — Global token-bucket rate limiter
 - **OpenAI-compatible** — Drop-in `/v1/chat/completions` endpoint
 
-### Observability (New in v0.2.0) 📊
-- **Request analytics** — JSONL logging with 7-day auto-retention
+### Observability 📊
+- **Prometheus metrics** — `/metrics` endpoint with request counters, backend gauges, and latency histogram
+- **Correlation IDs** — `X-Request-Id` header propagation (reuses client ID or generates UUID v4)
+- **Log rotation** — Size-based rotation with configurable retention (days, max size, max files)
+- **Request analytics** — JSONL logging with auto-retention
 - **Interactive dashboard** — Real-time charts with Chart.js
   - Request volume timeline (last 20 minutes)
   - Requests by model (top 5)
@@ -33,9 +36,8 @@ Route your llama herd with intelligence — priority routing, circuit breakers, 
 - **GPU metrics** — Real-time VRAM, utilization, temperature
 - **Latency tracking** — P50, P95, P99 percentiles
 - **Update checker** — Automatic GitHub release notifications
-- **Prometheus metrics** — `/metrics` endpoint for Grafana
 
-> **v0.3.0 is here.** Tag routing, weighted round-robin, hot-reload, and health check customization. See the [Roadmap](ROADMAP.md) for what's next.
+> **v0.4.0 is here.** Prometheus metrics, correlation IDs, and log rotation. See the [Roadmap](ROADMAP.md) for what's next.
 
 ## Quick Start
 
@@ -93,6 +95,9 @@ circuit_breaker:
 observability:
   metrics: true
   admin_api: true
+  log_retention_days: 7      # Auto-prune logs older than N days
+  log_max_size_mb: 100       # Rotate log file when it exceeds N MB
+  log_max_files: 5           # Keep N rotated log files
 ```
 
 ## API Endpoints
@@ -114,6 +119,21 @@ api_key: anything   # Ollama doesn't require auth; any value works
 | `POST /v1/completions` | Text completions (streaming supported) |
 
 All `/v1/*` requests use the same intelligent routing as native Ollama calls — model-aware, priority-based, with circuit breakers.
+
+### Correlation IDs
+
+Every request gets an `X-Request-Id` header for end-to-end tracing:
+
+```bash
+# Herd generates a UUID v4 if you don't provide one
+curl http://localhost:40114/v1/chat/completions -d '...'
+# Response includes: X-Request-Id: 550e8400-e29b-41d4-a716-446655440000
+
+# Or provide your own — Herd forwards it to the upstream backend
+curl -H "X-Request-Id: my-trace-123" http://localhost:40114/api/generate -d '...'
+```
+
+Request IDs are included in JSONL analytics logs for correlation across systems.
 
 ### All Endpoints
 
@@ -153,10 +173,13 @@ Access the interactive dashboard at `http://your-herd:40114/dashboard`
 All proxied requests are logged to `~/.herd/requests.jsonl`:
 
 ```json
-{"timestamp":1709395200,"model":"glm-4.7-flash:latest","backend":"citadel-5090","duration_ms":234,"status":"success","path":"/api/generate"}
+{"timestamp":1709395200,"model":"glm-4.7-flash:latest","backend":"citadel-5090","duration_ms":234,"status":"success","path":"/api/generate","request_id":"550e8400-e29b-41d4-a716-446655440000"}
 ```
 
-**Auto-cleanup:** Logs older than 7 days are automatically pruned at 3 AM daily.
+**Log management:**
+- Logs older than `log_retention_days` (default 7) are pruned daily at 3 AM
+- Log files are rotated when they exceed `log_max_size_mb` (default 100 MB)
+- Up to `log_max_files` (default 5) rotated files are kept
 
 ### Analytics API
 Query statistics programmatically:
@@ -309,6 +332,9 @@ Herd will route based on:
 | Tag-based routing | ✅ | ❌ |
 | Hot-reload config | ✅ | ❌ |
 | Rate limiting | ✅ | ❌ |
+| Prometheus metrics | ✅ | ❌ |
+| Correlation IDs | ✅ | ❌ |
+| Log rotation | ✅ | ❌ |
 | Language | Rust | Go |
 
 ## License

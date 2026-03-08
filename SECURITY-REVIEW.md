@@ -121,6 +121,20 @@ Herd runs HTTP on port 40114. For production:
 
 **Recommendation:** Filter sensitive fields from logs.
 
+**✅ PASS — Log Rotation (v0.4.0):**
+
+Log files are now managed with configurable rotation and retention:
+- Size-based rotation (`log_max_size_mb`, default 100 MB)
+- Rotated file count limit (`log_max_files`, default 5)
+- Time-based retention (`log_retention_days`, default 7 days)
+- Prevents unbounded disk usage from request logging
+
+**✅ PASS — Request Correlation (v0.4.0):**
+
+All requests are tagged with `X-Request-Id` (UUID v4) for end-to-end tracing.
+Request IDs are included in JSONL analytics logs. Note: correlation IDs may be
+logged alongside request metadata — ensure log access is restricted.
+
 ---
 
 ## 6. Container Security
@@ -169,7 +183,7 @@ ENTRYPOINT ["herd"]
 | Dependencies | ⏳ PENDING | Needs `cargo audit` |
 | Authentication | ✅ PASS | API key auth for admin/agent endpoints |
 | Input Validation | ⚠️ WARN | Acceptable for MVP |
-| Data Protection | ⚠️ WARN | HTTP only, logging concerns |
+| Data Protection | ⚠️ WARN | HTTP only, logging concerns (log rotation added v0.4.0) |
 | Container | ⚠️ WARN | Runs as root |
 | API Security | ✅ PASS | Auth + rate limiting implemented |
 

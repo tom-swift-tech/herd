@@ -124,10 +124,17 @@ impl Server {
         let recovery_time = parse_duration(&self.config.circuit_breaker.recovery_time)
             .unwrap_or(DEFAULT_RECOVERY_TIME);
 
-        // Validate: admin_api requires api_key
-        if self.config.observability.admin_api && self.config.server.api_key.is_none() {
-            anyhow::bail!("observability.admin_api is enabled but server.api_key is not set");
-        }
+        // Validate: admin_api requires api_key — disable gracefully if missing
+        let admin_api_enabled = if self.config.observability.admin_api
+            && self.config.server.api_key.is_none()
+        {
+            tracing::warn!(
+                "observability.admin_api is enabled but server.api_key is not set — disabling admin API"
+            );
+            false
+        } else {
+            self.config.observability.admin_api
+        };
 
         // Create backend pool with circuit breaker config
         let pool = BackendPool::new(
@@ -240,7 +247,7 @@ impl Server {
         }
 
         // Conditionally mount admin API (requires auth)
-        if self.config.observability.admin_api {
+        if admin_api_enabled {
             let admin_routes = axum::Router::new()
                 .route(
                     "/",

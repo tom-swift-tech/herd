@@ -69,7 +69,14 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let (config, config_path) = if let Some(config_path) = cli.config {
-        let config = Config::from_file(&config_path)?;
+        let config = match Config::from_file(&config_path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("Failed to load config from {:?}: {}", config_path, e);
+                tracing::info!("Starting with default configuration");
+                Config::default()
+            }
+        };
         (config, Some(config_path))
     } else {
         let mut config = Config::default();

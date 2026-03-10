@@ -6,6 +6,13 @@
 [![Rust](https://img.shields.io/badge/rust-1.70+-orange.svg)](https://www.rust-lang.org)
 [![Roadmap](https://img.shields.io/badge/roadmap-v0.4%20observability%20%26%20operations-blue)](ROADMAP.md)
 
+## Built for OpenClaw swarms 🦞
+Running multiple agents + parallel tool calls? Herd stops the GPU wars.
+Just set your OpenClaw `baseUrl` to `http://your-herd:40114` — done.
+Model homing + live VRAM routing keeps every agent on the fastest node.
+<img width="1723" height="754" alt="image" src="https://github.com/user-attachments/assets/5174b99c-e842-49c5-ab52-943d7006922f" />
+
+
 **Intelligent Ollama router with GPU awareness, analytics, and real-time monitoring.**
 
 Route your llama herd with intelligence — priority routing, circuit breakers, model awareness, real-time GPU metrics, beautiful dashboards, and OpenAI-compatible endpoints.

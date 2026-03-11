@@ -262,6 +262,9 @@ impl Server {
                         .put(admin::update_backend)
                         .delete(admin::remove_backend),
                 )
+                .route("/:name/models", axum::routing::get(admin::list_backend_models))
+                .route("/:name/models/:model", axum::routing::delete(admin::delete_model))
+                .route("/:name/pull", axum::routing::post(admin::pull_model))
                 .layer(axum::middleware::from_fn_with_state(
                     state.clone(),
                     require_api_key,
@@ -682,6 +685,7 @@ async fn status_handler(
                 "default_model": backend.config.default_model,
                 "idle_seconds": idle_secs,
                 "healthy": backend.healthy,
+                "vram_total_mb": backend.vram_total_mb,
             });
 
             if let Some(gpu) = &backend.gpu_metrics {

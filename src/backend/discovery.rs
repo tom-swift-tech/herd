@@ -26,6 +26,9 @@ struct OllamaRunningModel {
     name: String,
     #[serde(default)]
     model: String,
+    /// VRAM used by this model in bytes
+    #[serde(default)]
+    size_vram: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -108,6 +111,22 @@ impl ModelDiscovery {
                         tracing::trace!("No gpu-hot on {}: {}", name, e);
                     }
                 }
+
+                // VRAM probe: run once per backend on first discovery
+                if !state.vram_probed && state.healthy {
+                    info!("Probing VRAM on {} (first discovery)...", name);
+                    match self.probe_vram(pool, &state.config).await {
+                        Ok(vram_mb) => {
+                            info!("Backend {} VRAM: {} MB", name, vram_mb);
+                            pool.set_vram(&name, vram_mb).await;
+                        }
+                        Err(e) => {
+                            tracing::warn!("VRAM probe failed on {}: {}", name, e);
+                            // Mark as probed so we don't retry every cycle
+                            pool.mark_vram_probed(&name).await;
+                        }
+                    }
+                }
             }
         }
         info!("Model discovery complete");
@@ -168,6 +187,97 @@ impl ModelDiscovery {
 
         pool.update_current_model(&backend.name, current).await;
         Ok(())
+    }
+
+    /// Probe VRAM by pulling a small model, running a short prompt, then reading
+    /// `size_vram` from `/api/ps`. This gives us the GPU's total usable VRAM.
+    async fn probe_vram(&self, pool: &BackendPool, backend: &Backend) -> Result<u64> {
+        let probe_model = "llama3.2:3b";
+        let base = backend.url.trim_end_matches('/');
+
+        // Use a longer timeout for pull operations
+        let pull_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(600))
+            .build()?;
+
+        // 1. Pull the probe model (may already exist)
+        tracing::info!("Pulling {} on {} for VRAM probe...", probe_model, backend.name);
+        let pull_resp = pull_client
+            .post(format!("{}/api/pull", base))
+            .json(&serde_json::json!({"name": probe_model, "stream": false}))
+            .send()
+            .await?;
+
+        if !pull_resp.status().is_success() {
+            anyhow::bail!(
+                "Pull failed with status {} on {}",
+                pull_resp.status(),
+                backend.name
+            );
+        }
+        // Consume response body
+        let _ = pull_resp.text().await;
+
+        // 2. Run a tiny generation to force the model into VRAM
+        tracing::info!("Running VRAM probe generation on {}...", backend.name);
+        let gen_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(120))
+            .build()?;
+        let gen_resp = gen_client
+            .post(format!("{}/api/generate", base))
+            .json(&serde_json::json!({
+                "model": probe_model,
+                "prompt": "hi",
+                "stream": false,
+                "options": {"num_predict": 1}
+            }))
+            .send()
+            .await?;
+
+        if !gen_resp.status().is_success() {
+            anyhow::bail!(
+                "Generate failed with status {} on {}",
+                gen_resp.status(),
+                backend.name
+            );
+        }
+        let _ = gen_resp.text().await;
+
+        // 3. Read VRAM from /api/ps
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let ps_resp = self
+            .client
+            .get(format!("{}/api/ps", base))
+            .send()
+            .await?;
+        let running: OllamaRunning = ps_resp.json().await?;
+
+        let vram_bytes = running
+            .models
+            .first()
+            .map(|m| m.size_vram)
+            .unwrap_or(0);
+
+        // Convert to MB
+        let vram_mb = if vram_bytes > 0 {
+            vram_bytes / (1024 * 1024)
+        } else {
+            // Fallback: try GPU metrics if available
+            if let Some(state) = pool.get(&backend.name).await {
+                if let Some(gpu) = &state.gpu_metrics {
+                    gpu.memory_total
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        };
+
+        // Refresh model list since we just pulled one
+        let _ = self.discover_models(pool, backend).await;
+
+        Ok(vram_mb)
     }
 
     async fn discover_gpu_metrics(&self, pool: &BackendPool, name: &str, url: &str) -> Result<()> {

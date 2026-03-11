@@ -52,6 +52,7 @@ pub struct BackendResponse {
     pub model_count: usize,
     pub idle_seconds: u64,
     pub gpu: Option<GpuResponse>,
+    pub vram_total_mb: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -80,6 +81,7 @@ fn backend_to_response(b: &crate::backend::BackendState) -> BackendResponse {
             memory_total: g.memory_total,
             temperature: g.temperature,
         }),
+        vram_total_mb: b.vram_total_mb,
     }
 }
 
@@ -188,4 +190,160 @@ pub async fn remove_backend(
     } else {
         Err(StatusCode::NOT_FOUND)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Model management endpoints (proxy to Ollama API on the backend)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct PullModelRequest {
+    pub name: String,
+}
+
+/// POST /admin/backends/:name/pull — Pull a model on a specific backend.
+/// Streams Ollama pull progress as SSE.
+pub async fn pull_model(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<PullModelRequest>,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    let backend = state.pool.get(&name).await.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("Backend '{}' not found", name),
+        )
+    })?;
+
+    let url = format!("{}/api/pull", backend.config.url.trim_end_matches('/'));
+    tracing::info!("Pulling model '{}' on backend '{}'", req.name, name);
+
+    // Stream the pull response from Ollama
+    let resp = state
+        .client
+        .post(&url)
+        .json(&serde_json::json!({"name": req.name, "stream": true}))
+        .timeout(std::time::Duration::from_secs(3600)) // 1 hour for large models
+        .send()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to reach backend '{}': {}", name, e),
+            )
+        })?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("Ollama pull failed ({}): {}", status, body),
+        ));
+    }
+
+    // Stream Ollama's NDJSON progress through as SSE
+    let stream = resp.bytes_stream();
+    let body = axum::body::Body::from_stream(stream);
+
+    axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/x-ndjson")
+        .header("cache-control", "no-cache")
+        .body(body)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to build response: {}", e),
+            )
+        })
+}
+
+/// DELETE /admin/backends/:name/models/:model — Delete a model from a specific backend.
+pub async fn delete_model(
+    State(state): State<AppState>,
+    Path((name, model)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let backend = state.pool.get(&name).await.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("Backend '{}' not found", name),
+        )
+    })?;
+
+    let url = format!("{}/api/delete", backend.config.url.trim_end_matches('/'));
+    tracing::info!("Deleting model '{}' from backend '{}'", model, name);
+
+    let resp = state
+        .client
+        .delete(&url)
+        .json(&serde_json::json!({"name": model}))
+        .send()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to reach backend '{}': {}", name, e),
+            )
+        })?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("Ollama delete failed ({}): {}", status, body),
+        ));
+    }
+
+    // Refresh model list after deletion
+    let _ = resp.text().await;
+
+    tracing::info!("Deleted model '{}' from backend '{}'", model, name);
+    Ok(Json(serde_json::json!({
+        "status": "deleted",
+        "model": model,
+        "backend": name,
+    })))
+}
+
+/// GET /admin/backends/:name/models — List all models on a specific backend.
+pub async fn list_backend_models(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let backend = state.pool.get(&name).await.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("Backend '{}' not found", name),
+        )
+    })?;
+
+    // Fetch fresh model list from Ollama
+    let url = format!("{}/api/tags", backend.config.url.trim_end_matches('/'));
+    let resp = state
+        .client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to reach backend '{}': {}", name, e),
+            )
+        })?;
+
+    let data: serde_json::Value = resp.json().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("Invalid response from '{}': {}", name, e),
+        )
+    })?;
+
+    Ok(Json(serde_json::json!({
+        "backend": name,
+        "vram_total_mb": backend.vram_total_mb,
+        "models": data.get("models").cloned().unwrap_or(serde_json::json!([])),
+    })))
 }

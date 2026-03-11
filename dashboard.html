@@ -311,6 +311,20 @@
         .practice.dont li::before { content: '\2717'; position: absolute; left: 0; color: #ef4444; }
         .practice code { color: #818cf8; font-size: 12px; }
 
+        /* Model list in edit modal */
+        .model-item {
+            display: flex; justify-content: space-between; align-items: center;
+            padding: 6px 10px; border-radius: 6px; font-size: 13px;
+            background: rgba(255,255,255,0.03); margin-bottom: 4px;
+        }
+        .model-item-name { color: #94a3b8; font-family: 'SF Mono', monospace; font-size: 12px; }
+        .model-item-size { color: #64748b; font-size: 11px; }
+        .model-item-delete {
+            background: none; border: none; color: #ef4444; cursor: pointer;
+            font-size: 14px; padding: 2px 6px; border-radius: 4px; opacity: 0.6;
+        }
+        .model-item-delete:hover { opacity: 1; background: rgba(239, 68, 68, 0.1); }
+
         /* Mobile Responsive */
         @media (max-width: 900px) {
             .chart-grid { grid-template-columns: 1fr; }
@@ -581,6 +595,28 @@ Content-Type: application/json
             <input id="f-default" placeholder="e.g. llama3:8b">
             <label for="f-filter">Model Filter (regex, optional)</label>
             <input id="f-filter" placeholder="e.g. llama|qwen">
+
+            <!-- Model Management (edit mode only) -->
+            <div id="model-mgmt" style="display:none;">
+                <div style="margin-top:20px; padding-top:16px; border-top:1px solid rgba(255,255,255,0.06);">
+                    <label style="font-size:14px; font-weight:600; color:#e2e8f0;">Models on this node</label>
+                    <div id="model-vram" style="font-size:12px; color:#64748b; margin-bottom:8px;"></div>
+                    <div id="model-list" style="max-height:180px; overflow-y:auto; margin-bottom:12px;"></div>
+
+                    <label>Pull New Model</label>
+                    <div style="display:flex; gap:8px;">
+                        <input id="f-pull-model" placeholder="e.g. llama3.1:8b" style="flex:1;">
+                        <button class="btn-submit" onclick="pullModel()" id="btn-pull">Pull</button>
+                    </div>
+                    <div id="pull-progress" style="display:none; margin-top:8px;">
+                        <div style="font-size:12px; color:#94a3b8; margin-bottom:4px;" id="pull-status">Pulling...</div>
+                        <div style="height:6px; background:rgba(255,255,255,0.06); border-radius:3px; overflow:hidden;">
+                            <div id="pull-bar" style="height:100%; width:0%; background:#818cf8; border-radius:3px; transition:width 0.3s;"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
             <div class="modal-actions">
                 <button class="btn-cancel" onclick="closeModal()">Cancel</button>
                 <button class="btn-submit" onclick="submitModal()">Save</button>
@@ -657,6 +693,7 @@ Content-Type: application/json
             document.getElementById('f-priority').value = '50';
             document.getElementById('f-default').value = '';
             document.getElementById('f-filter').value = '';
+            document.getElementById('model-mgmt').style.display = 'none';
             document.getElementById('modal-overlay').classList.add('active');
         }
 
@@ -671,8 +708,131 @@ Content-Type: application/json
                 document.getElementById('f-priority').value = b.priority;
                 document.getElementById('f-default').value = b.default_model || '';
                 document.getElementById('f-filter').value = b.model_filter || '';
+                document.getElementById('model-mgmt').style.display = 'block';
+                document.getElementById('pull-progress').style.display = 'none';
+                document.getElementById('f-pull-model').value = '';
+
+                // Show VRAM info
+                const vramEl = document.getElementById('model-vram');
+                vramEl.textContent = b.vram_total_mb ? `VRAM: ${(b.vram_total_mb / 1024).toFixed(1)} GB` : '';
+
+                // Load models from this backend
+                loadBackendModels(name);
+
                 document.getElementById('modal-overlay').classList.add('active');
             });
+        }
+
+        async function loadBackendModels(name) {
+            const listEl = document.getElementById('model-list');
+            listEl.innerHTML = '<div style="font-size:12px; color:#64748b; padding:8px;">Loading models...</div>';
+            try {
+                const res = await fetch(`/admin/backends/${name}/models`);
+                const data = await res.json();
+                const models = data.models || [];
+                if (models.length === 0) {
+                    listEl.innerHTML = '<div style="font-size:12px; color:#64748b; padding:8px;">No models on this node</div>';
+                    return;
+                }
+                listEl.innerHTML = models.map(m => {
+                    const sizeGB = m.size ? (m.size / 1e9).toFixed(1) + ' GB' : '';
+                    return `<div class="model-item">
+                        <span class="model-item-name">${m.name}</span>
+                        <span style="display:flex; align-items:center; gap:8px;">
+                            <span class="model-item-size">${sizeGB}</span>
+                            <button class="model-item-delete" onclick="deleteModel('${name}', '${m.name}')" title="Delete">&#x2715;</button>
+                        </span>
+                    </div>`;
+                }).join('');
+            } catch (e) {
+                listEl.innerHTML = '<div style="font-size:12px; color:#ef4444; padding:8px;">Failed to load models</div>';
+            }
+        }
+
+        async function deleteModel(backend, model) {
+            if (!confirm(`Delete ${model} from ${backend}?`)) return;
+            try {
+                const res = await fetch(`/admin/backends/${backend}/models/${encodeURIComponent(model)}`, { method: 'DELETE' });
+                if (res.ok) {
+                    showToast(`Deleted ${model}`);
+                    loadBackendModels(backend);
+                    refresh();
+                } else {
+                    const text = await res.text();
+                    showToast(`Failed: ${text}`, 'error');
+                }
+            } catch (e) {
+                showToast(`Error: ${e.message}`, 'error');
+            }
+        }
+
+        async function pullModel() {
+            const name = document.getElementById('modal-original-name').value;
+            const model = document.getElementById('f-pull-model').value.trim();
+            if (!model) { showToast('Enter a model name', 'error'); return; }
+
+            const btn = document.getElementById('btn-pull');
+            const progressEl = document.getElementById('pull-progress');
+            const statusEl = document.getElementById('pull-status');
+            const barEl = document.getElementById('pull-bar');
+
+            btn.disabled = true;
+            btn.textContent = 'Pulling...';
+            progressEl.style.display = 'block';
+            statusEl.textContent = 'Starting pull...';
+            barEl.style.width = '0%';
+
+            try {
+                const res = await fetch(`/admin/backends/${name}/pull`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({name: model}),
+                });
+
+                if (!res.ok) {
+                    const text = await res.text();
+                    throw new Error(text);
+                }
+
+                // Read NDJSON stream
+                const reader = res.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+
+                while (true) {
+                    const {done, value} = await reader.read();
+                    if (done) break;
+                    buffer += decoder.decode(value, {stream: true});
+
+                    // Process complete lines
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop(); // keep incomplete line
+
+                    for (const line of lines) {
+                        if (!line.trim()) continue;
+                        try {
+                            const data = JSON.parse(line);
+                            if (data.total && data.completed) {
+                                const pct = Math.round((data.completed / data.total) * 100);
+                                barEl.style.width = pct + '%';
+                                statusEl.textContent = `${data.status || 'Downloading'} ${pct}%`;
+                            } else if (data.status) {
+                                statusEl.textContent = data.status;
+                            }
+                        } catch (e) { /* ignore parse errors */ }
+                    }
+                }
+
+                showToast(`Pulled ${model}`);
+                loadBackendModels(name);
+                refresh();
+            } catch (e) {
+                showToast(`Pull failed: ${e.message}`, 'error');
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Pull';
+                setTimeout(() => { progressEl.style.display = 'none'; }, 3000);
+            }
         }
 
         function closeModal() { document.getElementById('modal-overlay').classList.remove('active'); }
@@ -784,6 +944,7 @@ Content-Type: application/json
                     <div class="meta">
                         <span class="meta-item">P: <strong>${b.priority}</strong></span>
                         <span class="meta-item">Models: <strong>${b.model_count || b.models?.length || 0}</strong></span>
+                        ${b.vram_total_mb ? `<span class="meta-item">VRAM: <strong>${(b.vram_total_mb / 1024).toFixed(1)} GB</strong></span>` : ''}
                         <span class="card-status ${cls}"><span class="dot ${cls}"></span>${isOnline ? 'Online' : 'Offline'}</span>
                     </div>
                     ${gpuHtml}

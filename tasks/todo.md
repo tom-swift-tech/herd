@@ -1,35 +1,30 @@
 # Herd — Current Status
 
 **Version:** 0.4.2
-**Branch:** main
+**Branch:** ollama-features
 **Last pushed:** 2026-03-11
 
-## Current Task: Routing & Resilience Fixes
+## Current Task: Ollama Node Management Features
 
-### Issues
-1. **ModelAware hot-spotting** — `get_by_model` picks highest-priority backend regardless of load, starving other backends
-2. **404 not retried** — Proxy retry loop only retries on network errors; a 404 from Ollama (model evicted) is treated as success and proxied through
+### Features
+1. **VRAM probing** — On first backend discovery, pull `llama3.2:3b`, run a small prompt, read VRAM usage from `/api/ps`, store as `vram_total` on BackendState
+2. **Model listing in Edit modal** — Surface all models on the node, with delete buttons (calls Ollama `DELETE /api/delete`)
+3. **Model pull UI** — Text input + "Pull" button in Edit modal, calls Ollama `POST /api/pull` with streaming progress
 
 ### Plan
-- [x] Analyze proxy retry loop and model_aware router
-- [ ] Fix #1: `get_by_model` + `get_by_model_tagged` — when multiple backends have the model, prefer least-busy (GPU utilization) instead of always highest-priority
-- [ ] Fix #2: Proxy retry loop — treat 404 responses on model endpoints as retryable (don't break, continue to next backend)
-- [ ] Update circuit breaker defaults to less aggressive values (5 threshold, 30s recovery)
+- [ ] Add `vram_total_mb` field to BackendState and `vram_probed` flag
+- [ ] Add VRAM probe logic in discovery: pull llama3.2:3b → generate small prompt → read VRAM from /api/ps → store
+- [ ] Add admin API endpoints: `POST /admin/backends/:name/pull`, `DELETE /admin/backends/:name/models/:model`
+- [ ] Update Edit modal in dashboard: show model list with delete buttons, add pull input with progress
 - [ ] Run tests
-- [ ] Commit and push
+- [ ] Commit
+
+### Ollama API Reference
+- `GET /api/tags` — list models (already used)
+- `GET /api/ps` — running models with `size_vram` field
+- `POST /api/pull` — `{"name":"model"}`, streams `{"status":"...","total":N,"completed":N}`
+- `DELETE /api/delete` — `{"name":"model"}`
+- `POST /api/generate` — `{"model":"...","prompt":"..."}` for VRAM test
 
 ## Parked: GitHub Sponsors → Herd-Pro Access
-
-1. Set up GitHub Sponsors on `swift-innovate` with a Herd Pro tier
-2. Create a GitHub Actions workflow that listens for `sponsorship` events
-3. On `created` event → add sponsor as collaborator to `herd-pro` (read access)
-4. On `cancelled` event → remove collaborator from `herd-pro`
-5. Add release workflow to `herd-pro` for binary distribution
-6. Document how sponsors access `herd-pro` (clone, releases, auto-update with token)
-
-## Completed Milestones
-
-### v0.2.1 — Security Hardening
-### v0.3.0 — Routing & Reliability
-### v0.4.0/v0.4.1 — Observability & Operations
-### v0.4.2 — Agent Guide & Skills
+## Completed: v0.2.1, v0.3.0, v0.4.0/v0.4.1, v0.4.2

@@ -14,6 +14,10 @@ pub struct BackendState {
     pub failure_count: u32,
     pub last_check: Instant,
     pub last_request: Instant,
+    /// Total VRAM in MB, detected via probe on first discovery
+    pub vram_total_mb: Option<u64>,
+    /// Whether VRAM has been probed for this backend
+    pub vram_probed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -45,6 +49,8 @@ impl BackendPool {
                 failure_count: 0,
                 last_check: now,
                 last_request: now,
+                vram_total_mb: None,
+                vram_probed: false,
             })
             .collect();
 
@@ -225,6 +231,21 @@ impl BackendPool {
         }
     }
 
+    pub async fn set_vram(&self, name: &str, vram_mb: u64) {
+        let mut backends = self.backends.write().await;
+        if let Some(backend) = backends.iter_mut().find(|b| b.config.name == name) {
+            backend.vram_total_mb = Some(vram_mb);
+            backend.vram_probed = true;
+        }
+    }
+
+    pub async fn mark_vram_probed(&self, name: &str) {
+        let mut backends = self.backends.write().await;
+        if let Some(backend) = backends.iter_mut().find(|b| b.config.name == name) {
+            backend.vram_probed = true;
+        }
+    }
+
     pub async fn add(&self, backend: Backend) {
         let mut backends = self.backends.write().await;
         backends.push(BackendState {
@@ -236,6 +257,8 @@ impl BackendPool {
             failure_count: 0,
             last_check: Instant::now(),
             last_request: Instant::now(),
+            vram_total_mb: None,
+            vram_probed: false,
         });
     }
 

@@ -1044,7 +1044,8 @@ async fn skills_handler(
             "Send X-Request-Id for traceability across distributed systems",
             "Retry on 503 — circuit breaker auto-recovers backends",
             "Never hard-code backend URLs — always route through Herd",
-            "Body size limit is 10 MB"
+            "Body size limit is 10 MB",
+            "Do not set 'keep_alive' in request bodies — Herd injects it centrally on every Ollama request"
         ],
         "error_codes": {
             "502": "Backend failed — Herd will retry on another backend",

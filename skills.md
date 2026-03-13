@@ -91,6 +91,7 @@ Returns detailed backend information:
       "models": ["qwen2.5-coder:32b", "llama3.1:8b"],
       "model_count": 2,
       "current_model": "qwen2.5-coder:32b",
+      "hot_models": ["qwen2.5-coder:32b"],
       "healthy": true,
       "gpu": {
         "utilization": 45.0,

@@ -70,6 +70,7 @@ pub struct RoutingConfig {
     #[serde(default = "default_retry_count")]
     pub retry_count: u32,
 
+    // Read by proxy_handler (Task 2) — injected into every /api/generate and /api/chat request.
     #[serde(default = "default_keep_alive_value")]
     pub default_keep_alive: String,
 }

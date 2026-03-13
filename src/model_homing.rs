@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use crate::backend::BackendPool;
 use crate::config::Backend;
 use anyhow::Result;

@@ -737,29 +737,35 @@ Content-Type: application/json
         }
 
         function openEditModal(name) {
-            authFetch(`/admin/backends/${name}`).then(r => r.json()).then(b => {
-                document.getElementById('modal-title').textContent = `Edit ${b.name}`;
-                document.getElementById('modal-mode').value = 'edit';
-                document.getElementById('modal-original-name').value = b.name;
-                document.getElementById('f-name').value = b.name;
-                document.getElementById('f-name').disabled = true;
-                document.getElementById('f-url').value = b.url;
-                document.getElementById('f-priority').value = b.priority;
-                document.getElementById('f-vram').value = b.vram_total_mb ? (b.vram_total_mb / 1024).toFixed(1) : '';
-                document.getElementById('f-filter').value = b.model_filter || '';
-                document.getElementById('model-mgmt').style.display = 'block';
-                document.getElementById('pull-progress').style.display = 'none';
-                document.getElementById('f-pull-model').value = '';
+            authFetch(`/admin/backends/${name}`)
+                .then(r => {
+                    if (!r.ok) throw new Error(r.status === 401 ? 'Enter your API key in the header first' : `Server returned ${r.status}`);
+                    return r.json();
+                })
+                .then(b => {
+                    document.getElementById('modal-title').textContent = `Edit ${b.name}`;
+                    document.getElementById('modal-mode').value = 'edit';
+                    document.getElementById('modal-original-name').value = b.name;
+                    document.getElementById('f-name').value = b.name;
+                    document.getElementById('f-name').disabled = true;
+                    document.getElementById('f-url').value = b.url;
+                    document.getElementById('f-priority').value = b.priority;
+                    document.getElementById('f-vram').value = b.vram_total_mb ? (b.vram_total_mb / 1024).toFixed(1) : '';
+                    document.getElementById('f-filter').value = b.model_filter || '';
+                    document.getElementById('model-mgmt').style.display = 'block';
+                    document.getElementById('pull-progress').style.display = 'none';
+                    document.getElementById('f-pull-model').value = '';
 
-                // Show VRAM info
-                const vramEl = document.getElementById('model-vram');
-                vramEl.textContent = b.vram_total_mb ? `VRAM: ${(b.vram_total_mb / 1024).toFixed(1)} GB` : '';
+                    // Show VRAM info
+                    const vramEl = document.getElementById('model-vram');
+                    vramEl.textContent = b.vram_total_mb ? `VRAM: ${(b.vram_total_mb / 1024).toFixed(1)} GB` : '';
 
-                // Load models from this backend
-                loadBackendModels(name);
+                    // Load models from this backend
+                    loadBackendModels(name);
 
-                document.getElementById('modal-overlay').classList.add('active');
-            });
+                    document.getElementById('modal-overlay').classList.add('active');
+                })
+                .catch(e => showToast(`Edit failed: ${e.message}`, 'error'));
         }
 
         async function loadBackendModels(name) {

@@ -4,7 +4,7 @@
 [![GitHub stars](https://img.shields.io/github/stars/swift-innovate/herd?style=social)](https://github.com/swift-innovate/herd/stargazers)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.70+-orange.svg)](https://www.rust-lang.org)
-[![Roadmap](https://img.shields.io/badge/roadmap-v0.4%20observability%20%26%20operations-blue)](ROADMAP.md)
+[![Roadmap](https://img.shields.io/badge/roadmap-v0.9%20unified%20release-blue)](ROADMAP.md)
 
 ## Built for OpenClaw swarms 🦞
 Running multiple agents + parallel tool calls? Herd stops the GPU wars.
@@ -65,14 +65,14 @@ You're now routing through Herd. Point any OpenAI-compatible client or Ollama ag
 │  │  Proxy  │→ │ Engine  │→ │   Breaker   │     │
 │  └─────────┘  └─────────┘  └─────────────┘     │
 │       ↓            ↓              ↓              │
-│  ┌────────────────────────────────────────┐   │
-│  │            Backend Pool                 │   │
-│  │  ┌─────────┐ ┌─────────┐ ┌─────────┐   │   │
-│  │  │ Citadel │ │  minipc │ │  warden │   │   │
-│  │  │ :11434  │ │ :11434  │ │ :11434  │   │   │
-│  │  │ :1312   │ │ :1312   │ │ :1312   │   │   │
-│  │  └─────────┘ └─────────┘ └─────────┘   │   │
-│  └────────────────────────────────────────┘   │
+│  ┌────────────────────────────────────────┐     │
+│  │            Backend Pool                │     │
+│  │  ┌─────────┐ ┌─────────┐ ┌─────────┐  │     │
+│  │  │ Node A  │ │ Node B  │ │ Node C  │  │     │
+│  │  │ :11434  │ │ :11434  │ │ :11434  │  │     │
+│  │  │ :1312   │ │ :1312   │ │ :1312   │  │     │
+│  │  └─────────┘ └─────────┘ └─────────┘  │     │
+│  └────────────────────────────────────────┘     │
 └─────────────────────────────────────────────────┘
 ```
 
@@ -99,34 +99,47 @@ Herd is a **smart stateless proxy with a stateful routing cache**. It is not HA 
 ### Core Routing
 - **Priority-based routing** — Route to the best GPU first
 - **Model-aware routing** — Route to nodes with models already loaded
-- **Weighted round-robin** — Distribute by priority weight (new in v0.3.0)
+- **Weighted round-robin** — Distribute by priority weight
 - **Least-busy routing** — Route to lowest GPU utilization
-- **Tag-based routing** — Filter by `X-Herd-Tags` header (new in v0.3.0)
+- **Tag-based routing** — Filter by `X-Herd-Tags` header
+- **Model filtering** — Restrict backends by model size (e.g. `≤8B`) or name pattern
+- **Task classification** — Automatic model selection by complexity tier (heavy/standard/lightweight)
 - **Circuit breaker** — Auto-recover from failed nodes
-- **keep_alive injection** — Override `keep_alive` on every Ollama request centrally; prevents clients from accidentally evicting models (new in v0.4.3)
-- **Hot models warmer** — Declare `hot_models` per backend; Herd pre-loads and keeps them warm automatically (new in v0.4.3)
-- **Hot-reload config** — File watcher + `POST /admin/reload` (new in v0.3.0)
+- **keep_alive injection** — Override `keep_alive` on every Ollama request centrally; prevents clients from accidentally evicting models
+- **Hot models warmer** — Declare `hot_models` per backend; Herd pre-loads and keeps them warm automatically
+- **Hot-reload config** — File watcher + `POST /admin/reload`
 - **Rate limiting** — Global token-bucket rate limiter
 - **OpenAI-compatible** — Drop-in `/v1/chat/completions` endpoint
-- **Auto-update** — `herd --update` or `POST /admin/update` (new in v0.4.0)
+- **Auto-update** — `herd --update` or `POST /admin/update`
+
+### Agent Sessions & Tool Calling (v0.9.0)
+- **Agent session management** — Create, list, resume, and delete sessions with full message history and configurable TTL
+- **Built-in tool calling** — `read_file`, `write_file`, `list_files`, `run_command` with automatic tool-call loop
+- **Permission engine** — Regex-based deny patterns for file and shell access
+- **Audit logging** — JSONL audit trail for every tool call and permission denial
+- **WebSocket streaming** — Real-time agent events over WebSocket
+
+### Fleet Management (v0.9.0)
+- **Node registration** — `herd-tune` scripts for auto-enrolling Ollama nodes into the fleet
+- **SQLite node registry** — Persistent fleet state with health polling
+- **Enrollment key authentication** — Secure node registration
+- **Config editor API** — `GET/PUT /admin/config` with automatic secret redaction
+- **Dashboard Fleet tab** — Visual fleet management with node status
 
 ### Agent-Friendly
 - **Agent skills reference** — [`skills.md`](skills.md) teaches AI agents how to use Herd's API, routing, and headers
 - **Dashboard Agent Guide** — Built-in tab at `/dashboard` with endpoint tables, best practices, and error handling
 - **OpenAI drop-in** — Point any agent's `base_url` to Herd and it just works
 - **Correlation IDs** — `X-Request-Id` propagation for distributed agent tracing
-- **Tag-based routing** — Agents can target specific backends via `X-Herd-Tags` header
 
 ### Observability
 - **Prometheus metrics** — `/metrics` endpoint with request counters, backend gauges, and latency histogram
 - **Log rotation** — Size-based rotation with configurable retention (days, max size, max files)
 - **Request analytics** — JSONL logging with auto-retention
-- **Interactive dashboard** — Real-time charts with Chart.js (Backends, Analytics, Agent Guide tabs)
+- **Interactive dashboard** — Real-time charts with Chart.js (Backends, Analytics, Sessions, Fleet, Settings, Agent Guide tabs)
 - **GPU metrics** — Real-time VRAM, utilization, temperature
 - **Latency tracking** — P50, P95, P99 percentiles
 - **Update checker** — Automatic GitHub release notifications
-
-> **v0.4.3** — keep_alive injection, hot models warmer, Agent Guide dashboard tab, skills.md reference, Prometheus metrics, correlation IDs, log rotation. See the [Roadmap](ROADMAP.md) for what's next.
 
 ## Quick Start
 
@@ -139,9 +152,9 @@ herd --config herd.yaml
 
 # Or with CLI args
 herd --port 40114 \
-  --backend citadel=http://citadel:11434:100 \
-  --backend minipc=http://minipc:11434:80 \
-  --backend warden=http://warden:11434:50
+  --backend node-a=http://gpu-1:11434:100 \
+  --backend node-b=http://gpu-2:11434:80 \
+  --backend node-c=http://gpu-3:11434:50
 ```
 
 ## For AI Agents
@@ -199,23 +212,28 @@ model_warmer:              # v0.4.3+: replaces model_homing
   interval_secs: 240       # ping hot_models every 4 min
 
 backends:
-  - name: "citadel-5090"
-    url: "http://citadel:11434"
+  - name: "node-a"
+    url: "http://gpu-1:11434"
     priority: 100
-    gpu_hot_url: "http://citadel:1312"
-    tags: ["gpu", "fast"]              # For tag-based routing
-    health_check_path: "/api/version"  # Custom health endpoint
+    gpu_hot_url: "http://gpu-1:1312"
+    tags: ["gpu", "high-vram"]
+    health_check_path: "/api/version"
+    hot_models:
+      - "qwen2.5-coder:32b"
 
-  - name: "minipc-4080"
-    url: "http://minipc:11434"
+  - name: "node-b"
+    url: "http://gpu-2:11434"
     priority: 80
-    hot_models:                # keep these loaded at all times (v0.4.3+)
+    gpu_hot_url: "http://gpu-2:1312"
+    tags: ["gpu", "medium-vram"]
+    hot_models:
       - "glm-4.7-flash:latest"
 
-  - name: "warden-4070"
-    url: "http://warden:11434"
+  - name: "node-c"
+    url: "http://gpu-3:11434"
     priority: 50
-    model_filter: "≤8B"  # Only route small models
+    model_filter: "≤8B"  # Only route small models to this backend
+    tags: ["gpu", "low-vram"]
 
 circuit_breaker:
   failure_threshold: 3
@@ -225,9 +243,9 @@ circuit_breaker:
 observability:
   metrics: true
   admin_api: true
-  log_retention_days: 7      # Auto-prune logs older than N days
-  log_max_size_mb: 100       # Rotate log file when it exceeds N MB
-  log_max_files: 5           # Keep N rotated log files
+  log_retention_days: 7
+  log_max_size_mb: 100
+  log_max_files: 5
 ```
 
 ## Choosing the Right Endpoint
@@ -298,10 +316,17 @@ Request IDs are included in JSONL analytics logs for correlation across systems.
 | `GET /admin/backends/:name` | Get backend details |
 | `PUT /admin/backends/:name` | Update backend config |
 | `DELETE /admin/backends/:name` | Remove backend |
-| `POST /admin/reload` | Hot-reload config file (when enabled, API key required) |
+| `POST /admin/reload` | Hot-reload config file (API key required) |
 | `POST /admin/update` | Self-update from GitHub Releases (API key required) |
+| `GET /admin/config` | View current config (secrets redacted) |
+| `PUT /admin/config` | Update config (API key required) |
+| `POST /agent/sessions` | Create agent session |
+| `GET /agent/sessions` | List active sessions |
+| `POST /agent/sessions/:id/messages` | Send message to agent session |
+| `DELETE /agent/sessions/:id` | Delete agent session |
+| `WS /agent/ws/:id` | WebSocket for real-time agent events |
 
-## Analytics & Monitoring (v0.2.0)
+## Analytics & Monitoring
 
 ### Dashboard
 Access the interactive dashboard at `http://your-herd:40114/dashboard`
@@ -314,13 +339,16 @@ Access the interactive dashboard at `http://your-herd:40114/dashboard`
 - Model homing status and idle timers
 - One-click backend management (add/edit/remove)
 - Automatic update notifications
+- **Sessions tab** — Active agent sessions, message history, tool call audit
+- **Fleet tab** — Registered nodes, health status, enrollment management
+- **Settings tab** — Live config editor with secret redaction
 - **Agent Guide tab** — API reference, best practices, and error handling for AI agents
 
 ### Request Logging
 All proxied requests are logged to `~/.herd/requests.jsonl`:
 
 ```json
-{"timestamp":1709395200,"model":"glm-4.7-flash:latest","backend":"citadel-5090","duration_ms":234,"status":"success","path":"/api/generate","request_id":"550e8400-e29b-41d4-a716-446655440000"}
+{"timestamp":1709395200,"model":"glm-4.7-flash:latest","backend":"node-a","duration_ms":234,"status":"success","path":"/api/generate","request_id":"550e8400-e29b-41d4-a716-446655440000"}
 ```
 
 **Log management:**
@@ -350,8 +378,8 @@ curl http://localhost:40114/analytics?hours=1
     "llama3.1:8b": 200
   },
   "backend_counts": {
-    "citadel-5090": 1203,
-    "minipc-4080": 320
+    "node-a": 1203,
+    "node-b": 320
   },
   "timeline": [[1709395200, 45], [1709395260, 52], ...]
 }
@@ -400,8 +428,8 @@ model_warmer:
   interval_secs: 240   # ping every 4 min (default); safely under Ollama's 5-min eviction window
 
 backends:
-  - name: "citadel"
-    url: "http://citadel:11434"
+  - name: "node-a"
+    url: "http://gpu-1:11434"
     hot_models:
       - "glm-4.7-flash:latest"
       - "llama3:8b"
@@ -423,19 +451,19 @@ Old config keys are ignored after upgrading — Herd will log a warning at start
 Herd integrates with [gpu-hot](https://github.com/psalias2006/gpu-hot) for real-time metrics:
 
 ```yaml
-# On each GPU node
+# On each GPU node, run gpu-hot
 docker run -d --gpus all -p 1312:1312 \
-  -e NODE_NAME=citadel \
+  -e NODE_NAME=my-node \
   ghcr.io/psalias2006/gpu-hot:latest
 ```
 
-Then configure Herd to query metrics:
+Then point Herd at the metrics endpoint:
 
 ```yaml
 backends:
-  - name: "citadel"
-    url: "http://citadel:11434"
-    gpu_hot_url: "http://citadel:1312"
+  - name: "node-a"
+    url: "http://gpu-1:11434"
+    gpu_hot_url: "http://gpu-1:1312"
 ```
 
 **Dashboard GPU section:**
@@ -443,32 +471,6 @@ backends:
 - Auto-polls every 10 seconds
 - Automatically hides if gpu-hot is unreachable
 - Shows all GPUs on multi-GPU nodes
-
-**Example output:**
-```json
-{
-  "available": true,
-  "gpus": {
-    "0": {
-      "name": "NVIDIA GeForce RTX 5090",
-      "temperature": 37.0,
-      "utilization": 2.0,
-      "memory_used": 3731.48,
-      "memory_total": 32607.0,
-      "power_draw": 70.0
-    }
-  }
-}
-```
-
-Then configure Herd to query metrics:
-
-```yaml
-backends:
-  - name: "citadel"
-    url: "http://citadel:11434"
-    gpu_hot_url: "http://citadel:1312"
-```
 
 Herd will route based on:
 - Model already loaded (via `/api/ps`)
@@ -497,6 +499,9 @@ Herd will route based on:
 | Correlation IDs | ✅ | ❌ |
 | Log rotation | ✅ | ❌ |
 | Auto-update | ✅ | ❌ |
+| Agent sessions | ✅ | ❌ |
+| Fleet management | ✅ | ❌ |
+| Task classification | ✅ | ❌ |
 | Language | Rust | Go |
 
 ## License

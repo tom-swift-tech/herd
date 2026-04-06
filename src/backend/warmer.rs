@@ -12,11 +12,11 @@ pub struct ModelWarmer {
 }
 
 impl ModelWarmer {
-    pub fn new(interval_secs: u64) -> Self {
+    pub fn new(interval_secs: u64, timeout_secs: u64) -> Self {
         Self {
             interval: Duration::from_secs(interval_secs),
             client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
+                .timeout(Duration::from_secs(timeout_secs))
                 .build()
                 .unwrap(),
         }

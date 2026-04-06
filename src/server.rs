@@ -235,7 +235,10 @@ impl Server {
         let discovery = ModelDiscovery::new(60);
         discovery.spawn(pool.clone()).await;
 
-        let warmer = ModelWarmer::new(self.config.model_warmer.interval_secs);
+        let warmer = ModelWarmer::new(
+            self.config.model_warmer.interval_secs,
+            self.config.model_warmer.timeout_secs,
+        );
         warmer.spawn(pool.clone()).await;
 
         // Initialize analytics

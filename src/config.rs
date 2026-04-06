@@ -182,16 +182,27 @@ impl Default for Backend {
 pub struct ModelWarmerConfig {
     #[serde(default = "default_warmer_interval")]
     pub interval_secs: u64,
+
+    /// Per-model timeout in seconds for warming requests (default: 180).
+    /// Large models (20GB+) may need 60–180s to load into VRAM.
+    #[serde(default = "default_warmer_timeout")]
+    pub timeout_secs: u64,
 }
 
 impl Default for ModelWarmerConfig {
     fn default() -> Self {
-        Self { interval_secs: default_warmer_interval() }
+        Self {
+            interval_secs: default_warmer_interval(),
+            timeout_secs: default_warmer_timeout(),
+        }
     }
 }
 
 fn default_warmer_interval() -> u64 {
     240
+}
+fn default_warmer_timeout() -> u64 {
+    180
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -32,6 +32,8 @@ routing:
 model_warmer:
   interval_secs: 240             # Seconds between keep-alive pings (default: 240, min: 10).
                                  # Must be shorter than Ollama's eviction window (default 5 min).
+  timeout_secs: 180              # Per-model timeout for warming requests (default: 180).
+                                 # Large models (20GB+) may need 60-180s to load into VRAM.
 
 # ── Task Classifier ────────────────────────────────────────────────
 # Automatically classify requests by complexity when no model is specified.

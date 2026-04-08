@@ -69,7 +69,7 @@ pub async fn register_node(
     tracing::info!(
         "Node {} ({}) {} — id={}",
         reg.hostname,
-        reg.ollama_url,
+        reg.effective_url(),
         if is_new { "registered" } else { "re-registered" },
         id
     );

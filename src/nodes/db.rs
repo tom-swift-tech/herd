@@ -64,17 +64,25 @@ impl NodeDb {
     }
 
     /// Map a SELECT row (21 columns, node_id at index 1) to a Node struct.
-    /// Column order: id, node_id, hostname, ollama_url, gpu, vram_mb, ram_mb,
+    /// Column order: id, node_id, hostname, ollama_url (→ backend_url), gpu, vram_mb, ram_mb,
     ///   max_concurrent, ollama_version, os, status, priority, enabled, tags,
     ///   models_available, models_loaded, recommended_config, config_applied,
     ///   last_health_check, registered_at, updated_at
+    /// NOTE: Full schema migration happens in Task 3. This is a minimal bridge
+    /// that reads the old column into backend_url and defaults new fields.
     fn row_to_node(row: &rusqlite::Row) -> rusqlite::Result<Node> {
         Ok(Node {
             id: row.get(0)?,
             node_id: row.get(1)?,
             hostname: row.get(2)?,
-            ollama_url: row.get(3)?,
+            backend_url: row.get(3)?,
+            backend: crate::config::BackendType::default(),
+            backend_version: None,
             gpu: row.get(4)?,
+            gpu_vendor: None,
+            gpu_model: None,
+            gpu_backend: None,
+            cuda_version: None,
             vram_mb: row.get::<_, i32>(5)? as u32,
             ram_mb: row.get::<_, i32>(6)? as u32,
             max_concurrent: row.get::<_, i32>(7)? as u32,
@@ -87,6 +95,8 @@ impl NodeDb {
             models_available: row.get::<_, i32>(14)? as u32,
             models_loaded: serde_json::from_str(&row.get::<_, String>(15)?)
                 .unwrap_or_default(),
+            model_paths: Vec::new(),
+            capabilities: Vec::new(),
             recommended_config: serde_json::from_str(&row.get::<_, String>(16)?)
                 .unwrap_or_default(),
             config_applied: row.get::<_, i32>(17)? != 0,
@@ -155,7 +165,7 @@ impl NodeDb {
                     node_id = COALESCE(?14, node_id), hostname = ?15
                 WHERE id = ?13",
                 rusqlite::params![
-                    reg.ollama_url,
+                    reg.effective_url().to_string(),
                     reg.gpu,
                     reg.vram_mb,
                     reg.ram_mb,
@@ -186,7 +196,7 @@ impl NodeDb {
                     id,
                     reg.node_id,
                     reg.hostname,
-                    reg.ollama_url,
+                    reg.effective_url().to_string(),
                     reg.gpu,
                     reg.vram_mb,
                     reg.ram_mb,

@@ -100,7 +100,7 @@ impl NodeHealthPoller {
             let backend_name = format!("node:{}", node.hostname);
             let backend = crate::config::Backend {
                 name: backend_name.clone(),
-                url: node.ollama_url.clone(),
+                url: node.backend_url.clone(),
                 priority: node.priority,
                 tags: node.tags.clone(),
                 ..Default::default()
@@ -131,7 +131,7 @@ impl NodeHealthPoller {
                 tracing::info!(
                     "Added node backend {} to pool ({})",
                     backend_name,
-                    node.ollama_url
+                    node.backend_url
                 );
             }
         }
@@ -152,7 +152,7 @@ impl NodeHealthPoller {
     }
 
     async fn poll_node(&self, node_db: &NodeDb, node: &crate::nodes::Node, check_tags: bool) {
-        let base_url = node.ollama_url.trim_end_matches('/');
+        let base_url = node.backend_url.trim_end_matches('/');
 
         // GET /api/ps — loaded models
         let ps_url = format!("{}/api/ps", base_url);

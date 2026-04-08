@@ -4,6 +4,38 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 
+/// Status of a model file download.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum DownloadStatus {
+    Pending,
+    Downloading,
+    Completed,
+    Failed,
+}
+
+impl std::fmt::Display for DownloadStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DownloadStatus::Pending => write!(f, "pending"),
+            DownloadStatus::Downloading => write!(f, "downloading"),
+            DownloadStatus::Completed => write!(f, "completed"),
+            DownloadStatus::Failed => write!(f, "failed"),
+        }
+    }
+}
+
+impl DownloadStatus {
+    fn from_str(s: &str) -> Self {
+        match s {
+            "downloading" => DownloadStatus::Downloading,
+            "completed" => DownloadStatus::Completed,
+            "failed" => DownloadStatus::Failed,
+            _ => DownloadStatus::Pending,
+        }
+    }
+}
+
 /// Tracks a model file download in progress or completed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelDownload {
@@ -14,7 +46,7 @@ pub struct ModelDownload {
     pub target_path: String,
     pub bytes_downloaded: u64,
     pub total_bytes: u64,
-    pub status: String,
+    pub status: DownloadStatus,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -128,55 +160,50 @@ impl NodeDb {
         Ok(())
     }
 
-    /// Map a SELECT row (31 columns) to a Node struct.
-    /// Column order matches NODE_COLUMNS:
-    ///   id, node_id, hostname, backend_url, backend, backend_version,
-    ///   gpu, gpu_vendor, gpu_model, gpu_backend, cuda_version,
-    ///   vram_mb, ram_mb, max_concurrent,
-    ///   ollama_version, os, status, priority, enabled, tags, models_available,
-    ///   models_loaded, model_paths, capabilities, gpu_driver_version, max_context_len,
-    ///   recommended_config, config_applied, last_health_check,
-    ///   registered_at, updated_at
+    /// Map a SELECT row to a Node struct using named column access.
     fn row_to_node(row: &rusqlite::Row) -> rusqlite::Result<Node> {
-        let backend_str: String = row.get(4)?;
+        let backend_str: String = row.get("backend")?;
         let backend = match backend_str.as_str() {
             "llama-server" => crate::config::BackendType::LlamaServer,
             "openai-compat" => crate::config::BackendType::OpenAICompat,
             _ => crate::config::BackendType::Ollama,
         };
         Ok(Node {
-            id: row.get(0)?,
-            node_id: row.get(1)?,
-            hostname: row.get(2)?,
-            backend_url: row.get(3)?,
+            id: row.get("id")?,
+            node_id: row.get("node_id")?,
+            hostname: row.get("hostname")?,
+            backend_url: row.get("backend_url")?,
             backend,
-            backend_version: row.get(5)?,
-            gpu: row.get(6)?,
-            gpu_vendor: row.get(7)?,
-            gpu_model: row.get(8)?,
-            gpu_backend: row.get(9)?,
-            cuda_version: row.get(10)?,
-            vram_mb: row.get::<_, i32>(11)? as u32,
-            ram_mb: row.get::<_, i32>(12)? as u32,
-            max_concurrent: row.get::<_, i32>(13)? as u32,
-            ollama_version: row.get(14)?,
-            os: row.get(15)?,
-            status: row.get(16)?,
-            priority: row.get::<_, i32>(17)? as u32,
-            enabled: row.get::<_, i32>(18)? != 0,
-            tags: serde_json::from_str(&row.get::<_, String>(19)?).unwrap_or_default(),
-            models_available: row.get::<_, i32>(20)? as u32,
-            models_loaded: serde_json::from_str(&row.get::<_, String>(21)?).unwrap_or_default(),
-            model_paths: serde_json::from_str(&row.get::<_, String>(22)?).unwrap_or_default(),
-            capabilities: serde_json::from_str(&row.get::<_, String>(23)?).unwrap_or_default(),
-            gpu_driver_version: row.get(24)?,
-            max_context_len: row.get::<_, i32>(25)? as u32,
-            recommended_config: serde_json::from_str(&row.get::<_, String>(26)?)
+            backend_version: row.get("backend_version")?,
+            gpu: row.get("gpu")?,
+            gpu_vendor: row.get("gpu_vendor")?,
+            gpu_model: row.get("gpu_model")?,
+            gpu_backend: row.get("gpu_backend")?,
+            cuda_version: row.get("cuda_version")?,
+            vram_mb: row.get::<_, i32>("vram_mb")? as u32,
+            ram_mb: row.get::<_, i32>("ram_mb")? as u32,
+            max_concurrent: row.get::<_, i32>("max_concurrent")? as u32,
+            ollama_version: row.get("ollama_version")?,
+            os: row.get("os")?,
+            status: row.get("status")?,
+            priority: row.get::<_, i32>("priority")? as u32,
+            enabled: row.get::<_, i32>("enabled")? != 0,
+            tags: serde_json::from_str(&row.get::<_, String>("tags")?).unwrap_or_default(),
+            models_available: row.get::<_, i32>("models_available")? as u32,
+            models_loaded: serde_json::from_str(&row.get::<_, String>("models_loaded")?)
                 .unwrap_or_default(),
-            config_applied: row.get::<_, i32>(27)? != 0,
-            last_health_check: row.get(28)?,
-            registered_at: row.get(29)?,
-            updated_at: row.get(30)?,
+            model_paths: serde_json::from_str(&row.get::<_, String>("model_paths")?)
+                .unwrap_or_default(),
+            capabilities: serde_json::from_str(&row.get::<_, String>("capabilities")?)
+                .unwrap_or_default(),
+            gpu_driver_version: row.get("gpu_driver_version")?,
+            max_context_len: row.get::<_, i32>("max_context_len")? as u32,
+            recommended_config: serde_json::from_str(&row.get::<_, String>("recommended_config")?)
+                .unwrap_or_default(),
+            config_applied: row.get::<_, i32>("config_applied")? != 0,
+            last_health_check: row.get("last_health_check")?,
+            registered_at: row.get("registered_at")?,
+            updated_at: row.get("updated_at")?,
         })
     }
 
@@ -281,6 +308,10 @@ impl NodeDb {
             Ok((id, false))
         } else {
             // Insert new node
+            // Note: The SQL column is still named `ollama_url` for backward compatibility
+            // with older databases. The Rust-side field was renamed to `backend_url`.
+            // A future migration could rename the column, but ALTER TABLE RENAME COLUMN
+            // requires SQLite 3.25+.
             let id = uuid::Uuid::new_v4().to_string();
             conn.execute(
                 "INSERT INTO nodes (id, node_id, hostname, ollama_url, gpu, vram_mb, ram_mb,
@@ -502,7 +533,7 @@ impl NodeDb {
         &self,
         id: &str,
         bytes_downloaded: u64,
-        status: &str,
+        status: &DownloadStatus,
     ) -> Result<bool> {
         let conn = self
             .conn
@@ -511,7 +542,7 @@ impl NodeDb {
         let now = chrono::Utc::now().to_rfc3339();
         let rows = conn.execute(
             "UPDATE model_downloads SET bytes_downloaded = ?1, status = ?2, updated_at = ?3 WHERE id = ?4",
-            rusqlite::params![bytes_downloaded as i64, status, now, id],
+            rusqlite::params![bytes_downloaded as i64, status.to_string(), now, id],
         )?;
         Ok(rows > 0)
     }
@@ -579,6 +610,7 @@ impl NodeDb {
     }
 
     fn row_to_download(row: &rusqlite::Row) -> rusqlite::Result<ModelDownload> {
+        let status_str: String = row.get(7)?;
         Ok(ModelDownload {
             id: row.get(0)?,
             node_id: row.get(1)?,
@@ -587,7 +619,7 @@ impl NodeDb {
             target_path: row.get(4)?,
             bytes_downloaded: row.get::<_, i64>(5)? as u64,
             total_bytes: row.get::<_, i64>(6)? as u64,
-            status: row.get(7)?,
+            status: DownloadStatus::from_str(&status_str),
             created_at: row.get(8)?,
             updated_at: row.get(9)?,
         })
@@ -846,22 +878,22 @@ mod tests {
         let dl = db.get_download(&dl_id).unwrap().unwrap();
         assert_eq!(dl.node_id, node_id);
         assert_eq!(dl.file_name, "file.gguf");
-        assert_eq!(dl.status, "pending");
+        assert_eq!(dl.status, DownloadStatus::Pending);
         assert_eq!(dl.bytes_downloaded, 0);
         assert_eq!(dl.total_bytes, 5_000_000_000);
 
         // Update progress
-        db.update_download_progress(&dl_id, 1_000_000_000, "downloading")
+        db.update_download_progress(&dl_id, 1_000_000_000, &DownloadStatus::Downloading)
             .unwrap();
         let dl2 = db.get_download(&dl_id).unwrap().unwrap();
         assert_eq!(dl2.bytes_downloaded, 1_000_000_000);
-        assert_eq!(dl2.status, "downloading");
+        assert_eq!(dl2.status, DownloadStatus::Downloading);
 
         // Complete
-        db.update_download_progress(&dl_id, 5_000_000_000, "completed")
+        db.update_download_progress(&dl_id, 5_000_000_000, &DownloadStatus::Completed)
             .unwrap();
         let dl3 = db.get_download(&dl_id).unwrap().unwrap();
-        assert_eq!(dl3.status, "completed");
+        assert_eq!(dl3.status, DownloadStatus::Completed);
         assert_eq!(dl3.bytes_downloaded, 5_000_000_000);
 
         // List downloads
@@ -894,5 +926,25 @@ mod tests {
         // Verify the table exists by listing downloads (should be empty, not error)
         let downloads = db.list_downloads(None).unwrap();
         assert!(downloads.is_empty());
+    }
+
+    #[test]
+    fn download_status_display_and_parse() {
+        assert_eq!(DownloadStatus::Pending.to_string(), "pending");
+        assert_eq!(DownloadStatus::Downloading.to_string(), "downloading");
+        assert_eq!(DownloadStatus::Completed.to_string(), "completed");
+        assert_eq!(DownloadStatus::Failed.to_string(), "failed");
+
+        assert_eq!(DownloadStatus::from_str("pending"), DownloadStatus::Pending);
+        assert_eq!(
+            DownloadStatus::from_str("downloading"),
+            DownloadStatus::Downloading
+        );
+        assert_eq!(
+            DownloadStatus::from_str("completed"),
+            DownloadStatus::Completed
+        );
+        assert_eq!(DownloadStatus::from_str("failed"), DownloadStatus::Failed);
+        assert_eq!(DownloadStatus::from_str("unknown"), DownloadStatus::Pending);
     }
 }

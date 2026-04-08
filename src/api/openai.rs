@@ -60,10 +60,15 @@ pub async fn chat_completions(
         .await
         .map_err(|_| openai_error(StatusCode::PAYLOAD_TOO_LARGE, "Request body too large"))?;
 
-    // Extract model from body (required for routing)
-    let model_name = serde_json::from_slice::<Value>(&body_bytes)
-        .ok()
+    // Extract model and streaming flag from body
+    let request_json = serde_json::from_slice::<Value>(&body_bytes).ok();
+    let model_name = request_json
+        .as_ref()
         .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(String::from));
+    let is_streaming = request_json
+        .as_ref()
+        .and_then(|v| v.get("stream").and_then(|s| s.as_bool()))
+        .unwrap_or(false);
 
     // Extract tags from X-Herd-Tags header (comma-separated)
     let tags: Option<Vec<String>> = headers
@@ -204,32 +209,7 @@ pub async fn chat_completions(
     } else {
         "error"
     };
-
-    let log = crate::analytics::RequestLog {
-        timestamp: chrono::Utc::now().timestamp(),
-        model: model_name,
-        backend: selected_backend.unwrap_or_else(|| "none".to_string()),
-        duration_ms: duration.as_millis() as u64,
-        status: status.to_string(),
-        path: "/v1/chat/completions".to_string(),
-        request_id: Some(request_id.clone()),
-        tier: None,
-        classified_by: None,
-        tokens_in: None,
-        tokens_out: None,
-        tokens_per_second: None,
-        prompt_eval_ms: None,
-        eval_ms: None,
-        backend_type: None,
-    };
-    state
-        .metrics
-        .record_request(&log.backend, &log.status, log.duration_ms)
-        .await;
-
-    if let Err(e) = state.analytics.log_request(log).await {
-        tracing::error!("Failed to log request: {}", e);
-    }
+    let backend_name = selected_backend.unwrap_or_else(|| "none".to_string());
 
     // Bridge response back (reqwest → axum)
     let status_code = axum::http::StatusCode::from_u16(response.status().as_u16())
@@ -247,14 +227,108 @@ pub async fn chat_completions(
         }
     }
 
-    // Stream body for SSE streaming support
-    let body = axum::body::Body::from_stream(response.bytes_stream());
-    builder.body(body).map_err(|_| {
-        openai_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to build response",
-        )
-    })
+    if is_streaming {
+        // Streaming: pass through as-is, token extraction from SSE not yet supported
+        let log = crate::analytics::RequestLog {
+            timestamp: chrono::Utc::now().timestamp(),
+            model: model_name,
+            backend: backend_name.clone(),
+            duration_ms: duration.as_millis() as u64,
+            status: status.to_string(),
+            path: "/v1/chat/completions".to_string(),
+            request_id: Some(request_id.clone()),
+            tier: None,
+            classified_by: None,
+            tokens_in: None,
+            tokens_out: None,
+            tokens_per_second: None,
+            prompt_eval_ms: None,
+            eval_ms: None,
+            backend_type: None,
+        };
+        state
+            .metrics
+            .record_request(&log.backend, &log.status, log.duration_ms)
+            .await;
+        if let Err(e) = state.analytics.log_request(log).await {
+            tracing::error!("Failed to log request: {}", e);
+        }
+
+        let body = axum::body::Body::from_stream(response.bytes_stream());
+        builder.body(body).map_err(|_| {
+            openai_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to build response",
+            )
+        })
+    } else {
+        // Non-streaming: buffer body to extract token usage
+        let body_bytes = response.bytes().await.unwrap_or_default();
+
+        let mut tokens_in: Option<u32> = None;
+        let mut tokens_out: Option<u32> = None;
+        if let Ok(body_json) = serde_json::from_slice::<Value>(&body_bytes) {
+            if let Some(usage) = body_json.get("usage") {
+                tokens_in = usage
+                    .get("prompt_tokens")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32);
+                tokens_out = usage
+                    .get("completion_tokens")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32);
+            }
+        }
+
+        let duration_ms = duration.as_millis() as u64;
+        let log = crate::analytics::RequestLog {
+            timestamp: chrono::Utc::now().timestamp(),
+            model: model_name.clone(),
+            backend: backend_name.clone(),
+            duration_ms,
+            status: status.to_string(),
+            path: "/v1/chat/completions".to_string(),
+            request_id: Some(request_id.clone()),
+            tier: None,
+            classified_by: None,
+            tokens_in,
+            tokens_out,
+            tokens_per_second: None,
+            prompt_eval_ms: None,
+            eval_ms: None,
+            backend_type: None,
+        };
+        state
+            .metrics
+            .record_request(&log.backend, &log.status, duration_ms)
+            .await;
+        if let (Some(tin), Some(tout)) = (tokens_in, tokens_out) {
+            state
+                .metrics
+                .record_tokens(model_name.as_deref().unwrap_or("unknown"), tin, tout)
+                .await;
+            state
+                .metrics
+                .record_request_labeled(
+                    &backend_name,
+                    model_name.as_deref().unwrap_or("unknown"),
+                    status,
+                    duration_ms,
+                )
+                .await;
+        }
+        if let Err(e) = state.analytics.log_request(log).await {
+            tracing::error!("Failed to log request: {}", e);
+        }
+
+        let body = axum::body::Body::from(body_bytes);
+        builder.body(body).map_err(|_| {
+            openai_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to build response",
+            )
+        })
+    }
 }
 
 /// Returns an OpenAI-format error response.

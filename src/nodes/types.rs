@@ -185,9 +185,10 @@ impl Node {
                     .file_name()
                     .map(|f| f.to_string_lossy().to_string())
                     .unwrap_or_else(|| path.clone());
-                let loaded = self.models_loaded.iter().any(|m| {
-                    m == &file_name || m == path || file_name.contains(m) || m.contains(&file_name)
-                });
+                let loaded = self
+                    .models_loaded
+                    .iter()
+                    .any(|m| m == &file_name || m == path);
                 ModelRegistryEntry {
                     file_name,
                     file_path: path.clone(),
@@ -288,5 +289,104 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(reg.effective_url(), "http://test:11434");
+    }
+
+    #[test]
+    fn model_registry_exact_match_only() {
+        let node = Node {
+            id: "test".to_string(),
+            node_id: None,
+            hostname: "test".to_string(),
+            backend_url: "http://test:8090".to_string(),
+            backend: crate::config::BackendType::LlamaServer,
+            backend_version: None,
+            gpu: None,
+            gpu_vendor: None,
+            gpu_model: None,
+            gpu_backend: None,
+            cuda_version: None,
+            vram_mb: 0,
+            ram_mb: 0,
+            max_concurrent: 1,
+            ollama_version: None,
+            os: None,
+            status: "healthy".to_string(),
+            priority: 10,
+            enabled: true,
+            tags: vec![],
+            models_available: 0,
+            models_loaded: vec!["qwen".to_string()],
+            model_paths: vec![
+                "/models/qwen3-32b.gguf".to_string(),
+                "/models/qwen.gguf".to_string(),
+            ],
+            capabilities: vec![],
+            gpu_driver_version: None,
+            max_context_len: 4096,
+            recommended_config: serde_json::Value::Object(Default::default()),
+            config_applied: false,
+            last_health_check: None,
+            registered_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        let registry = node.model_registry();
+        // "qwen" should NOT match "qwen3-32b.gguf" (no contains matching)
+        assert!(
+            !registry[0].loaded,
+            "qwen3-32b.gguf should not match 'qwen'"
+        );
+        // "qwen" SHOULD match "qwen.gguf" (exact filename match — but filename is "qwen.gguf", not "qwen")
+        assert!(
+            !registry[1].loaded,
+            "qwen.gguf filename does not exactly match 'qwen'"
+        );
+    }
+
+    #[test]
+    fn model_registry_matches_by_path() {
+        let node = Node {
+            id: "test".to_string(),
+            node_id: None,
+            hostname: "test".to_string(),
+            backend_url: "http://test:8090".to_string(),
+            backend: crate::config::BackendType::LlamaServer,
+            backend_version: None,
+            gpu: None,
+            gpu_vendor: None,
+            gpu_model: None,
+            gpu_backend: None,
+            cuda_version: None,
+            vram_mb: 0,
+            ram_mb: 0,
+            max_concurrent: 1,
+            ollama_version: None,
+            os: None,
+            status: "healthy".to_string(),
+            priority: 10,
+            enabled: true,
+            tags: vec![],
+            models_available: 0,
+            models_loaded: vec![
+                "gemma-4-26B.gguf".to_string(),
+                "/models/qwen3-32b.gguf".to_string(),
+            ],
+            model_paths: vec![
+                "/models/gemma-4-26B.gguf".to_string(),
+                "/models/qwen3-32b.gguf".to_string(),
+            ],
+            capabilities: vec![],
+            gpu_driver_version: None,
+            max_context_len: 4096,
+            recommended_config: serde_json::Value::Object(Default::default()),
+            config_applied: false,
+            last_health_check: None,
+            registered_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        let registry = node.model_registry();
+        // Match by filename
+        assert!(registry[0].loaded, "gemma-4-26B.gguf matches by filename");
+        // Match by full path
+        assert!(registry[1].loaded, "/models/qwen3-32b.gguf matches by path");
     }
 }

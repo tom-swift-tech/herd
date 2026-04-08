@@ -48,9 +48,15 @@ impl SearchCache {
         None
     }
 
-    /// Store results in cache.
+    /// Store results in cache, evicting expired entries when the map grows large.
     async fn put(&self, key: String, results: Vec<ModelSearchResult>) {
         let mut map = self.entries.write().await;
+        // Evict expired entries if cache is large
+        if map.len() > 100 {
+            let now = Instant::now();
+            let ttl = std::time::Duration::from_secs(300);
+            map.retain(|_, e| now.duration_since(e.created_at) < ttl);
+        }
         map.insert(
             key,
             CacheEntry {
@@ -61,8 +67,7 @@ impl SearchCache {
     }
 }
 
-// Use a lazy-initialized global cache. Adding to AppState would require modifying
-// the struct which other teammates are also touching — a static is simpler.
+// Lazy-initialized global search cache, separate from AppState for simplicity.
 static SEARCH_CACHE: std::sync::OnceLock<SearchCache> = std::sync::OnceLock::new();
 
 fn cache() -> &'static SearchCache {
@@ -107,7 +112,9 @@ pub struct ModelSearchResponse {
 pub struct DownloadRequest {
     pub repo_id: String,
     pub file_name: String,
+    /// Reserved for future llama-server direct download support.
     #[serde(default)]
+    #[allow(dead_code)]
     pub target_path: Option<String>,
 }
 
@@ -218,6 +225,26 @@ fn cache_key(params: &ModelSearchParams) -> String {
     )
 }
 
+fn get_node_or_404(
+    node_db: &crate::nodes::NodeDb,
+    node_id: &str,
+) -> Result<crate::nodes::Node, (StatusCode, Json<serde_json::Value>)> {
+    node_db
+        .get_node(node_id)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Database error: {}", e)})),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Node not found"})),
+            )
+        })
+}
+
 // ---------------------------------------------------------------------------
 // GET /api/models/search
 // ---------------------------------------------------------------------------
@@ -287,7 +314,10 @@ pub async fn search_models(
     })?;
 
     // Get registered nodes for VRAM comparison
-    let nodes = state.node_db.list_nodes().unwrap_or_default();
+    let nodes = state.node_db.list_nodes().unwrap_or_else(|e| {
+        tracing::warn!("Failed to list nodes for VRAM compatibility: {}", e);
+        vec![]
+    });
 
     let mut results = Vec::new();
 
@@ -353,11 +383,13 @@ pub async fn search_models(
 }
 
 /// Determine which registered nodes have enough VRAM for the given file size.
+/// Applies a 1.2x safety multiplier to account for KV cache and runtime buffers.
 fn compute_fits_on(nodes: &[crate::nodes::Node], file_size_bytes: u64) -> Vec<String> {
     let file_size_mb = (file_size_bytes as f64 / (1024.0 * 1024.0)).ceil() as u64;
+    let estimated_vram_mb = file_size_mb * 6 / 5; // ~1.2x safety margin for KV cache
     nodes
         .iter()
-        .filter(|n| n.enabled && n.vram_mb as u64 >= file_size_mb)
+        .filter(|n| n.enabled && n.vram_mb as u64 >= estimated_vram_mb)
         .map(|n| n.hostname.clone())
         .collect()
 }
@@ -371,21 +403,7 @@ pub async fn download_model(
     Path(node_id): Path<String>,
     Json(req): Json<DownloadRequest>,
 ) -> Result<Json<DownloadResponse>, (StatusCode, Json<serde_json::Value>)> {
-    let node = state
-        .node_db
-        .get_node(&node_id)
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("Database error: {}", e)})),
-            )
-        })?
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "Node not found"})),
-            )
-        })?;
+    let node = get_node_or_404(&state.node_db, &node_id)?;
 
     match node.backend {
         BackendType::LlamaServer | BackendType::OpenAICompat => Err((
@@ -404,6 +422,8 @@ pub async fn download_model(
                 "stream": false,
             });
 
+            // NOTE: download_id is generated for client tracking but not yet persisted
+            // to the model_downloads table. Full progress tracking is a future enhancement.
             let download_id = uuid::Uuid::new_v4().to_string();
 
             // Fire the pull request using the long-timeout management client
@@ -451,21 +471,7 @@ pub async fn list_node_models(
     State(state): State<AppState>,
     Path(node_id): Path<String>,
 ) -> Result<Json<NodeModelsResponse>, (StatusCode, Json<serde_json::Value>)> {
-    let node = state
-        .node_db
-        .get_node(&node_id)
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("Database error: {}", e)})),
-            )
-        })?
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "Node not found"})),
-            )
-        })?;
+    let node = get_node_or_404(&state.node_db, &node_id)?;
 
     let (model_paths, model_registry) = match node.backend {
         BackendType::LlamaServer => {
@@ -494,21 +500,7 @@ pub async fn delete_node_model(
     State(state): State<AppState>,
     Path((node_id, model_name)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let node = state
-        .node_db
-        .get_node(&node_id)
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("Database error: {}", e)})),
-            )
-        })?
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "Node not found"})),
-            )
-        })?;
+    let node = get_node_or_404(&state.node_db, &node_id)?;
 
     match node.backend {
         BackendType::LlamaServer | BackendType::OpenAICompat => Err((
@@ -621,10 +613,10 @@ mod tests {
         let nodes = vec![
             test_node("big-node", 32768),
             test_node("small-node", 8192),
-            test_node("medium-node", 16384),
+            test_node("medium-node", 24576),
         ];
-        // ~15 GB file — fits on big-node and medium-node
-        let file_size = 15_000_000_000u64; // 14305 MB
+        // ~15 GB file — with 1.2x safety margin (~17167 MB), fits on big-node and medium-node
+        let file_size = 15_000_000_000u64; // 14305 MB raw, ~17167 MB with 1.2x
         let fits = compute_fits_on(&nodes, file_size);
         assert!(fits.contains(&"big-node".to_string()));
         assert!(fits.contains(&"medium-node".to_string()));

@@ -17,7 +17,7 @@ pub struct Metrics {
     pub routing_selections: Arc<RwLock<HashMap<String, AtomicU64>>>,
     /// Token counts by "{direction}|{model}" where direction is "in" or "out"
     pub tokens_total: Arc<RwLock<HashMap<String, AtomicU64>>>,
-    /// Tokens per second exponential moving average (stored as f32 bits in AtomicU64)
+    /// Tokens per second exponential moving average.
     pub tokens_per_second_ema: Arc<RwLock<f32>>,
     /// Labeled latency histogram by "{backend}|{model}|{status}"
     pub labeled_latency: Arc<RwLock<HashMap<String, LatencyHistogram>>>,
@@ -61,31 +61,59 @@ impl LatencyHistogram {
         // value exceeds all bucket bounds — counted in +Inf via self.count
     }
 
+    /// Render histogram buckets in Prometheus format with optional labels.
+    pub fn render_with_labels(&self, metric_name: &str, labels: &str) -> String {
+        let mut out = String::new();
+        let mut cumulative = 0u64;
+        for (i, bound) in self.bucket_bounds.iter().enumerate() {
+            cumulative += self.bucket_counts[i].load(Ordering::Relaxed);
+            if labels.is_empty() {
+                out.push_str(&format!(
+                    "{}_bucket{{le=\"{}\"}} {}\n",
+                    metric_name, bound, cumulative
+                ));
+            } else {
+                out.push_str(&format!(
+                    "{}_bucket{{{},le=\"{}\"}} {}\n",
+                    metric_name, labels, bound, cumulative
+                ));
+            }
+        }
+        let total = self.count.load(Ordering::Relaxed);
+        if labels.is_empty() {
+            out.push_str(&format!(
+                "{}_bucket{{le=\"+Inf\"}} {}\n",
+                metric_name, total
+            ));
+            out.push_str(&format!(
+                "{}_sum {}\n",
+                metric_name,
+                self.sum.load(Ordering::Relaxed)
+            ));
+            out.push_str(&format!("{}_count {}\n", metric_name, total));
+        } else {
+            out.push_str(&format!(
+                "{}_bucket{{{},le=\"+Inf\"}} {}\n",
+                metric_name, labels, total
+            ));
+            out.push_str(&format!(
+                "{}_sum{{{}}} {}\n",
+                metric_name,
+                labels,
+                self.sum.load(Ordering::Relaxed)
+            ));
+            out.push_str(&format!("{}_count{{{}}} {}\n", metric_name, labels, total));
+        }
+        out
+    }
+
     pub fn render(&self) -> String {
         let mut out = String::new();
         out.push_str(
             "# HELP herd_request_duration_ms Request duration histogram in milliseconds\n",
         );
         out.push_str("# TYPE herd_request_duration_ms histogram\n");
-        // Buckets are cumulative in Prometheus
-        let mut cumulative = 0u64;
-        for (i, bound) in self.bucket_bounds.iter().enumerate() {
-            cumulative += self.bucket_counts[i].load(Ordering::Relaxed);
-            out.push_str(&format!(
-                "herd_request_duration_ms_bucket{{le=\"{}\"}} {}\n",
-                bound, cumulative
-            ));
-        }
-        let total = self.count.load(Ordering::Relaxed);
-        out.push_str(&format!(
-            "herd_request_duration_ms_bucket{{le=\"+Inf\"}} {}\n",
-            total
-        ));
-        out.push_str(&format!(
-            "herd_request_duration_ms_sum {}\n",
-            self.sum.load(Ordering::Relaxed)
-        ));
-        out.push_str(&format!("herd_request_duration_ms_count {}\n", total));
+        out.push_str(&self.render_with_labels("herd_request_duration_ms", ""));
         out
     }
 }
@@ -173,6 +201,10 @@ impl Metrics {
     ) {
         let key = format!("{}|{}|{}", backend, model, status);
         let mut map = self.labeled_latency.write().await;
+        const MAX_LABEL_COMBOS: usize = 200;
+        if !map.contains_key(&key) && map.len() >= MAX_LABEL_COMBOS {
+            return; // Cardinality cap reached — skip to avoid memory growth
+        }
         map.entry(key)
             .or_insert_with(LatencyHistogram::new)
             .observe(duration_ms);
@@ -275,29 +307,9 @@ impl Metrics {
                         "backend=\"{}\", model=\"{}\", status=\"{}\"",
                         backend, model, status
                     );
-
-                    let mut cumulative = 0u64;
-                    for (i, bound) in hist.bucket_bounds.iter().enumerate() {
-                        cumulative += hist.bucket_counts[i].load(Ordering::Relaxed);
-                        out.push_str(&format!(
-                            "herd_request_duration_labeled_ms_bucket{{le=\"{}\", {}}} {}\n",
-                            bound, labels, cumulative
-                        ));
-                    }
-                    let total = hist.count.load(Ordering::Relaxed);
-                    out.push_str(&format!(
-                        "herd_request_duration_labeled_ms_bucket{{le=\"+Inf\", {}}} {}\n",
-                        labels, total
-                    ));
-                    out.push_str(&format!(
-                        "herd_request_duration_labeled_ms_sum{{{}}} {}\n",
-                        labels,
-                        hist.sum.load(Ordering::Relaxed)
-                    ));
-                    out.push_str(&format!(
-                        "herd_request_duration_labeled_ms_count{{{}}} {}\n",
-                        labels, total
-                    ));
+                    out.push_str(
+                        &hist.render_with_labels("herd_request_duration_labeled_ms", &labels),
+                    );
                 }
             }
         }
@@ -404,5 +416,57 @@ mod tests {
         assert!(output.contains(
             "herd_request_duration_labeled_ms_count{backend=\"gpu1\", model=\"llama3:8b\", status=\"success\"} 2"
         ));
+    }
+
+    #[tokio::test]
+    async fn labeled_histogram_cardinality_cap() {
+        let m = Metrics::new();
+        // Fill up to the cap (200 unique label combos)
+        for i in 0..200 {
+            m.record_request_labeled("gpu1", &format!("model-{}", i), "success", 100)
+                .await;
+        }
+        {
+            let map = m.labeled_latency.read().await;
+            assert_eq!(map.len(), 200);
+        }
+        // 201st unique combo should be silently dropped
+        m.record_request_labeled("gpu1", "model-overflow", "success", 100)
+            .await;
+        {
+            let map = m.labeled_latency.read().await;
+            assert_eq!(map.len(), 200);
+            assert!(!map.contains_key("gpu1|model-overflow|success"));
+        }
+        // Existing keys can still be updated
+        m.record_request_labeled("gpu1", "model-0", "success", 200)
+            .await;
+        {
+            let map = m.labeled_latency.read().await;
+            let hist = map.get("gpu1|model-0|success").unwrap();
+            assert_eq!(hist.count.load(Ordering::Relaxed), 2);
+        }
+    }
+
+    #[test]
+    fn render_with_labels_no_labels() {
+        let h = LatencyHistogram::new();
+        h.observe(5);
+        let rendered = h.render_with_labels("test_metric", "");
+        assert!(rendered.contains("test_metric_bucket{le=\"10\"} 1"));
+        assert!(rendered.contains("test_metric_bucket{le=\"+Inf\"} 1"));
+        assert!(rendered.contains("test_metric_sum 5"));
+        assert!(rendered.contains("test_metric_count 1"));
+    }
+
+    #[test]
+    fn render_with_labels_with_labels() {
+        let h = LatencyHistogram::new();
+        h.observe(5);
+        let rendered = h.render_with_labels("test_metric", "backend=\"gpu1\"");
+        assert!(rendered.contains("test_metric_bucket{backend=\"gpu1\",le=\"10\"} 1"));
+        assert!(rendered.contains("test_metric_bucket{backend=\"gpu1\",le=\"+Inf\"} 1"));
+        assert!(rendered.contains("test_metric_sum{backend=\"gpu1\"} 5"));
+        assert!(rendered.contains("test_metric_count{backend=\"gpu1\"} 1"));
     }
 }

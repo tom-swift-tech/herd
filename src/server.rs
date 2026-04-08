@@ -508,15 +508,25 @@ impl Server {
             .route(
                 "/api/nodes/:id/models",
                 axum::routing::get(crate::api::models::list_node_models),
-            )
-            .route(
-                "/api/nodes/:id/models/download",
-                axum::routing::post(crate::api::models::download_model),
-            )
-            .route(
-                "/api/nodes/:id/models/:model_name",
-                axum::routing::delete(crate::api::models::delete_node_model),
             );
+
+        // Destructive model endpoints require authentication
+        {
+            let model_mgmt_routes = axum::Router::new()
+                .route(
+                    "/api/nodes/:id/models/download",
+                    axum::routing::post(crate::api::models::download_model),
+                )
+                .route(
+                    "/api/nodes/:id/models/:model_name",
+                    axum::routing::delete(crate::api::models::delete_node_model),
+                )
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    require_api_key,
+                ));
+            app = app.merge(model_mgmt_routes);
+        }
 
         // Conditionally mount metrics
         if self.config.observability.metrics {
@@ -1010,7 +1020,6 @@ async fn proxy_handler(
         }
     }
 
-    let duration = start.elapsed();
     let status = match &response {
         Some(r) if r.status().is_success() => "success",
         _ => "error",
@@ -1027,67 +1036,70 @@ async fn proxy_handler(
     };
     let backend_type_str = backend_type.map(|bt| bt.to_string());
 
-    // Helper: build and log the RequestLog + record metrics
-    let log_and_record = |usage: TokenUsage,
-                          state: AppState,
-                          model_name: Option<String>,
-                          selected_backend: String,
-                          duration_ms: u64,
-                          status: String,
-                          path: String,
-                          request_id: String,
-                          tier: Option<String>,
-                          classified_by: Option<String>,
-                          backend_type_str: Option<String>| async move {
-        let log = RequestLog {
-            timestamp: chrono::Utc::now().timestamp(),
-            model: model_name.clone(),
-            backend: selected_backend,
-            duration_ms,
-            status: status.clone(),
-            path,
-            request_id: Some(request_id),
-            tier,
-            classified_by,
-            tokens_in: usage.tokens_in,
-            tokens_out: usage.tokens_out,
-            tokens_per_second: usage.tokens_per_second,
-            prompt_eval_ms: usage.prompt_eval_ms,
-            eval_ms: usage.eval_ms,
-            backend_type: backend_type_str,
-        };
+    // Context struct for proxy request logging/metrics (avoids 11-parameter closures)
+    struct ProxyRequestContext {
+        state: AppState,
+        model_name: Option<String>,
+        selected_backend: String,
+        path: String,
+        request_id: String,
+        tier: Option<String>,
+        classified_by: Option<String>,
+        backend_type_str: Option<String>,
+        start: std::time::Instant,
+    }
 
-        state
-            .metrics
-            .record_request(&log.backend, &log.status, log.duration_ms)
-            .await;
+    impl ProxyRequestContext {
+        async fn log_and_record(&self, status: &str, usage: TokenUsage) {
+            let duration_ms = self.start.elapsed().as_millis() as u64;
+            let log = RequestLog {
+                timestamp: chrono::Utc::now().timestamp(),
+                model: self.model_name.clone(),
+                backend: self.selected_backend.clone(),
+                duration_ms,
+                status: status.to_string(),
+                path: self.path.clone(),
+                request_id: Some(self.request_id.clone()),
+                tier: self.tier.clone(),
+                classified_by: self.classified_by.clone(),
+                tokens_in: usage.tokens_in,
+                tokens_out: usage.tokens_out,
+                tokens_per_second: usage.tokens_per_second,
+                prompt_eval_ms: usage.prompt_eval_ms,
+                eval_ms: usage.eval_ms,
+                backend_type: self.backend_type_str.clone(),
+            };
 
-        // Record token metrics
-        if let (Some(tin), Some(tout)) = (usage.tokens_in, usage.tokens_out) {
-            state
+            self.state
                 .metrics
-                .record_tokens(model_name.as_deref().unwrap_or("unknown"), tin, tout)
+                .record_request(&log.backend, &log.status, log.duration_ms)
                 .await;
-        }
-        if let Some(tps) = usage.tokens_per_second {
-            state.metrics.record_tokens_per_second(tps).await;
-        }
 
-        // Record labeled latency
-        state
-            .metrics
-            .record_request_labeled(
-                &log.backend,
-                model_name.as_deref().unwrap_or("unknown"),
-                &status,
-                log.duration_ms,
-            )
-            .await;
+            if let (Some(tin), Some(tout)) = (usage.tokens_in, usage.tokens_out) {
+                self.state
+                    .metrics
+                    .record_tokens(self.model_name.as_deref().unwrap_or("unknown"), tin, tout)
+                    .await;
+            }
+            if let Some(tps) = usage.tokens_per_second {
+                self.state.metrics.record_tokens_per_second(tps).await;
+            }
 
-        if let Err(e) = state.analytics.log_request(log).await {
-            tracing::error!("Failed to log request: {}", e);
+            self.state
+                .metrics
+                .record_request_labeled(
+                    &log.backend,
+                    self.model_name.as_deref().unwrap_or("unknown"),
+                    status,
+                    log.duration_ms,
+                )
+                .await;
+
+            if let Err(e) = self.state.analytics.log_request(log).await {
+                tracing::error!("Failed to log request: {}", e);
+            }
         }
-    };
+    }
 
     match response {
         Some(r) => {
@@ -1127,23 +1139,39 @@ async fn proxy_handler(
                 let last_data = Arc::new(tokio::sync::Mutex::new(Option::<Vec<u8>>::None));
                 let last_data_capture = last_data.clone();
 
+                // Oneshot channel to signal stream completion (replaces Arc::strong_count polling)
+                let (stream_done_tx, stream_done_rx) = tokio::sync::oneshot::channel::<()>();
+                let mut stream_done_tx = Some(stream_done_tx);
+
                 let inner_stream = r.bytes_stream();
                 let capturing_stream = futures_util::stream::unfold(
-                    (inner_stream, last_data_capture),
-                    |(mut stream, last_data)| async move {
+                    (inner_stream, last_data_capture, stream_done_tx.take()),
+                    |(mut stream, last_data, stream_done_tx)| async move {
                         use futures_util::StreamExt;
                         match stream.next().await {
                             Some(Ok(chunk)) => {
-                                // Check if this chunk contains SSE data lines
                                 if let Some(data) = extract_last_sse_data(&chunk) {
                                     *last_data.lock().await = Some(data);
                                 }
-                                Some((Ok::<_, std::io::Error>(chunk), (stream, last_data)))
+                                Some((
+                                    Ok::<_, std::io::Error>(chunk),
+                                    (stream, last_data, stream_done_tx),
+                                ))
                             }
                             Some(Err(e)) => {
-                                Some((Err(std::io::Error::other(e)), (stream, last_data)))
+                                tracing::warn!("Stream error from backend: {}", e);
+                                Some((
+                                    Err(std::io::Error::other(e)),
+                                    (stream, last_data, stream_done_tx),
+                                ))
                             }
-                            None => None,
+                            None => {
+                                // Stream ended — signal the waiting task
+                                if let Some(tx) = stream_done_tx {
+                                    let _ = tx.send(());
+                                }
+                                None
+                            }
                         }
                     },
                 );
@@ -1154,49 +1182,27 @@ async fn proxy_handler(
                     .map_err(|_| axum::http::StatusCode::BAD_GATEWAY)?;
 
                 // Fire-and-forget: extract tokens after stream ends
-                let state_clone = state.clone();
-                let path_clone = path.clone();
-                let model_clone = model_name.clone();
-                let request_id_clone = request_id.clone();
-                let duration_ms = duration.as_millis() as u64;
-                let status_str = status.to_string();
-                let bt_str = backend_type_str.clone();
+                let ctx = ProxyRequestContext {
+                    state: state.clone(),
+                    model_name: model_name.clone(),
+                    selected_backend: selected,
+                    path: path.clone(),
+                    request_id: request_id.clone(),
+                    tier,
+                    classified_by,
+                    backend_type_str: backend_type_str.clone(),
+                    start,
+                };
                 tokio::spawn(async move {
-                    // Wait briefly for stream to complete, then check
-                    // The last_data will be populated as the stream flows
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    // Try to get the captured data (may not be available yet for long streams)
-                    // We'll wait up to the routing timeout for the stream to finish
-                    let mut attempts = 0;
-                    loop {
-                        let data = last_data.lock().await.clone();
-                        // The Arc strong count drops to 1 when the stream is done
-                        // (the capturing_stream closure is dropped)
-                        if Arc::strong_count(&last_data) <= 1 || attempts > 600 {
-                            let usage = if let Some(data) = data {
-                                extract_tokens_from_response(&data, &path_clone, bt)
-                            } else {
-                                TokenUsage::default()
-                            };
-                            log_and_record(
-                                usage,
-                                state_clone,
-                                model_clone,
-                                selected,
-                                duration_ms,
-                                status_str,
-                                path_clone,
-                                request_id_clone,
-                                tier,
-                                classified_by,
-                                bt_str,
-                            )
-                            .await;
-                            break;
-                        }
-                        attempts += 1;
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                    }
+                    // Wait for stream to complete via oneshot signal
+                    let _ = stream_done_rx.await;
+                    let data = last_data.lock().await.clone();
+                    let usage = if let Some(data) = data {
+                        extract_tokens_from_response(&data, &ctx.path, bt)
+                    } else {
+                        TokenUsage::default()
+                    };
+                    ctx.log_and_record(status, usage).await;
                 });
 
                 Ok(resp)
@@ -1204,22 +1210,19 @@ async fn proxy_handler(
                 // Non-streaming: buffer body, extract tokens, then forward
                 let body_bytes = r.bytes().await.unwrap_or_default();
                 let usage = extract_tokens_from_response(&body_bytes, &path, bt);
-                let duration_ms = duration.as_millis() as u64;
 
-                log_and_record(
-                    usage,
-                    state.clone(),
-                    model_name.clone(),
-                    selected,
-                    duration_ms,
-                    status.to_string(),
-                    path.clone(),
-                    request_id.clone(),
+                let ctx = ProxyRequestContext {
+                    state: state.clone(),
+                    model_name: model_name.clone(),
+                    selected_backend: selected,
+                    path: path.clone(),
+                    request_id: request_id.clone(),
                     tier,
                     classified_by,
                     backend_type_str,
-                )
-                .await;
+                    start,
+                };
+                ctx.log_and_record(status, usage).await;
 
                 let body = axum::body::Body::from(body_bytes);
                 builder
@@ -1228,20 +1231,18 @@ async fn proxy_handler(
             }
         }
         None => {
-            log_and_record(
-                TokenUsage::default(),
-                state.clone(),
-                model_name.clone(),
-                selected_backend.unwrap_or_else(|| "none".to_string()),
-                duration.as_millis() as u64,
-                status.to_string(),
-                path.clone(),
-                request_id.clone(),
-                classification.map(|c| c.tier.clone()),
-                classification.map(|c| c.classified_by.clone()),
+            let ctx = ProxyRequestContext {
+                state: state.clone(),
+                model_name: model_name.clone(),
+                selected_backend: selected_backend.unwrap_or_else(|| "none".to_string()),
+                path: path.clone(),
+                request_id: request_id.clone(),
+                tier: classification.map(|c| c.tier.clone()),
+                classified_by: classification.map(|c| c.classified_by.clone()),
                 backend_type_str,
-            )
-            .await;
+                start,
+            };
+            ctx.log_and_record(status, TokenUsage::default()).await;
 
             let body = axum::body::Body::from(format!(
                 "{{\"error\":\"Bad Gateway\",\"request_id\":\"{}\"}}",

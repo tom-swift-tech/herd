@@ -18,6 +18,26 @@ server:
   port: 40114                    # Listen port (default: 40114)
   api_key: "your-secret-key"    # Required for admin API endpoints (/admin/*)
   rate_limit: 0                  # Global requests/sec limit; 0 = unlimited
+                                 # (legacy — prefer rate_limiting.global below)
+
+# === RATE LIMITING ===
+# Per-client rate limiting with API key mapping.
+# Off by default (global: 0 = unlimited, no clients).
+# Clients are identified by API key from Authorization: Bearer or X-Api-Key headers.
+# Response headers: X-Herd-RateLimit-Limit, X-Herd-RateLimit-Remaining, X-Herd-RateLimit-Reset
+
+# rate_limiting:
+#   global: 100          # requests/sec for unauthenticated/unknown clients (0 = unlimited)
+#   clients:
+#     - name: my-agent
+#       api_key: sk-agent-12345
+#       rate_limit: 50   # requests/sec for this client
+#     - name: dashboard
+#       api_key: sk-dash-67890
+#       rate_limit: 200
+#     - name: vip-client
+#       api_key: sk-vip-99999
+#       rate_limit: 0    # 0 = unlimited for this client
 
 # === ROUTING ===
 
@@ -28,6 +48,34 @@ routing:
   default_keep_alive: "-1"       # Injected into every /api/generate and /api/chat request body.
                                  # "-1" = never unload; "5m" = 5 minutes; "0" = unload immediately.
                                  # Overrides whatever the client sent. Not injected on /v1/* paths.
+
+# === ROUTING PROFILES ===
+# Named routing presets. Clients select via X-Herd-Profile header.
+# Off by default — when disabled, global routing config is used for all requests.
+
+# routing_profiles:
+#   enabled: false
+#   default_profile: balanced
+#   profiles:
+#     fast:
+#       strategy: priority
+#       description: "Fastest response — routes to highest-priority backend"
+#     balanced:
+#       strategy: least_busy
+#       description: "Balanced load across all backends"
+#     gpu-only:
+#       strategy: model_aware
+#       tags: [gpu]
+#       description: "Route only to GPU-tagged backends"
+#     local:
+#       strategy: priority
+#       backends: [local-ollama]
+#       description: "Route only to local Ollama instance"
+#     coding:
+#       strategy: model_aware
+#       preferred_model: "qwen2.5-coder:32b"
+#       tags: [gpu, high-vram]
+#       description: "Coding tasks — prefers large coding model on GPU backends"
 
 # === MODEL WARMER ===
 # Replaces the old model_homing block from v0.4.2.
@@ -123,6 +171,56 @@ backends:
   #   tags:
   #     - "external"
   #   # health_check_path defaults to /v1/models for openai-compat backends
+
+# === DISCOVERY ===
+# Multi-node fleet discovery. Automatically probes and registers remote Herd nodes.
+# Off by default — zero overhead when disabled.
+#
+# discovery:
+#   enabled: false
+#   probe_interval_secs: 60          # How often to re-probe static nodes (default: 60, min: 10)
+#   static_nodes:
+#     - url: http://192.168.1.100:8090
+#       backend: llama-server        # Backend type: ollama (default), llama-server, openai-compat
+#       tags: [gpu, nvidia]
+#       priority: 10
+#     - url: http://192.168.1.101:11434
+#       backend: ollama
+#       hostname: minipc             # Optional hostname override (default: extracted from URL)
+#       tags: [gpu]
+#   mdns:
+#     enabled: false                 # Requires building with --features mdns (not yet implemented)
+#     service_name: "_herd._tcp.local."
+#     broadcast: true
+#     listen: true
+
+# === TLS ===
+# Optional HTTPS support. Off by default. Requires building with --features tls.
+# Falls back to HTTP gracefully if cert/key files are missing or malformed.
+#
+# tls:
+#   enabled: false
+#   cert_path: /path/to/cert.pem
+#   key_path: /path/to/key.pem
+#   redirect_http: false            # Spawn a second listener that 301-redirects HTTP → HTTPS
+#   redirect_port: 80               # Port for the HTTP redirect listener (default: 80)
+
+# === BUDGET CAPS ===
+# Track estimated API-equivalent cost and enforce per-client/per-model limits.
+# Off by default — zero overhead when disabled. Costs are estimated from token
+# counts using tiered pricing (see analytics.rs estimate_api_cost).
+# Clients are identified via the X-Herd-Client header.
+#
+# budget:
+#   enabled: false
+#   global_limit_usd: 50.00         # Total spend cap across all clients/models (0 = unlimited)
+#   reset_period: monthly            # daily, weekly, monthly
+#   action: reject                   # reject (429) or warn (log + allow)
+#   clients:
+#     agent-team: 20.00
+#     dashboard: 5.00
+#   models:
+#     "llama3:70b": 30.00
 
 # === CIRCUIT BREAKER ===
 # Automatically stops routing to failing backends and probes them for recovery.

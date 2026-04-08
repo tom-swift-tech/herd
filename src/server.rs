@@ -135,6 +135,8 @@ pub struct AppState {
     pub session_store: Arc<SessionStore>,
     pub agent_audit: Arc<AgentAudit>,
     pub node_db: Arc<crate::nodes::NodeDb>,
+    pub budget: Arc<crate::budget::BudgetTracker>,
+    pub rate_limiter: Arc<crate::rate_limit::RateLimiter>,
     pub routing_timeout_ms: Arc<AtomicU64>,
     pub routing_retry_count: Arc<AtomicU32>,
     pub config_path: Option<PathBuf>,
@@ -254,6 +256,7 @@ impl AppState {
             .store(new_timeout.as_millis() as u64, Ordering::Relaxed);
         self.routing_retry_count
             .store(new_config.routing.retry_count, Ordering::Relaxed);
+        self.budget.update_config(new_config.budget.clone()).await;
         *self.config.write().await = new_config.clone();
 
         let mut msg = format!(
@@ -422,6 +425,21 @@ impl Server {
         let node_poller = crate::nodes::NodeHealthPoller::new(10, 60);
         node_poller.spawn(Arc::clone(&node_db), Arc::clone(&pool));
 
+        // Start multi-node discovery (static fleet probing)
+        if self.config.discovery.enabled {
+            let discovery = crate::discovery::NodeDiscovery::new(self.config.discovery.clone());
+            discovery.spawn(Arc::clone(&node_db));
+        }
+
+        let budget = crate::budget::BudgetTracker::new(self.config.budget.clone());
+
+        // Build per-client rate limiter config, merging legacy server.rate_limit
+        let mut rl_config = self.config.rate_limiting.clone();
+        if rl_config.global == 0 && self.config.server.rate_limit > 0 {
+            rl_config.global = self.config.server.rate_limit;
+        }
+        let rate_limiter = Arc::new(crate::rate_limit::RateLimiter::new(&rl_config));
+
         let state = AppState {
             pool: Arc::clone(&pool),
             router: Arc::new(tokio::sync::RwLock::new(router)),
@@ -433,6 +451,8 @@ impl Server {
             agent_audit,
             metrics,
             node_db,
+            budget,
+            rate_limiter,
             routing_timeout_ms: Arc::new(AtomicU64::new(routing_timeout.as_millis() as u64)),
             routing_retry_count: Arc::new(AtomicU32::new(self.config.routing.retry_count)),
             config_path: self.config_path.clone(),
@@ -508,7 +528,31 @@ impl Server {
             .route(
                 "/api/nodes/:id/models",
                 axum::routing::get(crate::api::models::list_node_models),
+            )
+            // Ollama blob extraction (read-only listing is public)
+            .route(
+                "/api/ollama/models",
+                axum::routing::get(crate::api::models::list_ollama_blobs),
+            )
+            // Routing profiles (public read)
+            .route(
+                "/api/profiles",
+                axum::routing::get(crate::api::profiles::list_profiles),
             );
+
+        // Set default profile (admin auth required)
+        {
+            let profile_admin_routes = axum::Router::new()
+                .route(
+                    "/api/profiles/default",
+                    axum::routing::put(crate::api::profiles::set_default_profile),
+                )
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    require_api_key,
+                ));
+            app = app.merge(profile_admin_routes);
+        }
 
         // Destructive model endpoints require authentication
         {
@@ -520,6 +564,11 @@ impl Server {
                 .route(
                     "/api/nodes/:id/models/:model_name",
                     axum::routing::delete(crate::api::models::delete_node_model),
+                )
+                // Blob extraction writes to disk — requires auth
+                .route(
+                    "/api/ollama/extract",
+                    axum::routing::post(crate::api::models::extract_ollama_blob),
                 )
                 .layer(axum::middleware::from_fn_with_state(
                     state.clone(),
@@ -538,6 +587,9 @@ impl Server {
                     axum::routing::get(agent_analytics_handler),
                 );
         }
+
+        // Budget summary endpoint (always mounted, returns empty if disabled)
+        app = app.route("/api/budget", axum::routing::get(budget_handler));
 
         // Conditionally mount admin API (requires auth)
         if admin_api_enabled {
@@ -627,43 +679,57 @@ impl Server {
             );
         }
 
-        // Proxy (catch-all) + middleware layers
-        let app = if self.config.server.rate_limit > 0 {
-            let limiter = Arc::new(RateLimiter::new(self.config.server.rate_limit));
-            let mut app = app
-                .fallback(proxy_handler)
-                .layer(tower::ServiceBuilder::new().layer(TraceLayer::new_for_http()))
-                .layer(axum::middleware::from_fn(
-                    move |req, next: axum::middleware::Next| {
-                        let limiter = Arc::clone(&limiter);
-                        async move {
-                            if limiter.try_acquire() {
-                                Ok(next.run(req).await)
-                            } else {
-                                Err(axum::http::StatusCode::TOO_MANY_REQUESTS)
+        // Proxy (catch-all) + middleware layers (per-client rate limiting)
+        let rate_limiter_mw = Arc::clone(&state.rate_limiter);
+        let mut app = app
+            .fallback(proxy_handler)
+            .layer(tower::ServiceBuilder::new().layer(TraceLayer::new_for_http()))
+            .layer(axum::middleware::from_fn(
+                move |req: axum::extract::Request, next: axum::middleware::Next| {
+                    let limiter = Arc::clone(&rate_limiter_mw);
+                    async move {
+                        let api_key = extract_api_key(&req);
+                        let result = limiter.check_rate_limit(api_key.as_deref()).await;
+
+                        match result {
+                            Ok(info) => {
+                                let mut response = next.run(req).await;
+                                inject_rate_limit_headers(response.headers_mut(), &info);
+                                Ok::<_, axum::response::Response>(response)
+                            }
+                            Err(info) => {
+                                let retry_after_ms = info
+                                    .reset_at
+                                    .saturating_sub(
+                                        std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs(),
+                                    )
+                                    .saturating_mul(1000)
+                                    .max(1000);
+                                let body = serde_json::json!({
+                                    "error": "Rate limit exceeded",
+                                    "retry_after_ms": retry_after_ms
+                                });
+                                let mut response = axum::response::IntoResponse::into_response((
+                                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                                    axum::Json(body),
+                                ));
+                                inject_rate_limit_headers(response.headers_mut(), &info);
+                                Ok(response)
                             }
                         }
-                    },
-                ));
-            if classifier_enabled {
-                app = app.layer(axum::middleware::from_fn_with_state(
-                    state.clone(),
-                    crate::classifier::classify_task,
-                ));
-            }
-            app.with_state(state)
-        } else {
-            let mut app = app
-                .fallback(proxy_handler)
-                .layer(tower::ServiceBuilder::new().layer(TraceLayer::new_for_http()));
-            if classifier_enabled {
-                app = app.layer(axum::middleware::from_fn_with_state(
-                    state.clone(),
-                    crate::classifier::classify_task,
-                ));
-            }
-            app.with_state(state)
-        };
+                    }
+                },
+            ));
+        if classifier_enabled {
+            app = app.layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::classifier::classify_task,
+            ));
+        }
+        let app = app.with_state(state);
 
         // Start config file watcher (polls every 30s)
         if let Some(ref config_path) = self.config_path {
@@ -695,57 +761,153 @@ impl Server {
             });
         }
 
-        // Start server
+        // Start server — try TLS if configured, fall back to HTTP on failure
+        #[cfg(feature = "tls")]
+        if self.config.tls.enabled {
+            match self.try_start_tls(&addr, app).await {
+                Ok(()) => return Ok(()),
+                Err(tls_err) => {
+                    tracing::warn!(
+                        "TLS configured but failed to start — falling back to HTTP: {}",
+                        tls_err
+                    );
+                    // Cannot recover `app` after move; rebuild is not practical.
+                    // Return the TLS error so the operator knows what happened.
+                    return Err(tls_err);
+                }
+            }
+        }
+
+        #[cfg(not(feature = "tls"))]
+        if self.config.tls.enabled {
+            tracing::warn!(
+                "TLS configured in herd.yaml but the 'tls' feature is not compiled in — starting HTTP instead. \
+                 Rebuild with: cargo build --features tls"
+            );
+        }
+
         let listener = tokio::net::TcpListener::bind(&addr).await?;
+        info!("Listening on http://{}", addr);
         axum::serve(listener, app).await?;
+
+        Ok(())
+    }
+
+    /// Attempt to start an HTTPS server using rustls. Returns Ok(()) if the server
+    /// ran (and eventually shut down), or Err if TLS setup failed so the caller can
+    /// report the issue.
+    #[cfg(feature = "tls")]
+    async fn try_start_tls(
+        &self,
+        addr: &str,
+        app: axum::Router,
+    ) -> Result<()> {
+        use axum_server::tls_rustls::RustlsConfig;
+
+        let cert_path = self.config.tls.cert_path.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("TLS enabled but cert_path is not set")
+        })?;
+        let key_path = self.config.tls.key_path.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("TLS enabled but key_path is not set")
+        })?;
+
+        if !std::path::Path::new(cert_path).exists() {
+            anyhow::bail!("TLS cert_path does not exist: {}", cert_path);
+        }
+        if !std::path::Path::new(key_path).exists() {
+            anyhow::bail!("TLS key_path does not exist: {}", key_path);
+        }
+
+        let rustls_config = RustlsConfig::from_pem_file(cert_path, key_path)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to load TLS cert/key: {}", e))?;
+
+        info!("TLS enabled — listening on https://{}", addr);
+
+        // Optional HTTP → HTTPS redirect listener
+        if self.config.tls.redirect_http {
+            let redirect_port = self.config.tls.redirect_port;
+            let host = self.config.server.host.clone();
+            let target_port = self.config.server.port;
+            info!("HTTP redirect active on port {}", redirect_port);
+
+            tokio::spawn(async move {
+                let redirect_app = axum::Router::new().fallback(
+                    move |req: axum::http::Request<axum::body::Body>| async move {
+                        let host_header = req
+                            .headers()
+                            .get(axum::http::header::HOST)
+                            .and_then(|v| v.to_str().ok())
+                            .map(|h| {
+                                // Strip port from host header if present
+                                h.split(':').next().unwrap_or(h).to_string()
+                            })
+                            .unwrap_or_else(|| "localhost".to_string());
+
+                        let path_and_query = req
+                            .uri()
+                            .path_and_query()
+                            .map(|pq| pq.as_str())
+                            .unwrap_or("/");
+
+                        let target = if target_port == 443 {
+                            format!("https://{}{}", host_header, path_and_query)
+                        } else {
+                            format!("https://{}:{}{}", host_header, target_port, path_and_query)
+                        };
+
+                        axum::response::Redirect::permanent(&target)
+                    },
+                );
+
+                let redirect_addr = format!("{}:{}", host, redirect_port);
+                match tokio::net::TcpListener::bind(&redirect_addr).await {
+                    Ok(listener) => {
+                        if let Err(e) = axum::serve(listener, redirect_app.into_make_service()).await
+                        {
+                            tracing::error!("HTTP redirect listener failed: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to bind HTTP redirect listener on {}: {}",
+                            redirect_addr,
+                            e
+                        );
+                    }
+                }
+            });
+        }
+
+        let socket_addr: std::net::SocketAddr = addr.parse()?;
+        axum_server::bind_rustls(socket_addr, rustls_config)
+            .serve(app.into_make_service())
+            .await?;
 
         Ok(())
     }
 }
 
 // ---------------------------------------------------------------------------
-// Token-bucket rate limiter
+// Rate limit response headers
 // ---------------------------------------------------------------------------
 
-struct RateLimiter {
-    tokens: Arc<std::sync::atomic::AtomicU64>,
-}
-
-impl RateLimiter {
-    fn new(requests_per_second: u64) -> Self {
-        let tokens = Arc::new(std::sync::atomic::AtomicU64::new(requests_per_second));
-        // Spawn refill task
-        let tokens_clone = Arc::clone(&tokens);
-        let max = requests_per_second;
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(1));
-            loop {
-                ticker.tick().await;
-                tokens_clone.store(max, std::sync::atomic::Ordering::Relaxed);
-            }
-        });
-        Self { tokens }
+fn inject_rate_limit_headers(
+    headers: &mut axum::http::HeaderMap,
+    info: &crate::rate_limit::RateLimitInfo,
+) {
+    // Only inject headers when rate limiting is active (limit > 0)
+    if info.limit == 0 {
+        return;
     }
-
-    fn try_acquire(&self) -> bool {
-        loop {
-            let current = self.tokens.load(std::sync::atomic::Ordering::Relaxed);
-            if current == 0 {
-                return false;
-            }
-            if self
-                .tokens
-                .compare_exchange_weak(
-                    current,
-                    current - 1,
-                    std::sync::atomic::Ordering::Relaxed,
-                    std::sync::atomic::Ordering::Relaxed,
-                )
-                .is_ok()
-            {
-                return true;
-            }
-        }
+    if let Ok(v) = axum::http::HeaderValue::from_str(&info.limit.to_string()) {
+        headers.insert("x-herd-ratelimit-limit", v);
+    }
+    if let Ok(v) = axum::http::HeaderValue::from_str(&info.remaining.to_string()) {
+        headers.insert("x-herd-ratelimit-remaining", v);
+    }
+    if let Ok(v) = axum::http::HeaderValue::from_str(&info.reset_at.to_string()) {
+        headers.insert("x-herd-ratelimit-reset", v);
     }
 }
 
@@ -912,13 +1074,65 @@ async fn proxy_handler(
         }
     }
 
+    // Extract client identifier from X-Herd-Client header (for budget tracking)
+    let client_name: Option<String> = headers
+        .get("x-herd-client")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    // Budget check (before routing to avoid wasting backend resources)
+    {
+        state.budget.reset_if_needed().await;
+        let budget_status = state
+            .budget
+            .check_budget(
+                client_name.as_deref(),
+                model_name.as_deref().unwrap_or("unknown"),
+            )
+            .await;
+
+        match budget_status {
+            crate::budget::BudgetStatus::Exceeded {
+                cap_type,
+                limit,
+                current,
+            } => {
+                let body = serde_json::json!({
+                    "error": "Budget exceeded",
+                    "cap": cap_type,
+                    "limit": limit,
+                    "current": current,
+                });
+                return Ok(axum::response::Response::builder()
+                    .status(axum::http::StatusCode::TOO_MANY_REQUESTS)
+                    .header("content-type", "application/json")
+                    .header("x-request-id", &request_id)
+                    .body(axum::body::Body::from(body.to_string()))
+                    .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?);
+            }
+            crate::budget::BudgetStatus::Warning {
+                cap_type,
+                limit,
+                current,
+            } => {
+                tracing::warn!(
+                    "Budget warning: {} at {:.2}/{:.2} USD",
+                    cap_type,
+                    current,
+                    limit
+                );
+            }
+            crate::budget::BudgetStatus::Ok { .. } => {}
+        }
+    }
+
     // Prepare both versions of the body — keep_alive is Ollama-specific
     let keep_alive_value = state.config.read().await.routing.default_keep_alive.clone();
     let forward_bytes_ollama = inject_keep_alive(&body_bytes, &path, &keep_alive_value);
     let forward_bytes_raw = body_bytes.clone();
 
     // Extract tags from X-Herd-Tags header (comma-separated)
-    let tags: Option<Vec<String>> = headers
+    let request_tags: Option<Vec<String>> = headers
         .get("x-herd-tags")
         .and_then(|v| v.to_str().ok())
         .map(|s| {
@@ -928,10 +1142,47 @@ async fn proxy_handler(
                 .collect()
         });
 
+    // Resolve routing profile (X-Herd-Profile header or default)
+    let profile_header = headers
+        .get("x-herd-profile")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let resolved = {
+        let config = state.config.read().await;
+        crate::profiles::resolve_profile(&config, profile_header.as_deref())
+    };
+
+    // Merge tags: request tags take precedence, profile tags are baseline
+    let tags: Option<Vec<String>> = if request_tags.is_some() {
+        request_tags
+    } else if !resolved.tags.is_empty() {
+        Some(resolved.tags.clone())
+    } else {
+        None
+    };
+
+    // If profile specifies a preferred model and request didn't specify one, use it
+    if model_name.is_none() {
+        if let Some(ref preferred) = resolved.preferred_model {
+            model_name = Some(preferred.clone());
+        }
+    }
+
+    let profile_name = resolved.profile_name.clone();
+
     // Retry loop: try routing to different backends on failure
     let mut response = None;
     let mut selected_backend: Option<String> = None;
     let mut excluded = HashSet::new();
+
+    // If profile restricts to specific backends, pre-exclude all others
+    if !resolved.backends.is_empty() {
+        for name in state.pool.all().await {
+            if !resolved.backends.contains(&name) {
+                excluded.insert(name);
+            }
+        }
+    }
 
     for _ in 0..=state.retry_count() {
         let backend = state
@@ -1040,6 +1291,7 @@ async fn proxy_handler(
     struct ProxyRequestContext {
         state: AppState,
         model_name: Option<String>,
+        client_name: Option<String>,
         selected_backend: String,
         path: String,
         request_id: String,
@@ -1098,6 +1350,16 @@ async fn proxy_handler(
             if let Err(e) = self.state.analytics.log_request(log).await {
                 tracing::error!("Failed to log request: {}", e);
             }
+
+            // Record cost for budget tracking
+            if let (Some(tin), Some(tout)) = (usage.tokens_in, usage.tokens_out) {
+                let model = self.model_name.as_deref().unwrap_or("unknown");
+                let cost = crate::analytics::estimate_api_cost(model, tin as u64, tout as u64);
+                self.state
+                    .budget
+                    .record_cost(self.client_name.as_deref(), model, cost)
+                    .await;
+            }
         }
     }
 
@@ -1109,6 +1371,13 @@ async fn proxy_handler(
             let mut builder = axum::response::Response::builder()
                 .status(status_code)
                 .header("x-request-id", &request_id);
+
+            // Add routing profile header if a profile was used
+            if let Some(ref pname) = profile_name {
+                if let Ok(val) = axum::http::HeaderValue::from_str(pname) {
+                    builder = builder.header("x-herd-profile", val);
+                }
+            }
 
             // Forward response headers (bridge reqwest http 0.2 → axum http 1.x)
             for (name, value) in r.headers() {
@@ -1185,6 +1454,7 @@ async fn proxy_handler(
                 let ctx = ProxyRequestContext {
                     state: state.clone(),
                     model_name: model_name.clone(),
+                    client_name: client_name.clone(),
                     selected_backend: selected,
                     path: path.clone(),
                     request_id: request_id.clone(),
@@ -1214,6 +1484,7 @@ async fn proxy_handler(
                 let ctx = ProxyRequestContext {
                     state: state.clone(),
                     model_name: model_name.clone(),
+                    client_name: client_name.clone(),
                     selected_backend: selected,
                     path: path.clone(),
                     request_id: request_id.clone(),
@@ -1234,6 +1505,7 @@ async fn proxy_handler(
             let ctx = ProxyRequestContext {
                 state: state.clone(),
                 model_name: model_name.clone(),
+                client_name: client_name.clone(),
                 selected_backend: selected_backend.unwrap_or_else(|| "none".to_string()),
                 path: path.clone(),
                 request_id: request_id.clone(),
@@ -1385,6 +1657,16 @@ async fn analytics_handler(
             "error": format!("Failed to get analytics: {}", e)
         })),
     }
+}
+
+async fn budget_handler(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> axum::Json<serde_json::Value> {
+    let summary = state.budget.get_summary().await;
+    axum::Json(
+        serde_json::to_value(&summary)
+            .unwrap_or_else(|_| serde_json::json!({"error": "serialization failed"})),
+    )
 }
 
 async fn agent_analytics_handler(
@@ -1721,12 +2003,14 @@ mod tests {
             router: Arc::new(tokio::sync::RwLock::new(router)),
             client: Arc::new(reqwest::Client::new()),
             mgmt_client: Arc::new(reqwest::Client::new()),
-            config: Arc::new(tokio::sync::RwLock::new(initial)),
+            config: Arc::new(tokio::sync::RwLock::new(initial.clone())),
             analytics: Arc::new(Analytics::new().unwrap()),
             session_store: Arc::new(SessionStore::new(100)),
             agent_audit: Arc::new(AgentAudit::new().unwrap()),
             metrics: Arc::new(crate::metrics::Metrics::new()),
             node_db: Arc::new(crate::nodes::NodeDb::open().unwrap()),
+            budget: crate::budget::BudgetTracker::new(initial.budget.clone()),
+            rate_limiter: Arc::new(crate::rate_limit::RateLimiter::new(&initial.rate_limiting)),
             routing_timeout_ms: Arc::new(AtomicU64::new(1_000)),
             routing_retry_count: Arc::new(AtomicU32::new(1)),
             config_path: Some(temp_path.clone()),
@@ -1950,5 +2234,54 @@ mod tests {
     fn extract_last_sse_data_empty() {
         let result = extract_last_sse_data(b"");
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn tls_config_missing_cert_path_detected() {
+        let tls = crate::config::TlsConfig {
+            enabled: true,
+            cert_path: None,
+            key_path: Some("/tmp/key.pem".into()),
+            ..Default::default()
+        };
+        assert!(tls.cert_path.is_none());
+    }
+
+    #[test]
+    fn tls_config_missing_key_path_detected() {
+        let tls = crate::config::TlsConfig {
+            enabled: true,
+            cert_path: Some("/tmp/cert.pem".into()),
+            key_path: None,
+            ..Default::default()
+        };
+        assert!(tls.key_path.is_none());
+    }
+
+    #[test]
+    fn tls_redirect_url_standard_port() {
+        // When target port is 443, the URL should omit the port
+        let target_port: u16 = 443;
+        let host = "example.com";
+        let path = "/v1/chat/completions";
+        let url = if target_port == 443 {
+            format!("https://{}{}", host, path)
+        } else {
+            format!("https://{}:{}{}", host, target_port, path)
+        };
+        assert_eq!(url, "https://example.com/v1/chat/completions");
+    }
+
+    #[test]
+    fn tls_redirect_url_custom_port() {
+        let target_port: u16 = 40114;
+        let host = "example.com";
+        let path = "/v1/chat/completions";
+        let url = if target_port == 443 {
+            format!("https://{}{}", host, path)
+        } else {
+            format!("https://{}:{}{}", host, target_port, path)
+        };
+        assert_eq!(url, "https://example.com:40114/v1/chat/completions");
     }
 }

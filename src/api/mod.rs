@@ -3,6 +3,7 @@ pub mod agent;
 pub mod models;
 pub mod nodes;
 pub mod openai;
+pub mod profiles;
 pub mod status;
 
 // Re-export handlers for convenience

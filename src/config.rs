@@ -30,6 +30,21 @@ pub struct Config {
 
     #[serde(default)]
     pub agent: AgentConfig,
+
+    #[serde(default)]
+    pub routing_profiles: crate::profiles::RoutingProfilesConfig,
+
+    #[serde(default)]
+    pub tls: TlsConfig,
+
+    #[serde(default)]
+    pub rate_limiting: RateLimitConfig,
+
+    #[serde(default)]
+    pub budget: BudgetConfig,
+
+    #[serde(default)]
+    pub discovery: DiscoveryConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -426,6 +441,174 @@ fn default_session_ttl() -> u64 {
     60
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+
+    #[serde(default)]
+    pub cert_path: Option<String>,
+
+    #[serde(default)]
+    pub key_path: Option<String>,
+
+    /// Redirect HTTP to HTTPS on a separate port
+    #[serde(default)]
+    pub redirect_http: bool,
+
+    /// Port for HTTP redirect listener (default: 80)
+    #[serde(default = "default_redirect_port")]
+    pub redirect_port: u16,
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cert_path: None,
+            key_path: None,
+            redirect_http: false,
+            redirect_port: default_redirect_port(),
+        }
+    }
+}
+
+fn default_redirect_port() -> u16 {
+    80
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RateLimitConfig {
+    /// Global rate limit (requests/sec). 0 = unlimited. Applies to unauthenticated requests.
+    #[serde(default)]
+    pub global: u64,
+
+    /// Per-client rate limits by API key name.
+    #[serde(default)]
+    pub clients: Vec<ClientRateLimit>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientRateLimit {
+    /// API key for this client
+    pub api_key: String,
+
+    /// Requests per second (0 = unlimited)
+    #[serde(default)]
+    pub rate_limit: u64,
+
+    /// Optional descriptive name
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BudgetConfig {
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Global budget cap in USD. 0.0 = unlimited.
+    #[serde(default)]
+    pub global_limit_usd: f32,
+
+    /// Per-client budget caps (keyed by client name from X-Herd-Client header).
+    #[serde(default)]
+    pub clients: HashMap<String, f32>,
+
+    /// Per-model budget caps.
+    #[serde(default)]
+    pub models: HashMap<String, f32>,
+
+    /// Reset period: "daily", "weekly", "monthly". Default: "monthly".
+    #[serde(default = "default_budget_period")]
+    pub reset_period: String,
+
+    /// Action when budget exceeded: "reject" (429) or "warn" (log + allow).
+    #[serde(default = "default_budget_action")]
+    pub action: String,
+}
+
+impl Default for BudgetConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            global_limit_usd: 0.0,
+            clients: HashMap::new(),
+            models: HashMap::new(),
+            reset_period: default_budget_period(),
+            action: default_budget_action(),
+        }
+    }
+}
+
+fn default_budget_period() -> String {
+    "monthly".to_string()
+}
+fn default_budget_action() -> String {
+    "reject".to_string()
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DiscoveryConfig {
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Static fleet: list of known Herd node URLs to probe and register
+    #[serde(default)]
+    pub static_nodes: Vec<StaticNodeConfig>,
+
+    /// mDNS discovery settings
+    #[serde(default)]
+    pub mdns: MdnsConfig,
+
+    /// How often to re-probe static nodes (seconds). Default: 60.
+    #[serde(default = "default_probe_interval")]
+    pub probe_interval_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StaticNodeConfig {
+    /// URL of the remote node's API (e.g., "http://192.168.1.100:8090")
+    pub url: String,
+    /// Backend type: ollama, llama-server, openai-compat
+    #[serde(default)]
+    pub backend: BackendType,
+    /// Optional hostname override
+    #[serde(default)]
+    pub hostname: Option<String>,
+    /// Tags to apply to this node
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Priority override
+    #[serde(default = "default_discovery_priority")]
+    pub priority: u32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MdnsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Service name for mDNS. Default: "_herd._tcp.local."
+    #[serde(default = "default_mdns_service")]
+    pub service_name: String,
+    /// Whether to broadcast this instance. Default: true when mDNS enabled.
+    #[serde(default = "default_true")]
+    pub broadcast: bool,
+    /// Whether to listen for other instances. Default: true when mDNS enabled.
+    #[serde(default = "default_true")]
+    pub listen: bool,
+}
+
+fn default_probe_interval() -> u64 {
+    60
+}
+fn default_discovery_priority() -> u32 {
+    50
+}
+fn default_mdns_service() -> String {
+    "_herd._tcp.local.".to_string()
+}
+
 impl Config {
     pub fn from_file(path: &Path) -> Result<Self> {
         let content = fs::read_to_string(path)?;
@@ -511,6 +694,17 @@ impl Config {
 
     pub fn to_yaml(&self) -> Result<String> {
         Ok(serde_yaml::to_string(self)?)
+    }
+
+    /// Returns the effective global rate limit.
+    /// If `rate_limiting.global` is set (non-zero), it takes precedence.
+    /// Otherwise falls back to the legacy `server.rate_limit` field.
+    pub fn effective_global_rate_limit(&self) -> u64 {
+        if self.rate_limiting.global > 0 {
+            self.rate_limiting.global
+        } else {
+            self.server.rate_limit
+        }
     }
 }
 
@@ -668,5 +862,252 @@ backends:
         assert_eq!(config.backends.len(), 2);
         assert_eq!(config.backends[0].backend, BackendType::Ollama);
         assert_eq!(config.backends[1].backend, BackendType::Ollama);
+    }
+
+    #[test]
+    fn tls_config_defaults() {
+        let tls = super::TlsConfig::default();
+        assert!(!tls.enabled);
+        assert!(tls.cert_path.is_none());
+        assert!(tls.key_path.is_none());
+        assert!(!tls.redirect_http);
+        assert_eq!(tls.redirect_port, 80);
+    }
+
+    #[test]
+    fn tls_config_deserializes_from_yaml() {
+        let yaml = r#"
+tls:
+  enabled: true
+  cert_path: /etc/ssl/cert.pem
+  key_path: /etc/ssl/key.pem
+  redirect_http: true
+  redirect_port: 8080
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.tls.enabled);
+        assert_eq!(config.tls.cert_path.as_deref(), Some("/etc/ssl/cert.pem"));
+        assert_eq!(config.tls.key_path.as_deref(), Some("/etc/ssl/key.pem"));
+        assert!(config.tls.redirect_http);
+        assert_eq!(config.tls.redirect_port, 8080);
+    }
+
+    #[test]
+    fn config_without_tls_section_backward_compat() {
+        let yaml = r#"
+server:
+  host: 0.0.0.0
+  port: 40114
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(!config.tls.enabled);
+        assert!(config.tls.cert_path.is_none());
+    }
+
+    #[test]
+    fn routing_profiles_defaults_disabled() {
+        let config: Config = serde_yaml::from_str("{}").unwrap();
+        assert!(!config.routing_profiles.enabled);
+        assert!(config.routing_profiles.default_profile.is_none());
+        assert!(config.routing_profiles.profiles.is_empty());
+    }
+
+    #[test]
+    fn routing_profiles_deserializes_from_yaml() {
+        let yaml = r#"
+routing_profiles:
+  enabled: true
+  default_profile: balanced
+  profiles:
+    fast:
+      strategy: priority
+      description: "Fastest response"
+    balanced:
+      strategy: least_busy
+      tags:
+        - gpu
+      backends:
+        - local-ollama
+      preferred_model: "llama3:8b"
+      description: "Balanced"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.routing_profiles.enabled);
+        assert_eq!(
+            config.routing_profiles.default_profile.as_deref(),
+            Some("balanced")
+        );
+        assert_eq!(config.routing_profiles.profiles.len(), 2);
+
+        let fast = &config.routing_profiles.profiles["fast"];
+        assert_eq!(fast.strategy, super::RoutingStrategy::Priority);
+        assert!(fast.tags.is_empty());
+        assert!(fast.backends.is_empty());
+        assert!(fast.preferred_model.is_none());
+        assert_eq!(fast.description.as_deref(), Some("Fastest response"));
+
+        let balanced = &config.routing_profiles.profiles["balanced"];
+        assert_eq!(balanced.strategy, super::RoutingStrategy::LeastBusy);
+        assert_eq!(balanced.tags, vec!["gpu"]);
+        assert_eq!(balanced.backends, vec!["local-ollama"]);
+        assert_eq!(balanced.preferred_model.as_deref(), Some("llama3:8b"));
+    }
+
+    #[test]
+    fn config_without_routing_profiles_backward_compat() {
+        let yaml = r#"
+server:
+  host: 0.0.0.0
+  port: 40114
+routing:
+  strategy: priority
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(!config.routing_profiles.enabled);
+        assert!(config.routing_profiles.profiles.is_empty());
+    }
+
+    #[test]
+    fn discovery_config_defaults_disabled() {
+        let config: Config = serde_yaml::from_str("{}").unwrap();
+        assert!(!config.discovery.enabled);
+        assert!(config.discovery.static_nodes.is_empty());
+        assert!(!config.discovery.mdns.enabled);
+        assert_eq!(config.discovery.probe_interval_secs, 60);
+    }
+
+    #[test]
+    fn discovery_config_deserializes_static_nodes() {
+        let yaml = r#"
+discovery:
+  enabled: true
+  probe_interval_secs: 30
+  static_nodes:
+    - url: http://192.168.1.100:8090
+      backend: llama-server
+      tags: [gpu, nvidia]
+      priority: 10
+    - url: http://192.168.1.101:11434
+      backend: ollama
+      hostname: minipc
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.discovery.enabled);
+        assert_eq!(config.discovery.probe_interval_secs, 30);
+        assert_eq!(config.discovery.static_nodes.len(), 2);
+
+        let n0 = &config.discovery.static_nodes[0];
+        assert_eq!(n0.url, "http://192.168.1.100:8090");
+        assert_eq!(n0.backend, BackendType::LlamaServer);
+        assert_eq!(n0.tags, vec!["gpu", "nvidia"]);
+        assert_eq!(n0.priority, 10);
+        assert!(n0.hostname.is_none());
+
+        let n1 = &config.discovery.static_nodes[1];
+        assert_eq!(n1.url, "http://192.168.1.101:11434");
+        assert_eq!(n1.backend, BackendType::Ollama);
+        assert_eq!(n1.hostname.as_deref(), Some("minipc"));
+        assert_eq!(n1.priority, 50); // default
+    }
+
+    #[test]
+    fn discovery_config_mdns_defaults() {
+        let yaml = r#"
+discovery:
+  enabled: true
+  mdns:
+    enabled: true
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.discovery.mdns.enabled);
+        assert_eq!(config.discovery.mdns.service_name, "_herd._tcp.local.");
+        assert!(config.discovery.mdns.broadcast);
+        assert!(config.discovery.mdns.listen);
+    }
+
+    #[test]
+    fn config_without_discovery_section_backward_compat() {
+        let yaml = r#"
+server:
+  host: 0.0.0.0
+  port: 40114
+routing:
+  strategy: priority
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(!config.discovery.enabled);
+        assert!(config.discovery.static_nodes.is_empty());
+    }
+
+    #[test]
+    fn rate_limit_config_deserializes_from_yaml() {
+        let yaml = r#"
+rate_limiting:
+  global: 100
+  clients:
+    - name: my-agent
+      api_key: sk-agent-12345
+      rate_limit: 50
+    - name: dashboard
+      api_key: sk-dash-67890
+      rate_limit: 200
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.rate_limiting.global, 100);
+        assert_eq!(config.rate_limiting.clients.len(), 2);
+        assert_eq!(config.rate_limiting.clients[0].api_key, "sk-agent-12345");
+        assert_eq!(config.rate_limiting.clients[0].rate_limit, 50);
+        assert_eq!(
+            config.rate_limiting.clients[0].name.as_deref(),
+            Some("my-agent")
+        );
+        assert_eq!(config.rate_limiting.clients[1].rate_limit, 200);
+    }
+
+    #[test]
+    fn rate_limit_config_defaults_to_disabled() {
+        let config: Config = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(config.rate_limiting.global, 0);
+        assert!(config.rate_limiting.clients.is_empty());
+    }
+
+    #[test]
+    fn effective_global_rate_limit_prefers_rate_limiting_global() {
+        let yaml = r#"
+server:
+  rate_limit: 50
+rate_limiting:
+  global: 100
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.effective_global_rate_limit(), 100);
+    }
+
+    #[test]
+    fn effective_global_rate_limit_falls_back_to_server_rate_limit() {
+        let yaml = r#"
+server:
+  rate_limit: 50
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.effective_global_rate_limit(), 50);
+    }
+
+    #[test]
+    fn backward_compat_old_config_without_rate_limiting() {
+        let yaml = r#"
+server:
+  host: 0.0.0.0
+  port: 40114
+  rate_limit: 10
+backends:
+  - name: gpu1
+    url: http://localhost:11434
+    priority: 100
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.server.rate_limit, 10);
+        assert_eq!(config.rate_limiting.global, 0);
+        assert_eq!(config.effective_global_rate_limit(), 10);
     }
 }

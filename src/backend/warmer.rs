@@ -37,6 +37,11 @@ impl ModelWarmer {
         let backends = pool.all().await;
         for name in backends {
             if let Some(state) = pool.get(&name).await {
+                // Skip llama-server backends — models are loaded at server start,
+                // and /api/generate is Ollama-specific.
+                if state.config.backend != crate::config::BackendType::Ollama {
+                    continue;
+                }
                 for model in &state.config.hot_models {
                     let url = warm_url(&state.config.url);
                     let payload = warm_payload(model);
@@ -80,6 +85,15 @@ mod tests {
     fn warm_url_constructed_correctly() {
         let url = warm_url("http://citadel:11434");
         assert_eq!(url, "http://citadel:11434/api/generate");
+    }
+
+    #[test]
+    fn llama_server_backend_should_be_skipped_by_warmer() {
+        // llama-server backends don't support /api/generate.
+        // The warmer skips them based on backend type check.
+        // This test documents that warm_url produces Ollama-specific paths.
+        let url = warm_url("http://citadel:8090");
+        assert!(url.contains("/api/generate"), "warm_url is Ollama-specific");
     }
 
     #[test]

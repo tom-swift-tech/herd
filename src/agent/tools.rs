@@ -115,7 +115,11 @@ async fn execute_read_file(args: &serde_json::Value) -> ToolResult {
     match tokio::fs::metadata(path).await {
         Ok(meta) if meta.len() > MAX_READ_BYTES => {
             return ToolResult {
-                content: format!("File too large ({} bytes, max {})", meta.len(), MAX_READ_BYTES),
+                content: format!(
+                    "File too large ({} bytes, max {})",
+                    meta.len(),
+                    MAX_READ_BYTES
+                ),
                 success: false,
             };
         }

@@ -46,7 +46,9 @@ impl Router for ModelAwareRouter {
 
         // Fall back to highest priority healthy backend
         let backend = if let Some(tags) = tags {
-            self.pool.get_by_priority_tagged_excluding(tags, excluded).await
+            self.pool
+                .get_by_priority_tagged_excluding(tags, excluded)
+                .await
         } else {
             self.pool.get_by_priority_excluding(excluded).await
         }
@@ -147,5 +149,50 @@ mod tests {
         let result = router.route(Some("llama3"), None).await.unwrap();
         // Should pick gpu2 (least busy) despite gpu1 having higher priority
         assert_eq!(result.name, "gpu2");
+    }
+
+    #[tokio::test]
+    async fn mixed_fleet_routes_to_correct_backend() {
+        // Simulate a mixed fleet: Ollama node with many models, llama-server with one model
+        let ollama_backend = Backend {
+            name: "ollama-node".into(),
+            url: "http://ollama:11434".into(),
+            priority: 100,
+            backend: crate::config::BackendType::Ollama,
+            ..Default::default()
+        };
+        let llama_backend = Backend {
+            name: "llama-node".into(),
+            url: "http://llama:8090".into(),
+            priority: 50,
+            backend: crate::config::BackendType::LlamaServer,
+            ..Default::default()
+        };
+
+        let pool = BackendPool::new(
+            vec![ollama_backend, llama_backend],
+            3,
+            Duration::from_secs(60),
+        );
+
+        // Ollama has many models, llama-server has only one
+        pool.update_models("ollama-node", vec!["llama3:8b".into(), "mistral:7b".into()])
+            .await;
+        pool.update_models("llama-node", vec!["qwen2:14b".into()])
+            .await;
+
+        let router = ModelAwareRouter::new(pool);
+
+        // Request for qwen2:14b should route to llama-node (only node with it)
+        let result = router.route(Some("qwen2:14b"), None).await.unwrap();
+        assert_eq!(result.name, "llama-node");
+
+        // Request for llama3:8b should route to ollama-node (only node with it)
+        let result = router.route(Some("llama3:8b"), None).await.unwrap();
+        assert_eq!(result.name, "ollama-node");
+
+        // Request for unknown model falls back to priority (ollama-node has 100)
+        let result = router.route(Some("unknown:model"), None).await.unwrap();
+        assert_eq!(result.name, "ollama-node");
     }
 }

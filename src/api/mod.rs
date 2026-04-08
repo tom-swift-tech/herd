@@ -1,5 +1,6 @@
 pub mod admin;
 pub mod agent;
+pub mod models;
 pub mod nodes;
 pub mod openai;
 pub mod status;

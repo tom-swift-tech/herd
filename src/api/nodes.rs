@@ -69,8 +69,12 @@ pub async fn register_node(
     tracing::info!(
         "Node {} ({}) {} — id={}",
         reg.hostname,
-        reg.ollama_url,
-        if is_new { "registered" } else { "re-registered" },
+        reg.effective_url(),
+        if is_new {
+            "registered"
+        } else {
+            "re-registered"
+        },
         id
     );
 
@@ -220,16 +224,14 @@ pub async fn download_script(
     };
 
     // Determine public URL: prefer explicit env var, fall back to Host header
-    let public_url = std::env::var("HERD_PUBLIC_URL")
-        .ok()
-        .unwrap_or_else(|| {
-            let host = req
-                .headers()
-                .get("host")
-                .and_then(|h| h.to_str().ok())
-                .unwrap_or("localhost:40114");
-            format!("http://{}", host)
-        });
+    let public_url = std::env::var("HERD_PUBLIC_URL").ok().unwrap_or_else(|| {
+        let host = req
+            .headers()
+            .get("host")
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("localhost:40114");
+        format!("http://{}", host)
+    });
 
     let config = state.config.read().await;
     let enrollment_key = config.server.enrollment_key.clone().unwrap_or_default();

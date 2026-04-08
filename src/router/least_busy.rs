@@ -23,7 +23,9 @@ impl Router for LeastBusyRouter {
         excluded: &HashSet<String>,
     ) -> anyhow::Result<RoutedBackend> {
         let backend = if let Some(tags) = tags {
-            self.pool.get_least_busy_tagged_excluding(tags, excluded).await
+            self.pool
+                .get_least_busy_tagged_excluding(tags, excluded)
+                .await
         } else {
             self.pool.get_least_busy_excluding(excluded).await
         }

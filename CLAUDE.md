@@ -11,11 +11,24 @@
 | **Repo** | `swift-innovate/herd` (GitHub) |
 | **Language** | Rust |
 | **Version** | 0.9.0 |
-| **Purpose** | Intelligent Ollama router — GPU-aware routing, circuit breakers, OpenAI compat, agent sessions, fleet management, dashboard |
+| **Purpose** | Intelligent LLM router — GPU-aware routing, circuit breakers, OpenAI compat, agent sessions, fleet management, dashboard |
 
-Herd is a single-binary reverse proxy for Ollama backends. It routes AI workloads across local GPU nodes with model awareness, health tracking, and observability.
+Herd is a single-binary reverse proxy for local LLM backends. It routes AI workloads across local GPU nodes with model awareness, health tracking, and observability.
 
 As of v0.9.0, the former private "Herd Pro" repository has been merged into this repo. **There is only one Herd repo now.**
+
+## Backend Strategy
+
+Herd supports two backend types per node:
+
+1. **Ollama** (current, stable) — Herd talks to Ollama's HTTP API. herd-tune configures Ollama env vars.
+2. **llama-server** (target for v1.x) — Herd talks to llama.cpp's llama-server via its OpenAI-compatible API. herd-tune detects GPU vendor, downloads the correct llama-server binary, and starts it.
+
+**Why llama-server?** Benchmarked on RTX 5090 (2026-04-08): llama-server delivers 44-80% faster TTFT and ~4x throughput vs Ollama on the same model and hardware. Ollama's Go serving layer is the bottleneck. Full benchmark data and architecture details in `docs/LLAMA_CPP_BACKEND.md`.
+
+**Herd doesn't care about GPU vendor.** Both backends expose OpenAI-compatible HTTP. The GPU backend complexity (CUDA vs ROCm vs SYCL vs Vulkan) is pushed to node setup via herd-tune. Herd routes requests — it doesn't do inference.
+
+**Important:** Ollama support is NOT being removed. Both backends coexist. The `backend` field in node registration distinguishes them. Existing Ollama fleet deployments continue working unchanged.
 
 ## Architecture
 
@@ -48,6 +61,12 @@ cargo test           # 111 tests (unit + integration)
 cargo build --release  # Release build
 ```
 
+## Key Design Docs
+
+- `docs/LLAMA_CPP_BACKEND.md` — Benchmark results, llama-server backend strategy, GPU support matrix, herd-tune changes, fleet architecture
+- `docs/specs/herd-tune-spec.md` — Node auto-registration spec (supports both Ollama and llama-server backends)
+- `ROADMAP.md` — Release milestones and feature targets
+
 ## Code Quality Rules
 
 - All new features default to `enabled: false` — zero overhead when not opted in
@@ -57,11 +76,16 @@ cargo build --release  # Release build
 - Tests for each feature — at minimum: enabled/disabled, happy path, edge cases
 - All public-facing headers use the `X-Herd-` prefix
 - **Never bail! on config errors** — degrade gracefully, warn+disable features
+- **Backend-agnostic routing** — routing logic must work identically for Ollama and llama-server backends. Use the `backend` field in node registration to determine health check paths and model list behavior, but the router itself treats all nodes as OpenAI-compatible HTTP endpoints.
 
 ## Commit Format
 
 Use conventional commits: `feat:`, `fix:`, `chore:`, `refactor:`, `docs:`, `test:`
 
+Git default branch is `main`. Always `git branch -M main` after `git init`.
+
 ## Roadmap
 
-See `ROADMAP.md`. Next milestone targets: budget caps, routing profiles, multi-model consensus.
+See `ROADMAP.md`. Current priorities:
+- **llama-server backend support** — herd-tune GPU detection, binary download, backend-aware health checks
+- Budget caps, routing profiles, multi-model consensus (v1.0+)

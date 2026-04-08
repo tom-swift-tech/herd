@@ -57,7 +57,11 @@ pub async fn create_session(
         .await
         .map_err(|e| (StatusCode::CONFLICT, e))?;
 
-    tracing::info!("Created agent session {} (model: {})", session.id, session.model);
+    tracing::info!(
+        "Created agent session {} (model: {})",
+        session.id,
+        session.model
+    );
     state
         .agent_audit
         .log_session_created(&session.id, &session.model)
@@ -65,9 +69,7 @@ pub async fn create_session(
     Ok((StatusCode::CREATED, Json(summarize(&session))))
 }
 
-pub async fn list_sessions(
-    State(state): State<AppState>,
-) -> Json<Vec<SessionSummary>> {
+pub async fn list_sessions(State(state): State<AppState>) -> Json<Vec<SessionSummary>> {
     let sessions = state.session_store.list().await;
     Json(sessions.iter().map(summarize).collect())
 }

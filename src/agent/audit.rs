@@ -185,7 +185,11 @@ impl AgentAudit {
             }
             temp.flush()?;
             std::fs::rename(&temp_path, &self.log_path)?;
-            tracing::info!("Audit log cleanup: removed {} old entries, kept {}", removed, kept_lines.len());
+            tracing::info!(
+                "Audit log cleanup: removed {} old entries, kept {}",
+                removed,
+                kept_lines.len()
+            );
         }
 
         Ok(removed)

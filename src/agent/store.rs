@@ -38,7 +38,11 @@ impl SessionStore {
                 match std::fs::read_to_string(&path) {
                     Ok(content) => match serde_json::from_str::<Session>(&content) {
                         Ok(session) => {
-                            tracing::info!("Restored session {} (model: {})", session.id, session.model);
+                            tracing::info!(
+                                "Restored session {} (model: {})",
+                                session.id,
+                                session.model
+                            );
                             locks.insert(session.id.clone(), Arc::new(Mutex::new(())));
                             sessions.insert(session.id.clone(), session);
                         }
@@ -384,7 +388,10 @@ mod tests {
         // Create and populate
         {
             let store = SessionStore::persistent(10, dir.clone()).unwrap();
-            let session = store.create("llama3:8b".into(), Some("test".into())).await.unwrap();
+            let session = store
+                .create("llama3:8b".into(), Some("test".into()))
+                .await
+                .unwrap();
             assert!(dir.join(format!("{}.json", session.id)).exists());
         }
 

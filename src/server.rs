@@ -1,5 +1,5 @@
-use crate::agent::{AgentAudit, SessionStore};
 use crate::agent::ws as agent_ws;
+use crate::agent::{AgentAudit, SessionStore};
 use crate::analytics::{Analytics, RequestLog};
 use crate::api::{admin, agent, openai};
 use crate::backend::{BackendPool, HealthChecker, ModelDiscovery, ModelWarmer};
@@ -19,6 +19,103 @@ const DEFAULT_ROUTING_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_CIRCUIT_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_RECOVERY_TIME: Duration = Duration::from_secs(60);
 const MAX_PROXY_BODY_BYTES: usize = 10 * 1024 * 1024; // 10 MB
+
+// ---------------------------------------------------------------------------
+// Token extraction from proxy responses
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default)]
+struct TokenUsage {
+    tokens_in: Option<u32>,
+    tokens_out: Option<u32>,
+    tokens_per_second: Option<f32>,
+    prompt_eval_ms: Option<u64>,
+    eval_ms: Option<u64>,
+}
+
+/// Extract token usage from a response body based on backend type and request path.
+///
+/// Ollama `/api/generate` and `/api/chat` responses include:
+///   prompt_eval_count, eval_count, prompt_eval_duration, eval_duration
+///
+/// llama-server/OpenAI-compat `/v1/chat/completions` responses include:
+///   usage.prompt_tokens, usage.completion_tokens
+fn extract_tokens_from_response(
+    body: &[u8],
+    path: &str,
+    backend_type: crate::config::BackendType,
+) -> TokenUsage {
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return TokenUsage::default();
+    };
+
+    match backend_type {
+        crate::config::BackendType::Ollama => {
+            if !path.contains("/api/generate") && !path.contains("/api/chat") {
+                return TokenUsage::default();
+            }
+            let tokens_in = json
+                .get("prompt_eval_count")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32);
+            let tokens_out = json
+                .get("eval_count")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32);
+            let prompt_eval_duration = json.get("prompt_eval_duration").and_then(|v| v.as_u64());
+            let eval_duration = json.get("eval_duration").and_then(|v| v.as_u64());
+
+            let prompt_eval_ms = prompt_eval_duration.map(|d| d / 1_000_000);
+            let eval_ms = eval_duration.map(|d| d / 1_000_000);
+            let tokens_per_second = match (tokens_out, eval_duration) {
+                (Some(count), Some(dur)) if dur > 0 => {
+                    Some(count as f32 / (dur as f32 / 1_000_000_000.0))
+                }
+                _ => None,
+            };
+
+            TokenUsage {
+                tokens_in,
+                tokens_out,
+                tokens_per_second,
+                prompt_eval_ms,
+                eval_ms,
+            }
+        }
+        crate::config::BackendType::LlamaServer | crate::config::BackendType::OpenAICompat => {
+            let usage = json.get("usage");
+            let tokens_in = usage
+                .and_then(|u| u.get("prompt_tokens"))
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32);
+            let tokens_out = usage
+                .and_then(|u| u.get("completion_tokens"))
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32);
+            TokenUsage {
+                tokens_in,
+                tokens_out,
+                ..Default::default()
+            }
+        }
+    }
+}
+
+/// Extract the last SSE `data:` line from a chunk of SSE text.
+/// Returns the JSON payload bytes if found.
+fn extract_last_sse_data(chunk: &[u8]) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(chunk).ok()?;
+    let mut last_data: Option<&str> = None;
+    for line in text.lines() {
+        if let Some(data) = line.strip_prefix("data: ") {
+            let trimmed = data.trim();
+            if trimmed != "[DONE]" && !trimmed.is_empty() {
+                last_data = Some(trimmed);
+            }
+        }
+    }
+    last_data.map(|d| d.as_bytes().to_vec())
+}
 
 pub struct Server {
     config: Config,
@@ -89,7 +186,9 @@ impl AppState {
         let mut restart_warnings: Vec<String> = Vec::new();
         {
             let old = self.config.read().await;
-            if old.server.host != new_config.server.host || old.server.port != new_config.server.port {
+            if old.server.host != new_config.server.host
+                || old.server.port != new_config.server.port
+            {
                 restart_warnings.push("server.host/port".to_string());
             }
             if old.server.rate_limit != new_config.server.rate_limit {
@@ -209,12 +308,8 @@ impl Server {
             self.config.observability.admin_api
         };
 
-        let agent_enabled = if self.config.agent.enabled
-            && self.config.server.api_key.is_none()
-        {
-            tracing::warn!(
-                "agent is enabled but server.api_key is not set — disabling agent API"
-            );
+        let agent_enabled = if self.config.agent.enabled && self.config.server.api_key.is_none() {
+            tracing::warn!("agent is enabled but server.api_key is not set — disabling agent API");
             false
         } else {
             self.config.agent.enabled
@@ -305,7 +400,10 @@ impl Server {
                 .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?
                 .join(".herd")
                 .join("sessions");
-            Arc::new(SessionStore::persistent(self.config.agent.max_sessions, session_dir)?)
+            Arc::new(SessionStore::persistent(
+                self.config.agent.max_sessions,
+                session_dir,
+            )?)
         } else {
             Arc::new(SessionStore::new(self.config.agent.max_sessions))
         };
@@ -401,7 +499,34 @@ impl Server {
                 axum::routing::get(crate::api::nodes::get_node)
                     .put(crate::api::nodes::update_node)
                     .delete(crate::api::nodes::delete_node),
+            )
+            // Model search and node model management
+            .route(
+                "/api/models/search",
+                axum::routing::get(crate::api::models::search_models),
+            )
+            .route(
+                "/api/nodes/:id/models",
+                axum::routing::get(crate::api::models::list_node_models),
             );
+
+        // Destructive model endpoints require authentication
+        {
+            let model_mgmt_routes = axum::Router::new()
+                .route(
+                    "/api/nodes/:id/models/download",
+                    axum::routing::post(crate::api::models::download_model),
+                )
+                .route(
+                    "/api/nodes/:id/models/:model_name",
+                    axum::routing::delete(crate::api::models::delete_node_model),
+                )
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    require_api_key,
+                ));
+            app = app.merge(model_mgmt_routes);
+        }
 
         // Conditionally mount metrics
         if self.config.observability.metrics {
@@ -427,8 +552,14 @@ impl Server {
                         .put(admin::update_backend)
                         .delete(admin::remove_backend),
                 )
-                .route("/:name/models", axum::routing::get(admin::list_backend_models))
-                .route("/:name/models/:model", axum::routing::delete(admin::delete_model))
+                .route(
+                    "/:name/models",
+                    axum::routing::get(admin::list_backend_models),
+                )
+                .route(
+                    "/:name/models/:model",
+                    axum::routing::delete(admin::delete_model),
+                )
                 .route("/:name/pull", axum::routing::post(admin::pull_model))
                 .layer(axum::middleware::from_fn_with_state(
                     state.clone(),
@@ -702,8 +833,7 @@ fn copy_request_headers(
 /// Only applies to /api/generate and /api/chat; all other paths and
 /// invalid JSON bodies are returned unchanged.
 fn inject_keep_alive(body: &[u8], path: &str, keep_alive: &str) -> axum::body::Bytes {
-    let is_ollama_endpoint =
-        path.contains("/api/generate") || path.contains("/api/chat");
+    let is_ollama_endpoint = path.contains("/api/generate") || path.contains("/api/chat");
     if !is_ollama_endpoint {
         return axum::body::Bytes::copy_from_slice(body);
     }
@@ -782,9 +912,10 @@ async fn proxy_handler(
         }
     }
 
-    // Inject keep_alive for Ollama-native endpoints
+    // Prepare both versions of the body — keep_alive is Ollama-specific
     let keep_alive_value = state.config.read().await.routing.default_keep_alive.clone();
-    let forward_bytes = inject_keep_alive(&body_bytes, &path, &keep_alive_value);
+    let forward_bytes_ollama = inject_keep_alive(&body_bytes, &path, &keep_alive_value);
+    let forward_bytes_raw = body_bytes.clone();
 
     // Extract tags from X-Herd-Tags header (comma-separated)
     let tags: Option<Vec<String>> = headers
@@ -815,11 +946,24 @@ async fn proxy_handler(
         selected_backend = Some(backend.name.clone());
         let url = format!("{}{}", backend.url, path_and_query);
 
+        // Only inject keep_alive for Ollama backends
+        let forward_bytes = if state
+            .pool
+            .get(&backend.name)
+            .await
+            .map(|s| s.config.backend == crate::config::BackendType::Ollama)
+            .unwrap_or(true)
+        {
+            forward_bytes_ollama.clone()
+        } else {
+            forward_bytes_raw.clone()
+        };
+
         let req_builder = state
             .client
             .request(method.clone(), &url)
             .timeout(state.routing_timeout())
-            .body(forward_bytes.clone());
+            .body(forward_bytes);
         let req_builder = copy_request_headers(&headers, req_builder);
 
         match req_builder.send().await {
@@ -846,7 +990,8 @@ async fn proxy_handler(
                 if matches!(r.status().as_u16(), 500 | 502 | 503) {
                     tracing::warn!(
                         "Backend {} returned {} — retrying on another backend",
-                        backend.name, r.status()
+                        backend.name,
+                        r.status()
                     );
                     state.pool.mark_unhealthy(&backend.name).await;
                     excluded.insert(backend.name.clone());
@@ -856,7 +1001,10 @@ async fn proxy_handler(
                 state.pool.mark_healthy(&backend.name).await;
                 response = Some(r);
                 let strategy = state.config_snapshot().await.routing.strategy.to_string();
-                state.metrics.record_routing_selection(&backend.name, &strategy).await;
+                state
+                    .metrics
+                    .record_routing_selection(&backend.name, &strategy)
+                    .await;
                 break;
             }
             Err(e) => {
@@ -872,36 +1020,85 @@ async fn proxy_handler(
         }
     }
 
-    let duration = start.elapsed();
     let status = match &response {
         Some(r) if r.status().is_success() => "success",
         _ => "error",
     };
 
     // Check for classification result from the classifier middleware
-    let classification = extensions
-        .get::<crate::classifier::ClassificationResult>();
+    let classification = extensions.get::<crate::classifier::ClassificationResult>();
 
-    // Log request
-    let log = RequestLog {
-        timestamp: chrono::Utc::now().timestamp(),
-        model: model_name,
-        backend: selected_backend.unwrap_or_else(|| "none".to_string()),
-        duration_ms: duration.as_millis() as u64,
-        status: status.to_string(),
-        path: path.clone(),
-        request_id: Some(request_id.clone()),
-        tier: classification.map(|c| c.tier.clone()),
-        classified_by: classification.map(|c| c.classified_by.clone()),
+    // Determine backend type for the selected backend
+    let backend_type = if let Some(ref name) = selected_backend {
+        state.pool.get(name).await.map(|s| s.config.backend)
+    } else {
+        None
     };
+    let backend_type_str = backend_type.map(|bt| bt.to_string());
 
-    state
-        .metrics
-        .record_request(&log.backend, &log.status, log.duration_ms)
-        .await;
+    // Context struct for proxy request logging/metrics (avoids 11-parameter closures)
+    struct ProxyRequestContext {
+        state: AppState,
+        model_name: Option<String>,
+        selected_backend: String,
+        path: String,
+        request_id: String,
+        tier: Option<String>,
+        classified_by: Option<String>,
+        backend_type_str: Option<String>,
+        start: std::time::Instant,
+    }
 
-    if let Err(e) = state.analytics.log_request(log).await {
-        tracing::error!("Failed to log request: {}", e);
+    impl ProxyRequestContext {
+        async fn log_and_record(&self, status: &str, usage: TokenUsage) {
+            let duration_ms = self.start.elapsed().as_millis() as u64;
+            let log = RequestLog {
+                timestamp: chrono::Utc::now().timestamp(),
+                model: self.model_name.clone(),
+                backend: self.selected_backend.clone(),
+                duration_ms,
+                status: status.to_string(),
+                path: self.path.clone(),
+                request_id: Some(self.request_id.clone()),
+                tier: self.tier.clone(),
+                classified_by: self.classified_by.clone(),
+                tokens_in: usage.tokens_in,
+                tokens_out: usage.tokens_out,
+                tokens_per_second: usage.tokens_per_second,
+                prompt_eval_ms: usage.prompt_eval_ms,
+                eval_ms: usage.eval_ms,
+                backend_type: self.backend_type_str.clone(),
+            };
+
+            self.state
+                .metrics
+                .record_request(&log.backend, &log.status, log.duration_ms)
+                .await;
+
+            if let (Some(tin), Some(tout)) = (usage.tokens_in, usage.tokens_out) {
+                self.state
+                    .metrics
+                    .record_tokens(self.model_name.as_deref().unwrap_or("unknown"), tin, tout)
+                    .await;
+            }
+            if let Some(tps) = usage.tokens_per_second {
+                self.state.metrics.record_tokens_per_second(tps).await;
+            }
+
+            self.state
+                .metrics
+                .record_request_labeled(
+                    &log.backend,
+                    self.model_name.as_deref().unwrap_or("unknown"),
+                    status,
+                    log.duration_ms,
+                )
+                .await;
+
+            if let Err(e) = self.state.analytics.log_request(log).await {
+                tracing::error!("Failed to log request: {}", e);
+            }
+        }
     }
 
     match response {
@@ -923,13 +1120,130 @@ async fn proxy_handler(
                 }
             }
 
-            // Stream the body instead of buffering
-            let body = axum::body::Body::from_stream(r.bytes_stream());
-            builder
-                .body(body)
-                .map_err(|_| axum::http::StatusCode::BAD_GATEWAY)
+            // Detect streaming response by content-type
+            let is_streaming = r
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(|ct| ct.contains("text/event-stream") || ct.contains("application/x-ndjson"))
+                .unwrap_or(false);
+
+            let bt = backend_type.unwrap_or(crate::config::BackendType::Ollama);
+            let selected = selected_backend.unwrap_or_else(|| "none".to_string());
+            let tier = classification.map(|c| c.tier.clone());
+            let classified_by = classification.map(|c| c.classified_by.clone());
+
+            if is_streaming {
+                // Streaming: wrap the byte stream to capture only the last SSE data chunk.
+                // The stream passes through to the client in real-time.
+                let last_data = Arc::new(tokio::sync::Mutex::new(Option::<Vec<u8>>::None));
+                let last_data_capture = last_data.clone();
+
+                // Oneshot channel to signal stream completion (replaces Arc::strong_count polling)
+                let (stream_done_tx, stream_done_rx) = tokio::sync::oneshot::channel::<()>();
+                let mut stream_done_tx = Some(stream_done_tx);
+
+                let inner_stream = r.bytes_stream();
+                let capturing_stream = futures_util::stream::unfold(
+                    (inner_stream, last_data_capture, stream_done_tx.take()),
+                    |(mut stream, last_data, stream_done_tx)| async move {
+                        use futures_util::StreamExt;
+                        match stream.next().await {
+                            Some(Ok(chunk)) => {
+                                if let Some(data) = extract_last_sse_data(&chunk) {
+                                    *last_data.lock().await = Some(data);
+                                }
+                                Some((
+                                    Ok::<_, std::io::Error>(chunk),
+                                    (stream, last_data, stream_done_tx),
+                                ))
+                            }
+                            Some(Err(e)) => {
+                                tracing::warn!("Stream error from backend: {}", e);
+                                Some((
+                                    Err(std::io::Error::other(e)),
+                                    (stream, last_data, stream_done_tx),
+                                ))
+                            }
+                            None => {
+                                // Stream ended — signal the waiting task
+                                if let Some(tx) = stream_done_tx {
+                                    let _ = tx.send(());
+                                }
+                                None
+                            }
+                        }
+                    },
+                );
+
+                let body = axum::body::Body::from_stream(capturing_stream);
+                let resp = builder
+                    .body(body)
+                    .map_err(|_| axum::http::StatusCode::BAD_GATEWAY)?;
+
+                // Fire-and-forget: extract tokens after stream ends
+                let ctx = ProxyRequestContext {
+                    state: state.clone(),
+                    model_name: model_name.clone(),
+                    selected_backend: selected,
+                    path: path.clone(),
+                    request_id: request_id.clone(),
+                    tier,
+                    classified_by,
+                    backend_type_str: backend_type_str.clone(),
+                    start,
+                };
+                tokio::spawn(async move {
+                    // Wait for stream to complete via oneshot signal
+                    let _ = stream_done_rx.await;
+                    let data = last_data.lock().await.clone();
+                    let usage = if let Some(data) = data {
+                        extract_tokens_from_response(&data, &ctx.path, bt)
+                    } else {
+                        TokenUsage::default()
+                    };
+                    ctx.log_and_record(status, usage).await;
+                });
+
+                Ok(resp)
+            } else {
+                // Non-streaming: buffer body, extract tokens, then forward
+                let body_bytes = r.bytes().await.unwrap_or_default();
+                let usage = extract_tokens_from_response(&body_bytes, &path, bt);
+
+                let ctx = ProxyRequestContext {
+                    state: state.clone(),
+                    model_name: model_name.clone(),
+                    selected_backend: selected,
+                    path: path.clone(),
+                    request_id: request_id.clone(),
+                    tier,
+                    classified_by,
+                    backend_type_str,
+                    start,
+                };
+                ctx.log_and_record(status, usage).await;
+
+                let body = axum::body::Body::from(body_bytes);
+                builder
+                    .body(body)
+                    .map_err(|_| axum::http::StatusCode::BAD_GATEWAY)
+            }
         }
         None => {
+            let ctx = ProxyRequestContext {
+                state: state.clone(),
+                model_name: model_name.clone(),
+                selected_backend: selected_backend.unwrap_or_else(|| "none".to_string()),
+                path: path.clone(),
+                request_id: request_id.clone(),
+                tier: classification.map(|c| c.tier.clone()),
+                classified_by: classification.map(|c| c.classified_by.clone()),
+                backend_type_str,
+                start,
+            };
+            ctx.log_and_record(status, TokenUsage::default()).await;
+
             let body = axum::body::Body::from(format!(
                 "{{\"error\":\"Bad Gateway\",\"request_id\":\"{}\"}}",
                 request_id
@@ -1326,9 +1640,15 @@ async fn dashboard_handler() -> axum::response::Html<&'static str> {
     axum::response::Html(include_str!("../dashboard.html"))
 }
 
-async fn skills_md_handler() -> ([(axum::http::header::HeaderName, &'static str); 1], &'static str) {
+async fn skills_md_handler() -> (
+    [(axum::http::header::HeaderName, &'static str); 1],
+    &'static str,
+) {
     (
-        [(axum::http::header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/markdown; charset=utf-8",
+        )],
         include_str!("../skills.md"),
     )
 }
@@ -1466,5 +1786,169 @@ mod tests {
         let bad = b"not json at all";
         let result = inject_keep_alive(bad, "/api/generate", "-1");
         assert_eq!(result.as_ref(), bad.as_ref());
+    }
+
+    // -----------------------------------------------------------------------
+    // Token extraction tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn extract_tokens_ollama_generate() {
+        let body = serde_json::json!({
+            "model": "llama3:8b",
+            "response": "Hello!",
+            "done": true,
+            "prompt_eval_count": 26,
+            "eval_count": 298,
+            "prompt_eval_duration": 4_500_000_000_u64,
+            "eval_duration": 8_200_000_000_u64
+        });
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let usage = extract_tokens_from_response(
+            &bytes,
+            "/api/generate",
+            crate::config::BackendType::Ollama,
+        );
+        assert_eq!(usage.tokens_in, Some(26));
+        assert_eq!(usage.tokens_out, Some(298));
+        assert_eq!(usage.prompt_eval_ms, Some(4500));
+        assert_eq!(usage.eval_ms, Some(8200));
+        // tokens_per_second = 298 / (8.2) ≈ 36.34
+        let tps = usage.tokens_per_second.unwrap();
+        assert!(tps > 36.0 && tps < 37.0, "tps was {}", tps);
+    }
+
+    #[test]
+    fn extract_tokens_ollama_chat() {
+        let body = serde_json::json!({
+            "model": "llama3:8b",
+            "message": {"role": "assistant", "content": "Hi"},
+            "done": true,
+            "prompt_eval_count": 50,
+            "eval_count": 100,
+            "prompt_eval_duration": 2_000_000_000_u64,
+            "eval_duration": 4_000_000_000_u64
+        });
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let usage =
+            extract_tokens_from_response(&bytes, "/api/chat", crate::config::BackendType::Ollama);
+        assert_eq!(usage.tokens_in, Some(50));
+        assert_eq!(usage.tokens_out, Some(100));
+    }
+
+    #[test]
+    fn extract_tokens_llama_server() {
+        let body = serde_json::json!({
+            "id": "chatcmpl-1234",
+            "choices": [{"message": {"content": "Hi"}}],
+            "usage": {
+                "prompt_tokens": 26,
+                "completion_tokens": 298,
+                "total_tokens": 324
+            }
+        });
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let usage = extract_tokens_from_response(
+            &bytes,
+            "/v1/chat/completions",
+            crate::config::BackendType::LlamaServer,
+        );
+        assert_eq!(usage.tokens_in, Some(26));
+        assert_eq!(usage.tokens_out, Some(298));
+        // llama-server doesn't provide timing info in the response
+        assert!(usage.tokens_per_second.is_none());
+        assert!(usage.prompt_eval_ms.is_none());
+        assert!(usage.eval_ms.is_none());
+    }
+
+    #[test]
+    fn extract_tokens_openai_compat() {
+        let body = serde_json::json!({
+            "id": "chatcmpl-5678",
+            "choices": [{"message": {"content": "Hello"}}],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 50
+            }
+        });
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let usage = extract_tokens_from_response(
+            &bytes,
+            "/v1/chat/completions",
+            crate::config::BackendType::OpenAICompat,
+        );
+        assert_eq!(usage.tokens_in, Some(100));
+        assert_eq!(usage.tokens_out, Some(50));
+    }
+
+    #[test]
+    fn extract_tokens_invalid_json_returns_default() {
+        let usage = extract_tokens_from_response(
+            b"not json",
+            "/api/generate",
+            crate::config::BackendType::Ollama,
+        );
+        assert!(usage.tokens_in.is_none());
+        assert!(usage.tokens_out.is_none());
+    }
+
+    #[test]
+    fn extract_tokens_ollama_wrong_path_returns_default() {
+        let body = serde_json::json!({"prompt_eval_count": 10, "eval_count": 20});
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let usage =
+            extract_tokens_from_response(&bytes, "/v1/models", crate::config::BackendType::Ollama);
+        assert!(usage.tokens_in.is_none());
+    }
+
+    #[test]
+    fn extract_tokens_partial_ollama_response() {
+        // Ollama response with eval_count but no prompt_eval_count
+        let body = serde_json::json!({"eval_count": 100, "eval_duration": 2_000_000_000_u64});
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let usage = extract_tokens_from_response(
+            &bytes,
+            "/api/generate",
+            crate::config::BackendType::Ollama,
+        );
+        assert!(usage.tokens_in.is_none());
+        assert_eq!(usage.tokens_out, Some(100));
+        assert_eq!(usage.eval_ms, Some(2000));
+    }
+
+    // -----------------------------------------------------------------------
+    // SSE data extraction tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn extract_last_sse_data_single_line() {
+        let chunk =
+            b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20}}\n\n";
+        let result = extract_last_sse_data(chunk);
+        assert!(result.is_some());
+        let json: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
+        assert_eq!(json["usage"]["prompt_tokens"], 10);
+    }
+
+    #[test]
+    fn extract_last_sse_data_multiple_lines() {
+        let chunk = b"data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":10}}\n\ndata: [DONE]\n\n";
+        let result = extract_last_sse_data(chunk);
+        assert!(result.is_some());
+        let json: serde_json::Value = serde_json::from_slice(&result.unwrap()).unwrap();
+        assert_eq!(json["usage"]["completion_tokens"], 10);
+    }
+
+    #[test]
+    fn extract_last_sse_data_done_only() {
+        let chunk = b"data: [DONE]\n\n";
+        let result = extract_last_sse_data(chunk);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn extract_last_sse_data_empty() {
+        let result = extract_last_sse_data(b"");
+        assert!(result.is_none());
     }
 }

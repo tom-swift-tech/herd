@@ -15,13 +15,19 @@ pub struct Metrics {
     pub latency_buckets: Arc<RwLock<LatencyHistogram>>,
     /// Routing selections by "{backend}|{strategy}"
     pub routing_selections: Arc<RwLock<HashMap<String, AtomicU64>>>,
+    /// Token counts by "{direction}|{model}" where direction is "in" or "out"
+    pub tokens_total: Arc<RwLock<HashMap<String, AtomicU64>>>,
+    /// Tokens per second exponential moving average.
+    pub tokens_per_second_ema: Arc<RwLock<f32>>,
+    /// Labeled latency histogram by "{backend}|{model}|{status}"
+    pub labeled_latency: Arc<RwLock<HashMap<String, LatencyHistogram>>>,
 }
 
 pub struct LatencyHistogram {
-    bucket_bounds: Vec<u64>,       // upper bounds in ms
-    bucket_counts: Vec<AtomicU64>, // count of observations <= bound
-    sum: AtomicU64,                // total sum of observations in ms
-    count: AtomicU64,              // total count of observations
+    pub bucket_bounds: Vec<u64>,       // upper bounds in ms
+    pub bucket_counts: Vec<AtomicU64>, // count of observations <= bound
+    pub sum: AtomicU64,                // total sum of observations in ms
+    pub count: AtomicU64,              // total count of observations
 }
 
 impl Default for LatencyHistogram {
@@ -55,31 +61,59 @@ impl LatencyHistogram {
         // value exceeds all bucket bounds — counted in +Inf via self.count
     }
 
+    /// Render histogram buckets in Prometheus format with optional labels.
+    pub fn render_with_labels(&self, metric_name: &str, labels: &str) -> String {
+        let mut out = String::new();
+        let mut cumulative = 0u64;
+        for (i, bound) in self.bucket_bounds.iter().enumerate() {
+            cumulative += self.bucket_counts[i].load(Ordering::Relaxed);
+            if labels.is_empty() {
+                out.push_str(&format!(
+                    "{}_bucket{{le=\"{}\"}} {}\n",
+                    metric_name, bound, cumulative
+                ));
+            } else {
+                out.push_str(&format!(
+                    "{}_bucket{{{},le=\"{}\"}} {}\n",
+                    metric_name, labels, bound, cumulative
+                ));
+            }
+        }
+        let total = self.count.load(Ordering::Relaxed);
+        if labels.is_empty() {
+            out.push_str(&format!(
+                "{}_bucket{{le=\"+Inf\"}} {}\n",
+                metric_name, total
+            ));
+            out.push_str(&format!(
+                "{}_sum {}\n",
+                metric_name,
+                self.sum.load(Ordering::Relaxed)
+            ));
+            out.push_str(&format!("{}_count {}\n", metric_name, total));
+        } else {
+            out.push_str(&format!(
+                "{}_bucket{{{},le=\"+Inf\"}} {}\n",
+                metric_name, labels, total
+            ));
+            out.push_str(&format!(
+                "{}_sum{{{}}} {}\n",
+                metric_name,
+                labels,
+                self.sum.load(Ordering::Relaxed)
+            ));
+            out.push_str(&format!("{}_count{{{}}} {}\n", metric_name, labels, total));
+        }
+        out
+    }
+
     pub fn render(&self) -> String {
         let mut out = String::new();
         out.push_str(
             "# HELP herd_request_duration_ms Request duration histogram in milliseconds\n",
         );
         out.push_str("# TYPE herd_request_duration_ms histogram\n");
-        // Buckets are cumulative in Prometheus
-        let mut cumulative = 0u64;
-        for (i, bound) in self.bucket_bounds.iter().enumerate() {
-            cumulative += self.bucket_counts[i].load(Ordering::Relaxed);
-            out.push_str(&format!(
-                "herd_request_duration_ms_bucket{{le=\"{}\"}} {}\n",
-                bound, cumulative
-            ));
-        }
-        let total = self.count.load(Ordering::Relaxed);
-        out.push_str(&format!(
-            "herd_request_duration_ms_bucket{{le=\"+Inf\"}} {}\n",
-            total
-        ));
-        out.push_str(&format!(
-            "herd_request_duration_ms_sum {}\n",
-            self.sum.load(Ordering::Relaxed)
-        ));
-        out.push_str(&format!("herd_request_duration_ms_count {}\n", total));
+        out.push_str(&self.render_with_labels("herd_request_duration_ms", ""));
         out
     }
 }
@@ -97,6 +131,9 @@ impl Metrics {
             requests_by_backend: Arc::new(RwLock::new(HashMap::new())),
             latency_buckets: Arc::new(RwLock::new(LatencyHistogram::new())),
             routing_selections: Arc::new(RwLock::new(HashMap::new())),
+            tokens_total: Arc::new(RwLock::new(HashMap::new())),
+            tokens_per_second_ema: Arc::new(RwLock::new(0.0)),
+            labeled_latency: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -128,6 +165,49 @@ impl Metrics {
         map.entry(key)
             .or_insert_with(|| AtomicU64::new(0))
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record token usage for a model. Increments `herd_tokens_total` counters.
+    pub async fn record_tokens(&self, model: &str, tokens_in: u32, tokens_out: u32) {
+        let mut map = self.tokens_total.write().await;
+        let key_in = format!("in|{}", model);
+        map.entry(key_in)
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(tokens_in as u64, Ordering::Relaxed);
+        let key_out = format!("out|{}", model);
+        map.entry(key_out)
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(tokens_out as u64, Ordering::Relaxed);
+    }
+
+    /// Record tokens-per-second using exponential moving average (alpha=0.1).
+    pub async fn record_tokens_per_second(&self, tps: f32) {
+        let alpha = 0.1_f32;
+        let mut ema = self.tokens_per_second_ema.write().await;
+        if *ema == 0.0 {
+            *ema = tps;
+        } else {
+            *ema = alpha * tps + (1.0 - alpha) * *ema;
+        }
+    }
+
+    /// Record a request with backend, model, and status labels for the labeled histogram.
+    pub async fn record_request_labeled(
+        &self,
+        backend: &str,
+        model: &str,
+        status: &str,
+        duration_ms: u64,
+    ) {
+        let key = format!("{}|{}|{}", backend, model, status);
+        let mut map = self.labeled_latency.write().await;
+        const MAX_LABEL_COMBOS: usize = 200;
+        if !map.contains_key(&key) && map.len() >= MAX_LABEL_COMBOS {
+            return; // Cardinality cap reached — skip to avoid memory growth
+        }
+        map.entry(key)
+            .or_insert_with(LatencyHistogram::new)
+            .observe(duration_ms);
     }
 
     pub async fn render(&self) -> String {
@@ -162,7 +242,9 @@ impl Metrics {
         }
 
         // Routing selections
-        out.push_str("\n# HELP herd_routing_selections_total Routing selections by backend and strategy\n");
+        out.push_str(
+            "\n# HELP herd_routing_selections_total Routing selections by backend and strategy\n",
+        );
         out.push_str("# TYPE herd_routing_selections_total counter\n");
         {
             let map = self.routing_selections.read().await;
@@ -183,6 +265,53 @@ impl Metrics {
         {
             let hist = self.latency_buckets.read().await;
             out.push_str(&hist.render());
+        }
+
+        // Token totals
+        out.push_str("\n# HELP herd_tokens_total Total tokens processed by direction and model\n");
+        out.push_str("# TYPE herd_tokens_total counter\n");
+        {
+            let map = self.tokens_total.read().await;
+            for (key, count) in map.iter() {
+                if let Some((direction, model)) = key.split_once('|') {
+                    out.push_str(&format!(
+                        "herd_tokens_total{{direction=\"{}\", model=\"{}\"}} {}\n",
+                        direction,
+                        model,
+                        count.load(Ordering::Relaxed)
+                    ));
+                }
+            }
+        }
+
+        // Tokens per second EMA gauge
+        out.push_str(
+            "\n# HELP herd_tokens_per_second Tokens per second (exponential moving average)\n",
+        );
+        out.push_str("# TYPE herd_tokens_per_second gauge\n");
+        {
+            let ema = self.tokens_per_second_ema.read().await;
+            out.push_str(&format!("herd_tokens_per_second {:.2}\n", *ema));
+        }
+
+        // Labeled latency histograms
+        out.push_str("\n# HELP herd_request_duration_labeled_ms Request duration histogram with backend, model, and status labels\n");
+        out.push_str("# TYPE herd_request_duration_labeled_ms histogram\n");
+        {
+            let map = self.labeled_latency.read().await;
+            for (key, hist) in map.iter() {
+                let parts: Vec<&str> = key.splitn(3, '|').collect();
+                if parts.len() == 3 {
+                    let (backend, model, status) = (parts[0], parts[1], parts[2]);
+                    let labels = format!(
+                        "backend=\"{}\", model=\"{}\", status=\"{}\"",
+                        backend, model, status
+                    );
+                    out.push_str(
+                        &hist.render_with_labels("herd_request_duration_labeled_ms", &labels),
+                    );
+                }
+            }
         }
 
         out
@@ -215,8 +344,11 @@ mod tests {
         m.record_routing_selection("gpu2", "least_busy").await;
 
         let output = m.render().await;
-        assert!(output.contains("herd_routing_selections_total{backend=\"gpu1\", strategy=\"priority\"} 2"));
-        assert!(output.contains("herd_routing_selections_total{backend=\"gpu2\", strategy=\"least_busy\"} 1"));
+        assert!(output
+            .contains("herd_routing_selections_total{backend=\"gpu1\", strategy=\"priority\"} 2"));
+        assert!(output.contains(
+            "herd_routing_selections_total{backend=\"gpu2\", strategy=\"least_busy\"} 1"
+        ));
     }
 
     #[test]
@@ -233,5 +365,108 @@ mod tests {
         assert!(rendered.contains("le=\"100\"} 2"));
         // 500ms bucket should have 3 cumulative
         assert!(rendered.contains("le=\"500\"} 3"));
+    }
+
+    #[tokio::test]
+    async fn record_tokens_renders_correctly() {
+        let m = Metrics::new();
+        m.record_tokens("llama3:8b", 100, 200).await;
+        m.record_tokens("llama3:8b", 50, 75).await;
+
+        let output = m.render().await;
+        assert!(output.contains("herd_tokens_total{direction=\"in\", model=\"llama3:8b\"} 150"));
+        assert!(output.contains("herd_tokens_total{direction=\"out\", model=\"llama3:8b\"} 275"));
+    }
+
+    #[tokio::test]
+    async fn tokens_per_second_ema() {
+        let m = Metrics::new();
+        // First value initializes the EMA
+        m.record_tokens_per_second(100.0).await;
+        {
+            let ema = m.tokens_per_second_ema.read().await;
+            assert!((100.0 - *ema).abs() < 0.01);
+        }
+
+        // Second value: EMA = 0.1 * 50 + 0.9 * 100 = 5 + 90 = 95
+        m.record_tokens_per_second(50.0).await;
+        {
+            let ema = m.tokens_per_second_ema.read().await;
+            assert!((95.0 - *ema).abs() < 0.01);
+        }
+
+        let output = m.render().await;
+        assert!(output.contains("herd_tokens_per_second 95.00"));
+    }
+
+    #[tokio::test]
+    async fn labeled_histogram_renders() {
+        let m = Metrics::new();
+        m.record_request_labeled("gpu1", "llama3:8b", "success", 150)
+            .await;
+        m.record_request_labeled("gpu1", "llama3:8b", "success", 50)
+            .await;
+
+        let output = m.render().await;
+        assert!(output.contains("herd_request_duration_labeled_ms"));
+        assert!(output.contains("backend=\"gpu1\""));
+        assert!(output.contains("model=\"llama3:8b\""));
+        assert!(output.contains("status=\"success\""));
+        // Count should be 2
+        assert!(output.contains(
+            "herd_request_duration_labeled_ms_count{backend=\"gpu1\", model=\"llama3:8b\", status=\"success\"} 2"
+        ));
+    }
+
+    #[tokio::test]
+    async fn labeled_histogram_cardinality_cap() {
+        let m = Metrics::new();
+        // Fill up to the cap (200 unique label combos)
+        for i in 0..200 {
+            m.record_request_labeled("gpu1", &format!("model-{}", i), "success", 100)
+                .await;
+        }
+        {
+            let map = m.labeled_latency.read().await;
+            assert_eq!(map.len(), 200);
+        }
+        // 201st unique combo should be silently dropped
+        m.record_request_labeled("gpu1", "model-overflow", "success", 100)
+            .await;
+        {
+            let map = m.labeled_latency.read().await;
+            assert_eq!(map.len(), 200);
+            assert!(!map.contains_key("gpu1|model-overflow|success"));
+        }
+        // Existing keys can still be updated
+        m.record_request_labeled("gpu1", "model-0", "success", 200)
+            .await;
+        {
+            let map = m.labeled_latency.read().await;
+            let hist = map.get("gpu1|model-0|success").unwrap();
+            assert_eq!(hist.count.load(Ordering::Relaxed), 2);
+        }
+    }
+
+    #[test]
+    fn render_with_labels_no_labels() {
+        let h = LatencyHistogram::new();
+        h.observe(5);
+        let rendered = h.render_with_labels("test_metric", "");
+        assert!(rendered.contains("test_metric_bucket{le=\"10\"} 1"));
+        assert!(rendered.contains("test_metric_bucket{le=\"+Inf\"} 1"));
+        assert!(rendered.contains("test_metric_sum 5"));
+        assert!(rendered.contains("test_metric_count 1"));
+    }
+
+    #[test]
+    fn render_with_labels_with_labels() {
+        let h = LatencyHistogram::new();
+        h.observe(5);
+        let rendered = h.render_with_labels("test_metric", "backend=\"gpu1\"");
+        assert!(rendered.contains("test_metric_bucket{backend=\"gpu1\",le=\"10\"} 1"));
+        assert!(rendered.contains("test_metric_bucket{backend=\"gpu1\",le=\"+Inf\"} 1"));
+        assert!(rendered.contains("test_metric_sum{backend=\"gpu1\"} 5"));
+        assert!(rendered.contains("test_metric_count{backend=\"gpu1\"} 1"));
     }
 }

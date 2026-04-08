@@ -124,6 +124,29 @@ impl std::fmt::Display for RoutingStrategy {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum BackendType {
+    #[default]
+    #[serde(rename = "ollama")]
+    Ollama,
+
+    #[serde(rename = "llama-server")]
+    LlamaServer,
+
+    #[serde(rename = "openai-compat")]
+    OpenAICompat,
+}
+
+impl std::fmt::Display for BackendType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BackendType::Ollama => write!(f, "ollama"),
+            BackendType::LlamaServer => write!(f, "llama-server"),
+            BackendType::OpenAICompat => write!(f, "openai-compat"),
+        }
+    }
+}
+
 fn default_strategy() -> RoutingStrategy {
     RoutingStrategy::ModelAware
 }
@@ -141,6 +164,10 @@ fn default_keep_alive_value() -> String {
 pub struct Backend {
     pub name: String,
     pub url: String,
+
+    #[serde(default)]
+    pub backend: BackendType,
+
     pub priority: u32,
 
     #[serde(default)]
@@ -162,11 +189,23 @@ pub struct Backend {
     pub tags: Vec<String>,
 }
 
+impl Backend {
+    /// Default health check path based on backend type.
+    pub fn default_health_check_path(&self) -> &str {
+        match self.backend {
+            BackendType::LlamaServer => "/health",
+            BackendType::OpenAICompat => "/v1/models",
+            BackendType::Ollama => "/",
+        }
+    }
+}
+
 impl Default for Backend {
     fn default() -> Self {
         Self {
             name: String::new(),
             url: String::new(),
+            backend: BackendType::default(),
             priority: 50,
             hot_models: Vec::new(),
             gpu_hot_url: None,
@@ -501,6 +540,7 @@ pub fn parse_duration(input: &str) -> Result<Duration> {
 #[cfg(test)]
 mod tests {
     use super::parse_duration;
+    use super::BackendType;
     use super::Config;
     use std::time::Duration;
 
@@ -548,5 +588,85 @@ mod tests {
         let yaml = "backends:\n  - name: x\n    url: http://x\n    priority: 50\n    default_model: llama3:8b\n";
         let result: Result<Config, _> = serde_yaml::from_str(yaml);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn backend_type_defaults_to_ollama() {
+        let yaml = "backends:\n  - name: x\n    url: http://x\n    priority: 50\n";
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.backends[0].backend, BackendType::Ollama);
+    }
+
+    #[test]
+    fn backend_type_llama_server_parses() {
+        let yaml = "backends:\n  - name: x\n    url: http://x\n    priority: 50\n    backend: llama-server\n";
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.backends[0].backend, BackendType::LlamaServer);
+    }
+
+    #[test]
+    fn backend_type_ollama_explicit() {
+        let yaml =
+            "backends:\n  - name: x\n    url: http://x\n    priority: 50\n    backend: ollama\n";
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.backends[0].backend, BackendType::Ollama);
+    }
+
+    #[test]
+    fn backend_type_openai_compat_parses() {
+        let yaml = "backends:\n  - name: x\n    url: http://x\n    priority: 50\n    backend: openai-compat\n";
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.backends[0].backend, BackendType::OpenAICompat);
+    }
+
+    #[test]
+    fn backend_type_openai_compat_display() {
+        assert_eq!(BackendType::OpenAICompat.to_string(), "openai-compat");
+    }
+
+    #[test]
+    fn openai_compat_default_health_check_path() {
+        let b = super::Backend {
+            name: "compat1".into(),
+            url: "http://localhost:8080".into(),
+            backend: BackendType::OpenAICompat,
+            priority: 50,
+            ..Default::default()
+        };
+        assert_eq!(b.default_health_check_path(), "/v1/models");
+    }
+
+    #[test]
+    fn backend_type_round_trip_serialize() {
+        for bt in [
+            BackendType::Ollama,
+            BackendType::LlamaServer,
+            BackendType::OpenAICompat,
+        ] {
+            let json = serde_json::to_string(&bt).unwrap();
+            let deserialized: BackendType = serde_json::from_str(&json).unwrap();
+            assert_eq!(bt, deserialized);
+        }
+    }
+
+    #[test]
+    fn config_without_backend_field_defaults_to_ollama() {
+        // Backward compat: existing YAML configs without `backend` field
+        let yaml = r#"
+server:
+  host: 0.0.0.0
+  port: 40114
+backends:
+  - name: gpu1
+    url: http://localhost:11434
+    priority: 100
+  - name: gpu2
+    url: http://192.168.1.50:11434
+    priority: 50
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.backends.len(), 2);
+        assert_eq!(config.backends[0].backend, BackendType::Ollama);
+        assert_eq!(config.backends[1].backend, BackendType::Ollama);
     }
 }

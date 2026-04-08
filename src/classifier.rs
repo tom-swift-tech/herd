@@ -1,11 +1,11 @@
+use crate::config::TaskClassifierConfig;
+use crate::server::AppState;
 use axum::{
     body::Body,
     extract::State,
     http::{HeaderValue, Request, Response},
     middleware::Next,
 };
-use crate::config::TaskClassifierConfig;
-use crate::server::AppState;
 
 /// Classification result attached to request extensions.
 #[derive(Debug, Clone)]
@@ -92,9 +92,9 @@ pub fn extract_last_user_message(json: &serde_json::Value) -> String {
     json.get("messages")
         .and_then(|m| m.as_array())
         .and_then(|msgs| {
-            msgs.iter().rev().find(|msg| {
-                msg.get("role").and_then(|r| r.as_str()) == Some("user")
-            })
+            msgs.iter()
+                .rev()
+                .find(|msg| msg.get("role").and_then(|r| r.as_str()) == Some("user"))
         })
         .and_then(|msg| msg.get("content"))
         .and_then(|c| c.as_str())
@@ -124,28 +124,28 @@ pub fn classify_by_keywords(
     }
 
     // No keyword match — use default tier if configured
-    config.tiers.get(&config.default_tier).map(|default_tier| ClassificationResult {
-        tier: config.default_tier.clone(),
-        model: default_tier.model.clone(),
-        classified_by: "default".to_string(),
-    })
+    config
+        .tiers
+        .get(&config.default_tier)
+        .map(|default_tier| ClassificationResult {
+            tier: config.default_tier.clone(),
+            model: default_tier.model.clone(),
+            classified_by: "default".to_string(),
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use crate::config::{TaskClassifierConfig, TierConfig};
+    use std::collections::HashMap;
 
     fn test_config() -> TaskClassifierConfig {
         let mut tiers = HashMap::new();
         tiers.insert(
             "heavy".to_string(),
             TierConfig {
-                keywords: vec![
-                    "analyze".to_string(),
-                    "debug complex".to_string(),
-                ],
+                keywords: vec!["analyze".to_string(), "debug complex".to_string()],
                 model: "qwen2.5:32b-instruct".to_string(),
             },
         );

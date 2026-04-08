@@ -128,7 +128,8 @@ impl AgentExecutor {
         user_message: String,
         events: mpsc::Sender<AgentEvent>,
     ) -> Result<String> {
-        self.execute_inner(session, user_message, Some(events)).await
+        self.execute_inner(session, user_message, Some(events))
+            .await
     }
 
     async fn emit(events: &Option<mpsc::Sender<AgentEvent>>, event: AgentEvent) {
@@ -248,8 +249,7 @@ impl AgentExecutor {
                                 )
                                 .await;
 
-                                let result =
-                                    tools::execute_tool(&call.name, &call.arguments).await;
+                                let result = tools::execute_tool(&call.name, &call.arguments).await;
 
                                 Self::emit(
                                     &events,

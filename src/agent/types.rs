@@ -93,18 +93,42 @@ mod tests {
 
     #[test]
     fn message_role_serializes_lowercase() {
-        assert_eq!(serde_json::to_string(&MessageRole::System).unwrap(), "\"system\"");
-        assert_eq!(serde_json::to_string(&MessageRole::User).unwrap(), "\"user\"");
-        assert_eq!(serde_json::to_string(&MessageRole::Assistant).unwrap(), "\"assistant\"");
-        assert_eq!(serde_json::to_string(&MessageRole::Tool).unwrap(), "\"tool\"");
+        assert_eq!(
+            serde_json::to_string(&MessageRole::System).unwrap(),
+            "\"system\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MessageRole::User).unwrap(),
+            "\"user\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MessageRole::Assistant).unwrap(),
+            "\"assistant\""
+        );
+        assert_eq!(
+            serde_json::to_string(&MessageRole::Tool).unwrap(),
+            "\"tool\""
+        );
     }
 
     #[test]
     fn message_role_deserializes_lowercase() {
-        assert_eq!(serde_json::from_str::<MessageRole>("\"system\"").unwrap(), MessageRole::System);
-        assert_eq!(serde_json::from_str::<MessageRole>("\"user\"").unwrap(), MessageRole::User);
-        assert_eq!(serde_json::from_str::<MessageRole>("\"assistant\"").unwrap(), MessageRole::Assistant);
-        assert_eq!(serde_json::from_str::<MessageRole>("\"tool\"").unwrap(), MessageRole::Tool);
+        assert_eq!(
+            serde_json::from_str::<MessageRole>("\"system\"").unwrap(),
+            MessageRole::System
+        );
+        assert_eq!(
+            serde_json::from_str::<MessageRole>("\"user\"").unwrap(),
+            MessageRole::User
+        );
+        assert_eq!(
+            serde_json::from_str::<MessageRole>("\"assistant\"").unwrap(),
+            MessageRole::Assistant
+        );
+        assert_eq!(
+            serde_json::from_str::<MessageRole>("\"tool\"").unwrap(),
+            MessageRole::Tool
+        );
     }
 
     #[test]
@@ -117,7 +141,12 @@ mod tests {
 
     #[test]
     fn session_status_roundtrip() {
-        for status in [SessionStatus::Active, SessionStatus::Processing, SessionStatus::Completed, SessionStatus::Error] {
+        for status in [
+            SessionStatus::Active,
+            SessionStatus::Processing,
+            SessionStatus::Completed,
+            SessionStatus::Error,
+        ] {
             let json = serde_json::to_string(&status).unwrap();
             let back: SessionStatus = serde_json::from_str(&json).unwrap();
             assert_eq!(back, status);

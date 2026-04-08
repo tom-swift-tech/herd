@@ -70,10 +70,7 @@ impl PermissionEngine {
         for (i, pattern) in self.deny_bash_patterns.iter().enumerate() {
             if pattern.is_match(command) {
                 let raw = &self.deny_bash_raw[i];
-                return PermissionResult::Denied(format!(
-                    "Command matches deny pattern '{}'",
-                    raw
-                ));
+                return PermissionResult::Denied(format!("Command matches deny pattern '{}'", raw));
             }
         }
         PermissionResult::Allowed
@@ -124,15 +121,8 @@ mod tests {
 
     fn restrictive() -> PermissionEngine {
         PermissionEngine::new(&PermissionsConfig {
-            deny_file_patterns: vec![
-                r"\.env$".into(),
-                r"\.ssh".into(),
-                r"/etc/shadow".into(),
-            ],
-            deny_bash_patterns: vec![
-                r"rm\s+-rf\s+/".into(),
-                r"\bsudo\b".into(),
-            ],
+            deny_file_patterns: vec![r"\.env$".into(), r"\.ssh".into(), r"/etc/shadow".into()],
+            deny_bash_patterns: vec![r"rm\s+-rf\s+/".into(), r"\bsudo\b".into()],
             allow_shell_commands: true,
         })
     }

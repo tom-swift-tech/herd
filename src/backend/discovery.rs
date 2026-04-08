@@ -28,6 +28,18 @@ struct OllamaRunningModel {
     model: String,
 }
 
+/// OpenAI-compatible /v1/models response (used by llama-server)
+#[derive(Debug, Deserialize)]
+struct OpenAIModelsResponse {
+    #[serde(default)]
+    data: Vec<OpenAIModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAIModel {
+    id: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct GpuHotData {
     gpus: Vec<GpuInfo>,
@@ -126,11 +138,20 @@ impl ModelDiscovery {
     }
 
     async fn discover_models(&self, pool: &BackendPool, backend: &Backend) -> Result<()> {
-        let url = format!("{}/api/tags", backend.url);
-        let resp = self.client.get(&url).send().await?;
-        let models: OllamaModels = resp.json().await?;
-
-        let mut model_names: Vec<String> = models.models.into_iter().map(|m| m.name).collect();
+        let mut model_names: Vec<String> = match backend.backend {
+            crate::config::BackendType::LlamaServer | crate::config::BackendType::OpenAICompat => {
+                let url = format!("{}/v1/models", backend.url);
+                let resp = self.client.get(&url).send().await?;
+                let models: OpenAIModelsResponse = resp.json().await?;
+                models.data.into_iter().map(|m| m.id).collect()
+            }
+            crate::config::BackendType::Ollama => {
+                let url = format!("{}/api/tags", backend.url);
+                let resp = self.client.get(&url).send().await?;
+                let models: OllamaModels = resp.json().await?;
+                models.models.into_iter().map(|m| m.name).collect()
+            }
+        };
 
         // Apply model_filter regex if configured
         if let Some(ref filter) = backend.model_filter {
@@ -165,18 +186,27 @@ impl ModelDiscovery {
     }
 
     async fn discover_running(&self, pool: &BackendPool, backend: &Backend) -> Result<()> {
-        let url = format!("{}/api/ps", backend.url);
-        let resp = self.client.get(&url).send().await?;
-        let running: OllamaRunning = resp.json().await?;
-
-        // Get the first running model (if any)
-        let current = running.models.first().map(|m| {
-            if m.model.is_empty() {
-                m.name.clone()
-            } else {
-                m.model.clone()
+        let current = match backend.backend {
+            crate::config::BackendType::LlamaServer | crate::config::BackendType::OpenAICompat => {
+                // llama-server/OpenAI-compat always has its model loaded — use /v1/models
+                let url = format!("{}/v1/models", backend.url);
+                let resp = self.client.get(&url).send().await?;
+                let models: OpenAIModelsResponse = resp.json().await?;
+                models.data.first().map(|m| m.id.clone())
             }
-        });
+            crate::config::BackendType::Ollama => {
+                let url = format!("{}/api/ps", backend.url);
+                let resp = self.client.get(&url).send().await?;
+                let running: OllamaRunning = resp.json().await?;
+                running.models.first().map(|m| {
+                    if m.model.is_empty() {
+                        m.name.clone()
+                    } else {
+                        m.model.clone()
+                    }
+                })
+            }
+        };
 
         pool.update_current_model(&backend.name, current).await;
         Ok(())
@@ -199,5 +229,20 @@ impl ModelDiscovery {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_openai_models_response() {
+        let json = r#"{"object":"list","data":[
+            {"id":"gemma-4-26B","object":"model","owned_by":"llamacpp","created":1234}
+        ]}"#;
+        let resp: OpenAIModelsResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.data.len(), 1);
+        assert_eq!(resp.data[0].id, "gemma-4-26B");
     }
 }

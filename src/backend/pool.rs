@@ -54,7 +54,9 @@ fn filter_healthy<'a>(
 fn least_busy_cmp(a: &&BackendState, b: &&BackendState) -> std::cmp::Ordering {
     let a_busy = a.gpu_metrics.as_ref().map(|g| g.utilization).unwrap_or(0.0);
     let b_busy = b.gpu_metrics.as_ref().map(|g| g.utilization).unwrap_or(0.0);
-    a_busy.partial_cmp(&b_busy).unwrap_or(std::cmp::Ordering::Equal)
+    a_busy
+        .partial_cmp(&b_busy)
+        .unwrap_or(std::cmp::Ordering::Equal)
 }
 
 impl BackendPool {
@@ -114,7 +116,10 @@ impl BackendPool {
         self.get_by_priority_excluding(&HashSet::new()).await
     }
 
-    pub async fn get_by_priority_excluding(&self, excluded: &HashSet<String>) -> Option<BackendState> {
+    pub async fn get_by_priority_excluding(
+        &self,
+        excluded: &HashSet<String>,
+    ) -> Option<BackendState> {
         self.get_by_priority_tagged_excluding(&[], excluded).await
     }
 
@@ -127,7 +132,8 @@ impl BackendPool {
         model: &str,
         excluded: &HashSet<String>,
     ) -> Option<BackendState> {
-        self.get_by_model_tagged_excluding(model, &[], excluded).await
+        self.get_by_model_tagged_excluding(model, &[], excluded)
+            .await
     }
 
     pub async fn get_least_busy(&self) -> Option<BackendState> {
@@ -202,7 +208,8 @@ impl BackendPool {
     }
 
     pub async fn get_by_priority_tagged(&self, tags: &[String]) -> Option<BackendState> {
-        self.get_by_priority_tagged_excluding(tags, &HashSet::new()).await
+        self.get_by_priority_tagged_excluding(tags, &HashSet::new())
+            .await
     }
 
     pub async fn get_by_priority_tagged_excluding(

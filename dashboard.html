@@ -441,6 +441,123 @@
             .stat-value { font-size: 22px; }
         }
 
+        /* Backend Type Badges */
+        .badge-backend {
+            display: inline-block; padding: 2px 8px; border-radius: 10px;
+            font-size: 10px; font-weight: 700; text-transform: uppercase;
+            letter-spacing: 0.5px; vertical-align: middle;
+        }
+        .badge-backend.ollama { background: rgba(96, 165, 250, 0.15); color: #60a5fa; }
+        .badge-backend.llama-server { background: rgba(74, 222, 128, 0.15); color: #4ade80; }
+        .badge-backend.unknown { background: rgba(100, 116, 139, 0.15); color: #94a3b8; }
+
+        /* GPU Info Tags */
+        .gpu-info-row { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
+        .gpu-info-tag {
+            font-size: 10px; padding: 2px 6px; border-radius: 4px;
+            background: rgba(255,255,255,0.04); color: #94a3b8;
+        }
+        .gpu-info-tag strong { color: #e2e8f0; }
+        .capability-tag {
+            font-size: 10px; padding: 2px 6px; border-radius: 4px;
+            background: rgba(251, 191, 36, 0.1); color: #fbbf24; font-weight: 600;
+        }
+
+        /* Models Tab */
+        .models-search-bar {
+            display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+            margin-bottom: 20px; padding: 16px 20px;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            border: 1px solid rgba(255,255,255,0.06); border-radius: 12px;
+        }
+        .models-search-bar input[type="text"] {
+            flex: 1; min-width: 200px; padding: 8px 14px; border-radius: 8px;
+            border: 1px solid rgba(255,255,255,0.1); background: rgba(255,255,255,0.04);
+            color: #e2e8f0; font-size: 14px; outline: none;
+        }
+        .models-search-bar input[type="text"]:focus { border-color: rgba(99,102,241,0.5); }
+        .models-search-bar select {
+            padding: 8px 12px; border-radius: 8px;
+            border: 1px solid rgba(255,255,255,0.1); background: #1e293b;
+            color: #e2e8f0; font-size: 13px; outline: none;
+        }
+        .model-result-card {
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            border: 1px solid rgba(255,255,255,0.06); border-radius: 12px;
+            padding: 16px 20px; margin-bottom: 12px;
+            transition: border-color 0.3s;
+        }
+        .model-result-card:hover { border-color: rgba(99, 102, 241, 0.3); }
+        .model-result-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 8px; }
+        .model-result-name { font-size: 15px; font-weight: 600; color: #e2e8f0; }
+        .model-result-author { font-size: 12px; color: #64748b; }
+        .model-result-meta { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-bottom: 8px; }
+        .model-result-meta .meta-item { font-size: 12px; }
+        .model-fits-badges { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 6px; }
+        .fit-badge {
+            font-size: 10px; padding: 2px 6px; border-radius: 4px;
+            background: rgba(74, 222, 128, 0.1); color: #4ade80; font-weight: 600;
+        }
+        .downloads-section {
+            margin-bottom: 20px; padding: 16px 20px;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            border: 1px solid rgba(255,255,255,0.06); border-radius: 12px;
+        }
+        .downloads-section h3 { font-size: 14px; font-weight: 600; color: #e2e8f0; margin-bottom: 12px; }
+        .download-progress-item {
+            display: flex; align-items: center; gap: 12px; margin-bottom: 8px;
+            font-size: 13px; color: #94a3b8;
+        }
+        .download-progress-bar {
+            flex: 1; height: 6px; background: rgba(255,255,255,0.06);
+            border-radius: 3px; overflow: hidden;
+        }
+        .download-progress-fill {
+            height: 100%; border-radius: 3px; background: #818cf8;
+            transition: width 0.3s;
+        }
+
+        /* Download Modal */
+        .node-select-list { max-height: 200px; overflow-y: auto; margin: 12px 0; }
+        .node-select-item {
+            display: flex; justify-content: space-between; align-items: center;
+            padding: 8px 12px; border-radius: 8px; cursor: pointer;
+            margin-bottom: 4px; font-size: 13px; color: #94a3b8;
+            background: rgba(255,255,255,0.03);
+            transition: background 0.2s;
+        }
+        .node-select-item:hover { background: rgba(99, 102, 241, 0.1); }
+        .node-select-item.selected { background: rgba(99, 102, 241, 0.2); border: 1px solid rgba(99, 102, 241, 0.4); }
+        .node-select-item .node-vram { font-size: 11px; color: #64748b; }
+
+        /* Analytics Extended */
+        .analytics-grid-2col {
+            display: grid; grid-template-columns: 1fr 1fr; gap: 16px;
+            margin-top: 16px;
+        }
+        .metric-hero {
+            text-align: center; padding: 20px;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            border: 1px solid rgba(255,255,255,0.06); border-radius: 12px;
+        }
+        .metric-hero-value { font-size: 32px; font-weight: 700; letter-spacing: -1px; }
+        .metric-hero-label { font-size: 12px; color: #64748b; margin-top: 4px; }
+        .metric-hero-sub { font-size: 11px; color: #475569; margin-top: 2px; }
+        .metric-hero.cost .metric-hero-value { color: #4ade80; }
+        .metric-hero.tps .metric-hero-value { color: #fbbf24; }
+        .latency-table-card {
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            border: 1px solid rgba(255,255,255,0.06); border-radius: 12px;
+            padding: 16px 20px; margin-top: 16px;
+        }
+        .latency-table-card h3 {
+            font-size: 14px; font-weight: 600; color: #94a3b8; margin-bottom: 12px;
+        }
+        @media (max-width: 768px) {
+            .analytics-grid-2col { grid-template-columns: 1fr; }
+            .models-search-bar { flex-direction: column; }
+        }
+
         /* Fleet Management */
         .fleet-add-node {
             margin-bottom: 24px; padding: 20px;
@@ -595,6 +712,9 @@
             <div class="tab" data-tab="fleet" onclick="switchTab('fleet')">
                 Fleet <span class="tab-badge" id="fleet-tab-badge">0</span>
             </div>
+            <div class="tab" data-tab="models" onclick="switchTab('models')">
+                Models
+            </div>
             <div class="tab" data-tab="settings" onclick="switchTab('settings')">
                 Settings
             </div>
@@ -640,6 +760,62 @@
                     <div class="latency-value" id="lat-p99">--</div>
                     <div class="latency-label">p99 Latency</div>
                 </div>
+            </div>
+
+            <!-- Token & Cost Metrics -->
+            <div class="analytics-grid-2col" style="margin-top:16px;">
+                <div class="metric-hero cost">
+                    <div class="metric-hero-value" id="analytics-cost">$0.00</div>
+                    <div class="metric-hero-label">Estimated API Cost Avoided</div>
+                    <div class="metric-hero-sub">Based on equivalent cloud API pricing</div>
+                </div>
+                <div class="metric-hero tps">
+                    <div class="metric-hero-value" id="analytics-tps">--</div>
+                    <div class="metric-hero-label">Avg Tokens/Second</div>
+                    <div class="metric-hero-sub" id="analytics-tokens-total"></div>
+                </div>
+            </div>
+
+            <!-- Token Usage Chart -->
+            <div class="chart-card" style="margin-top:16px;">
+                <div class="chart-title">Token Usage by Model</div>
+                <div class="chart-container" style="height:250px;">
+                    <canvas id="tokenUsageChart"></canvas>
+                </div>
+            </div>
+
+            <!-- Top Models by Token Volume -->
+            <div class="chart-card" style="margin-top:16px;">
+                <div class="chart-title">Top Models by Token Volume</div>
+                <div class="chart-container" style="height:200px;">
+                    <canvas id="topModelsTokenChart"></canvas>
+                </div>
+            </div>
+
+            <!-- Per-Model Latency Table -->
+            <div class="latency-table-card">
+                <h3>Per-Model Latency</h3>
+                <table class="data-table" id="model-latency-table">
+                    <thead>
+                        <tr><th>Model</th><th>P50</th><th>P95</th><th>P99</th></tr>
+                    </thead>
+                    <tbody id="model-latency-body">
+                        <tr><td colspan="4" style="text-align:center; color:#64748b; padding:20px;">No data yet</td></tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <!-- Per-Backend Latency Table -->
+            <div class="latency-table-card">
+                <h3>Per-Backend Latency</h3>
+                <table class="data-table" id="backend-latency-table">
+                    <thead>
+                        <tr><th>Backend</th><th>P50</th><th>P95</th><th>P99</th></tr>
+                    </thead>
+                    <tbody id="backend-latency-body">
+                        <tr><td colspan="4" style="text-align:center; color:#64748b; padding:20px;">No data yet</td></tr>
+                    </tbody>
+                </table>
             </div>
         </div>
 
@@ -787,13 +963,22 @@ Content-Type: application/json
         <div class="tab-content" id="tab-fleet">
             <div class="fleet-add-node">
                 <h3>Add Node to Fleet</h3>
-                <p>Run the herd-tune script on any machine with Ollama to auto-detect hardware and register with this Herd instance.</p>
+                <p>Run the herd-tune script on any machine to auto-detect hardware and register with this Herd instance.</p>
 
-                <div class="script-download-buttons">
-                    <a href="/api/nodes/script?os=windows" class="btn btn-primary" download>
+                <div style="margin: 12px 0;">
+                    <label style="font-size:12px; color:#94a3b8; display:block; margin-bottom:6px;">Backend Type</label>
+                    <select id="fleet-backend-select" onchange="updateFleetScriptLinks()" style="padding:6px 12px; border-radius:8px; border:1px solid rgba(255,255,255,0.1); background:#1e293b; color:#e2e8f0; font-size:13px;">
+                        <option value="auto">Auto-detect</option>
+                        <option value="ollama">Ollama</option>
+                        <option value="llama-server">llama-server</option>
+                    </select>
+                </div>
+
+                <div class="script-download-buttons" id="fleet-script-buttons">
+                    <a href="/api/nodes/script?os=windows" class="btn btn-primary" download id="fleet-script-win">
                         Windows (PowerShell)
                     </a>
-                    <a href="/api/nodes/script?os=linux" class="btn btn-secondary" download>
+                    <a href="/api/nodes/script?os=linux" class="btn btn-secondary" download id="fleet-script-linux">
                         Linux (Bash)
                     </a>
                 </div>
@@ -806,7 +991,7 @@ Content-Type: application/json
                                 <h4>Windows</h4>
                                 <ol>
                                     <li>Download herd-tune.ps1 (button above)</li>
-                                    <li>Open PowerShell as Administrator on your Ollama machine</li>
+                                    <li>Open PowerShell as Administrator on your machine</li>
                                     <li>Run: <code>.\herd-tune.ps1 -Apply</code></li>
                                     <li>Done &mdash; your node will appear in the fleet below</li>
                                 </ol>
@@ -815,7 +1000,7 @@ Content-Type: application/json
                                 <h4>Linux</h4>
                                 <ol>
                                     <li>Download herd-tune.sh (button above)</li>
-                                    <li>On your Ollama machine:<br>
+                                    <li>On your machine:<br>
                                         <code>chmod +x herd-tune.sh</code><br>
                                         <code>sudo ./herd-tune.sh --apply</code></li>
                                     <li>Done &mdash; your node will appear in the fleet below</li>
@@ -832,12 +1017,12 @@ Content-Type: application/json
                     <thead>
                         <tr>
                             <th>Hostname</th>
+                            <th>Backend</th>
                             <th>GPU</th>
                             <th>VRAM</th>
                             <th>RAM</th>
                             <th>Status</th>
-                            <th>Models Loaded</th>
-                            <th>Available</th>
+                            <th>Models</th>
                             <th>Parallel</th>
                             <th>Priority</th>
                             <th>Actions</th>
@@ -847,6 +1032,61 @@ Content-Type: application/json
                         <tr><td colspan="10" class="empty-state">No nodes registered yet. Download and run herd-tune to add nodes.</td></tr>
                     </tbody>
                 </table>
+            </div>
+        </div>
+
+        <!-- Models Tab -->
+        <div class="tab-content" id="tab-models">
+            <!-- Active Downloads -->
+            <div class="downloads-section" id="models-downloads-section" style="display:none;">
+                <h3>Active Downloads</h3>
+                <div id="models-downloads-list"></div>
+            </div>
+
+            <!-- Search Bar -->
+            <div class="models-search-bar">
+                <input type="text" id="models-search-input" placeholder="Search HuggingFace for GGUF models..." onkeydown="if(event.key==='Enter')searchModels()">
+                <select id="models-quant-filter">
+                    <option value="">All Quants</option>
+                    <option value="Q4_K_M">Q4_K_M</option>
+                    <option value="Q4_K_S">Q4_K_S</option>
+                    <option value="Q5_K_M">Q5_K_M</option>
+                    <option value="Q5_K_S">Q5_K_S</option>
+                    <option value="Q6_K">Q6_K</option>
+                    <option value="Q8_0">Q8_0</option>
+                    <option value="IQ4_XS">IQ4_XS</option>
+                </select>
+                <select id="models-size-filter">
+                    <option value="">Any Size</option>
+                    <option value="4">4 GB</option>
+                    <option value="8">8 GB</option>
+                    <option value="16">16 GB</option>
+                    <option value="32">32 GB</option>
+                </select>
+                <button class="btn btn-primary" onclick="searchModels()">Search</button>
+            </div>
+
+            <!-- Results -->
+            <div id="models-results">
+                <div class="empty-state">
+                    <div class="empty-state-title">Search for GGUF Models</div>
+                    <div class="empty-state-text">Enter a model name above to search HuggingFace for GGUF quantized models.</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Model Download Modal -->
+        <div class="modal-overlay" id="model-download-modal-overlay">
+            <div class="modal">
+                <h2>Download Model</h2>
+                <p style="color:#94a3b8; font-size:13px; margin-bottom:12px;" id="download-modal-model-name"></p>
+                <p style="color:#64748b; font-size:12px; margin-bottom:12px;" id="download-modal-file-info"></p>
+                <label style="display:block; font-size:13px; color:#94a3b8; margin-bottom:8px;">Select target node:</label>
+                <div class="node-select-list" id="download-node-list"></div>
+                <div class="modal-actions">
+                    <button class="btn-cancel" onclick="closeDownloadModal()">Cancel</button>
+                    <button class="btn-submit" id="download-modal-start-btn" onclick="startModelDownload()" disabled>Download</button>
+                </div>
             </div>
         </div>
 
@@ -1094,7 +1334,7 @@ Content-Type: application/json
     <div class="toast-container" id="toast-container"></div>
 
     <script>
-        let timelineChart, modelChart, backendChart;
+        let timelineChart, modelChart, backendChart, tokenUsageChart, topModelsTokenChart;
         let currentSessionId = null;
         let refreshCountdown = 5;
         let countdownInterval = null;
@@ -1114,6 +1354,8 @@ Content-Type: application/json
                     timelineChart?.resize();
                     modelChart?.resize();
                     backendChart?.resize();
+                    tokenUsageChart?.resize();
+                    topModelsTokenChart?.resize();
                 }, 50);
             }
             // Fleet tab: start/stop auto-refresh
@@ -1470,10 +1712,14 @@ Content-Type: application/json
 
             const urlDisplay = b.url ? truncate(b.url, 40) : '';
 
+            const backendType = b.backend || 'ollama';
+            const backendBadgeClass = backendType === 'llama-server' ? 'llama-server' : backendType === 'ollama' ? 'ollama' : 'unknown';
+            const backendBadgeLabel = backendType === 'llama-server' ? 'llama-server' : 'Ollama';
+
             return `
                 <div class="card ${isOnline ? '' : 'offline'}">
                     <div class="card-header">
-                        <span class="card-name">${escapeHtml(b.name)}</span>
+                        <span class="card-name">${escapeHtml(b.name)} <span class="badge-backend ${backendBadgeClass}">${backendBadgeLabel}</span></span>
                         <div class="card-actions">
                             <button class="btn btn-sm" onclick="openEditModal('${b.name}')">Edit</button>
                             <button class="btn btn-sm btn-danger" onclick="removeBackend('${b.name}')">&#x2715;</button>
@@ -1485,6 +1731,7 @@ Content-Type: application/json
                         <span class="meta-item">P: <strong>${b.priority}</strong></span>
                         <span class="meta-item">Models: <strong>${b.model_count || b.models?.length || 0}</strong></span>
                         ${b.vram_total_mb ? `<span class="meta-item">VRAM: <strong>${(b.vram_total_mb / 1024).toFixed(1)} GB</strong></span>` : ''}
+                        ${b.backend_version ? `<span class="meta-item">Ver: <strong>${escapeHtml(b.backend_version)}</strong></span>` : ''}
                         <span class="card-status ${cls}"><span class="dot ${cls}"></span>${isOnline ? 'Online' : 'Offline'}</span>
                     </div>
                     ${gpuHtml}
@@ -1543,6 +1790,36 @@ Content-Type: application/json
                     y: { grid: { display: false }, ticks: { color: '#64748b' } }
                 }}
             });
+
+            // Token Usage stacked bar chart
+            tokenUsageChart = new Chart(document.getElementById('tokenUsageChart'), {
+                type: 'bar',
+                data: {
+                    labels: [],
+                    datasets: [
+                        { label: 'Tokens In', data: [], backgroundColor: '#818cf8', borderRadius: 4, stack: 'tokens' },
+                        { label: 'Tokens Out', data: [], backgroundColor: '#4ade80', borderRadius: 4, stack: 'tokens' }
+                    ]
+                },
+                options: {
+                    ...opts,
+                    plugins: { legend: { display: true, labels: { color: '#64748b', font: { size: 11 } } } },
+                    scales: {
+                        x: { grid: { display: false }, ticks: { color: '#64748b' }, stacked: true },
+                        y: { beginAtZero: true, grid: { color: 'rgba(255,255,255,0.05)' }, ticks: { color: '#64748b' }, stacked: true }
+                    }
+                }
+            });
+
+            // Top Models by Token Volume horizontal bar
+            topModelsTokenChart = new Chart(document.getElementById('topModelsTokenChart'), {
+                type: 'bar',
+                data: { labels: [], datasets: [{ label: 'Total Tokens', data: [], backgroundColor: '#fbbf24', borderRadius: 4 }] },
+                options: { ...opts, indexAxis: 'y', scales: {
+                    x: { beginAtZero: true, grid: { color: 'rgba(255,255,255,0.05)' }, ticks: { color: '#64748b' } },
+                    y: { grid: { display: false }, ticks: { color: '#64748b' } }
+                }}
+            });
         }
 
         // -- Update Stats & Charts from Analytics --
@@ -1591,6 +1868,75 @@ Content-Type: application/json
                     backendChart.data.labels = backends.map(b => b[0]);
                     backendChart.data.datasets[0].data = backends.map(b => b[1]);
                     backendChart.update('none');
+                }
+
+                // Token usage by model (stacked bar)
+                if (data.model_token_counts) {
+                    const tokenModels = Object.entries(data.model_token_counts).slice(0, 10);
+                    tokenUsageChart.data.labels = tokenModels.map(m => m[0].split(':')[0]);
+                    tokenUsageChart.data.datasets[0].data = tokenModels.map(m => Array.isArray(m[1]) ? m[1][0] : (m[1].tokens_in || 0));
+                    tokenUsageChart.data.datasets[1].data = tokenModels.map(m => Array.isArray(m[1]) ? m[1][1] : (m[1].tokens_out || 0));
+                    tokenUsageChart.update('none');
+                }
+
+                // Top models by total token volume
+                if (data.model_token_counts) {
+                    const sorted = Object.entries(data.model_token_counts)
+                        .map(([k, v]) => {
+                            const tin = Array.isArray(v) ? v[0] : (v.tokens_in || 0);
+                            const tout = Array.isArray(v) ? v[1] : (v.tokens_out || 0);
+                            return [k, tin + tout];
+                        })
+                        .sort((a, b) => b[1] - a[1]).slice(0, 5);
+                    topModelsTokenChart.data.labels = sorted.map(m => m[0].split(':')[0]);
+                    topModelsTokenChart.data.datasets[0].data = sorted.map(m => m[1]);
+                    topModelsTokenChart.update('none');
+                }
+
+                // Cost estimation
+                if (data.estimated_api_cost_usd !== undefined) {
+                    document.getElementById('analytics-cost').textContent = '$' + data.estimated_api_cost_usd.toFixed(2);
+                }
+
+                // Tokens per second
+                if (data.tokens_per_second_avg !== undefined) {
+                    document.getElementById('analytics-tps').textContent = data.tokens_per_second_avg.toFixed(1) + ' t/s';
+                }
+
+                // Total tokens summary
+                const totalIn = data.total_tokens_in || 0;
+                const totalOut = data.total_tokens_out || 0;
+                if (totalIn > 0 || totalOut > 0) {
+                    document.getElementById('analytics-tokens-total').textContent =
+                        `${totalIn.toLocaleString()} in / ${totalOut.toLocaleString()} out`;
+                }
+
+                // Per-model latency table
+                if (data.model_latency) {
+                    const tbody = document.getElementById('model-latency-body');
+                    const entries = Object.entries(data.model_latency);
+                    if (entries.length > 0) {
+                        tbody.innerHTML = entries.map(([model, lat]) => `<tr>
+                            <td><strong>${escapeHtml(model)}</strong></td>
+                            <td>${formatMs(lat.p50 || 0)}</td>
+                            <td>${formatMs(lat.p95 || 0)}</td>
+                            <td>${formatMs(lat.p99 || 0)}</td>
+                        </tr>`).join('');
+                    }
+                }
+
+                // Per-backend latency table
+                if (data.backend_latency) {
+                    const tbody = document.getElementById('backend-latency-body');
+                    const entries = Object.entries(data.backend_latency);
+                    if (entries.length > 0) {
+                        tbody.innerHTML = entries.map(([backend, lat]) => `<tr>
+                            <td><strong>${escapeHtml(backend)}</strong></td>
+                            <td>${formatMs(lat.p50 || 0)}</td>
+                            <td>${formatMs(lat.p95 || 0)}</td>
+                            <td>${formatMs(lat.p99 || 0)}</td>
+                        </tr>`).join('');
+                    }
                 }
             } catch (e) {
                 console.error('Charts update failed:', e);
@@ -1836,7 +2182,6 @@ Content-Type: application/json
                                    node.status === 'degraded' ? 'status-degraded' :
                                    node.status === 'disabled' ? 'status-disabled' : 'status-unreachable';
                 const statusDot = `<span class="status-dot ${statusClass}"></span>`;
-                const modelsLoaded = (node.models_loaded || []).join(', ') || '\u2014';
                 const vramGB = node.vram_mb ? (node.vram_mb / 1024).toFixed(1) + ' GB' : '\u2014';
                 const ramGB = node.ram_mb ? (node.ram_mb / 1024).toFixed(1) + ' GB' : '\u2014';
                 const enabledToggle = `<label class="toggle-switch">
@@ -1844,14 +2189,58 @@ Content-Type: application/json
                     <span class="toggle-slider"></span>
                 </label>`;
 
+                // Backend type badge
+                const bt = node.backend || 'ollama';
+                const btClass = bt === 'llama-server' ? 'llama-server' : bt === 'ollama' ? 'ollama' : 'unknown';
+                const btLabel = bt === 'llama-server' ? 'llama-server' : 'Ollama';
+                const backendBadge = `<span class="badge-backend ${btClass}">${btLabel}</span>`;
+                const backendVer = node.backend_version ? `<br><small style="color:#64748b;">${escapeHtml(node.backend_version)}</small>` : '';
+
+                // GPU info
+                const gpuModel = node.gpu_model || node.gpu || '\u2014';
+                let gpuInfoHtml = escapeHtml(gpuModel);
+                const gpuTags = [];
+                if (node.gpu_vendor) gpuTags.push(node.gpu_vendor);
+                if (node.gpu_backend) gpuTags.push(node.gpu_backend);
+                if (node.cuda_version) gpuTags.push('CUDA ' + node.cuda_version);
+                if (gpuTags.length > 0) {
+                    gpuInfoHtml += '<br><span style="display:flex; gap:3px; flex-wrap:wrap; margin-top:3px;">' +
+                        gpuTags.map(t => `<span class="gpu-info-tag">${escapeHtml(t)}</span>`).join('') + '</span>';
+                }
+                // Capabilities
+                const caps = node.capabilities || [];
+                if (caps.length > 0) {
+                    gpuInfoHtml += '<span style="display:flex; gap:3px; flex-wrap:wrap; margin-top:3px;">' +
+                        caps.map(c => `<span class="capability-tag">${escapeHtml(c)}</span>`).join('') + '</span>';
+                }
+
+                // Models info
+                let modelsHtml = '';
+                const modelsLoaded = node.models_loaded || [];
+                if (modelsLoaded.length > 0) {
+                    modelsHtml = '<small>' + modelsLoaded.map(m => escapeHtml(m)).join(', ') + '</small>';
+                }
+                // For llama-server, also show model_paths as available GGUFs
+                const modelPaths = node.model_paths || [];
+                if (bt === 'llama-server' && modelPaths.length > 0) {
+                    const ggufNames = modelPaths.map(p => {
+                        const parts = p.replace(/\\/g, '/').split('/');
+                        return parts[parts.length - 1];
+                    });
+                    if (modelsLoaded.length > 0) modelsHtml += '<br>';
+                    modelsHtml += '<small style="color:#64748b;">GGUFs: ' + ggufNames.map(n => escapeHtml(n)).join(', ') + '</small>';
+                } else if (modelsLoaded.length === 0) {
+                    modelsHtml = '<small style="color:#64748b;">\u2014</small>';
+                }
+
                 return `<tr class="${!node.enabled ? 'row-disabled' : ''}">
                     <td><strong>${escapeHtml(node.hostname || '')}</strong><br><small style="color:#64748b;">${escapeHtml(node.ollama_url || '')}</small></td>
-                    <td>${escapeHtml(node.gpu || '\u2014')}</td>
+                    <td>${backendBadge}${backendVer}</td>
+                    <td>${gpuInfoHtml}</td>
                     <td>${vramGB}</td>
                     <td>${ramGB}</td>
                     <td>${statusDot} ${escapeHtml(node.status || 'unknown')}</td>
-                    <td><small>${escapeHtml(modelsLoaded)}</small></td>
-                    <td>${node.models_available || 0}</td>
+                    <td>${modelsHtml}</td>
                     <td>${node.max_concurrent || 0}</td>
                     <td>
                         <input type="number" class="inline-input" value="${node.priority || 50}" min="1" max="100"
@@ -1917,6 +2306,208 @@ Content-Type: application/json
                 clearInterval(fleetRefreshInterval);
                 fleetRefreshInterval = null;
             }
+        }
+
+        // -- Fleet Script Backend Selector --
+        function updateFleetScriptLinks() {
+            const backend = document.getElementById('fleet-backend-select').value;
+            const suffix = backend !== 'auto' ? `&backend=${backend}` : '';
+            document.getElementById('fleet-script-win').href = `/api/nodes/script?os=windows${suffix}`;
+            document.getElementById('fleet-script-linux').href = `/api/nodes/script?os=linux${suffix}`;
+        }
+
+        // -- Models Tab --
+        let modelSearchResults = [];
+        let activeModelDownloads = {};
+        let selectedDownloadNode = null;
+        let pendingDownloadModel = null;
+
+        async function searchModels() {
+            const query = document.getElementById('models-search-input').value.trim();
+            if (!query) return;
+            const quant = document.getElementById('models-quant-filter').value;
+            const maxSize = document.getElementById('models-size-filter').value;
+            const resultsEl = document.getElementById('models-results');
+            resultsEl.innerHTML = '<div class="empty-state"><div class="empty-state-title">Searching...</div></div>';
+
+            try {
+                let url = `/api/models/search?q=${encodeURIComponent(query)}`;
+                if (quant) url += `&quant=${encodeURIComponent(quant)}`;
+                if (maxSize) url += `&max_size_gb=${maxSize}`;
+                const res = await authFetch(url);
+                if (!res.ok) throw new Error(`Search failed (${res.status})`);
+                const data = await res.json();
+                modelSearchResults = data.results || data.models || [];
+                renderModelResults();
+            } catch (e) {
+                resultsEl.innerHTML = `<div class="empty-state"><div class="empty-state-title">Search Failed</div><div class="empty-state-text">${escapeHtml(e.message)}</div></div>`;
+            }
+        }
+
+        function formatFileSize(bytes) {
+            if (!bytes) return '?';
+            const gb = bytes / (1024 * 1024 * 1024);
+            if (gb >= 1) return gb.toFixed(1) + ' GB';
+            const mb = bytes / (1024 * 1024);
+            return mb.toFixed(0) + ' MB';
+        }
+
+        function renderModelResults() {
+            const el = document.getElementById('models-results');
+            if (modelSearchResults.length === 0) {
+                el.innerHTML = '<div class="empty-state"><div class="empty-state-title">No results</div><div class="empty-state-text">Try a different search term or adjust filters.</div></div>';
+                return;
+            }
+            el.innerHTML = modelSearchResults.map((m, i) => {
+                const name = m.name || m.model_name || '';
+                const author = m.author || '';
+                const quant = m.quant || m.quantization || '';
+                const size = m.size || m.file_size || 0;
+                const downloads = m.downloads || m.download_count || 0;
+                const fitsOn = m.fits_on || [];
+
+                return `<div class="model-result-card">
+                    <div class="model-result-header">
+                        <div>
+                            <div class="model-result-name">${escapeHtml(name)}</div>
+                            ${author ? `<div class="model-result-author">by ${escapeHtml(author)}</div>` : ''}
+                        </div>
+                        <button class="btn btn-primary btn-sm" onclick="openDownloadModal(${i})">Download</button>
+                    </div>
+                    <div class="model-result-meta">
+                        ${quant ? `<span class="meta-item">Quant: <strong>${escapeHtml(quant)}</strong></span>` : ''}
+                        ${size ? `<span class="meta-item">Size: <strong>${formatFileSize(size)}</strong></span>` : ''}
+                        ${downloads ? `<span class="meta-item">Downloads: <strong>${downloads.toLocaleString()}</strong></span>` : ''}
+                    </div>
+                    ${fitsOn.length > 0 ? `<div class="model-fits-badges">
+                        <span style="font-size:11px; color:#64748b; margin-right:4px;">Fits on:</span>
+                        ${fitsOn.map(h => `<span class="fit-badge">${escapeHtml(h)}</span>`).join('')}
+                    </div>` : ''}
+                </div>`;
+            }).join('');
+        }
+
+        function openDownloadModal(index) {
+            pendingDownloadModel = modelSearchResults[index];
+            selectedDownloadNode = null;
+            const name = pendingDownloadModel.name || pendingDownloadModel.model_name || '';
+            const size = pendingDownloadModel.size || pendingDownloadModel.file_size || 0;
+            document.getElementById('download-modal-model-name').textContent = name;
+            document.getElementById('download-modal-file-info').textContent = size ? `File size: ${formatFileSize(size)}` : '';
+            document.getElementById('download-modal-start-btn').disabled = true;
+
+            // Build node list from fleet
+            const listEl = document.getElementById('download-node-list');
+            if (fleetNodes.length === 0) {
+                listEl.innerHTML = '<div style="padding:12px; color:#64748b; font-size:13px;">No nodes registered in fleet.</div>';
+            } else {
+                listEl.innerHTML = fleetNodes.filter(n => n.enabled && n.status === 'healthy').map(n => {
+                    const vram = n.vram_mb ? (n.vram_mb / 1024).toFixed(1) + ' GB VRAM' : '';
+                    return `<div class="node-select-item" data-node-id="${n.id}" onclick="selectDownloadNode('${n.id}', this)">
+                        <span><strong>${escapeHtml(n.hostname || n.id)}</strong></span>
+                        <span class="node-vram">${vram}</span>
+                    </div>`;
+                }).join('');
+            }
+
+            document.getElementById('model-download-modal-overlay').classList.add('active');
+        }
+
+        function selectDownloadNode(id, el) {
+            selectedDownloadNode = id;
+            document.querySelectorAll('#download-node-list .node-select-item').forEach(n => n.classList.remove('selected'));
+            el.classList.add('selected');
+            document.getElementById('download-modal-start-btn').disabled = false;
+        }
+
+        function closeDownloadModal() {
+            document.getElementById('model-download-modal-overlay').classList.remove('active');
+            pendingDownloadModel = null;
+            selectedDownloadNode = null;
+        }
+
+        async function startModelDownload() {
+            if (!selectedDownloadNode || !pendingDownloadModel) return;
+            const modelName = pendingDownloadModel.name || pendingDownloadModel.model_name || '';
+            const nodeId = selectedDownloadNode;
+            closeDownloadModal();
+
+            const downloadId = `${nodeId}-${Date.now()}`;
+            activeModelDownloads[downloadId] = { nodeId, model: modelName, progress: 0, status: 'Starting...' };
+            renderActiveDownloads();
+
+            try {
+                const res = await authFetch(`/api/nodes/${nodeId}/models/download`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        model: modelName,
+                        url: pendingDownloadModel.download_url || pendingDownloadModel.url || '',
+                        file_name: pendingDownloadModel.file_name || ''
+                    })
+                });
+                if (!res.ok) {
+                    const text = await res.text();
+                    throw new Error(text);
+                }
+
+                // Try to read streaming progress
+                if (res.body) {
+                    const reader = res.body.getReader();
+                    const decoder = new TextDecoder();
+                    let buffer = '';
+                    while (true) {
+                        const {done, value} = await reader.read();
+                        if (done) break;
+                        buffer += decoder.decode(value, {stream: true});
+                        const lines = buffer.split('\n');
+                        buffer = lines.pop();
+                        for (const line of lines) {
+                            if (!line.trim()) continue;
+                            try {
+                                const data = JSON.parse(line);
+                                if (data.progress !== undefined) {
+                                    activeModelDownloads[downloadId].progress = data.progress;
+                                }
+                                if (data.status) {
+                                    activeModelDownloads[downloadId].status = data.status;
+                                }
+                                renderActiveDownloads();
+                            } catch (_) {}
+                        }
+                    }
+                }
+
+                delete activeModelDownloads[downloadId];
+                renderActiveDownloads();
+                showToast(`Downloaded ${modelName}`);
+            } catch (e) {
+                activeModelDownloads[downloadId].status = `Failed: ${e.message}`;
+                renderActiveDownloads();
+                setTimeout(() => { delete activeModelDownloads[downloadId]; renderActiveDownloads(); }, 5000);
+                showToast(`Download failed: ${e.message}`, 'error');
+            }
+        }
+
+        function renderActiveDownloads() {
+            const section = document.getElementById('models-downloads-section');
+            const list = document.getElementById('models-downloads-list');
+            const entries = Object.entries(activeModelDownloads);
+            if (entries.length === 0) {
+                section.style.display = 'none';
+                return;
+            }
+            section.style.display = 'block';
+            list.innerHTML = entries.map(([id, dl]) => {
+                const pct = Math.round(dl.progress || 0);
+                return `<div class="download-progress-item">
+                    <span style="min-width:120px;"><strong>${escapeHtml(dl.model)}</strong></span>
+                    <div class="download-progress-bar">
+                        <div class="download-progress-fill" style="width:${pct}%"></div>
+                    </div>
+                    <span style="min-width:80px; text-align:right;">${escapeHtml(dl.status)}</span>
+                </div>`;
+            }).join('');
         }
 
         // -- Settings / Config Editor --
@@ -2107,13 +2698,16 @@ Content-Type: application/json
 
         // -- Keyboard & Click Handlers --
         document.addEventListener('keydown', e => {
-            if (e.key === 'Escape') { closeModal(); closeSessionModal(); }
+            if (e.key === 'Escape') { closeModal(); closeSessionModal(); closeDownloadModal(); }
         });
         document.getElementById('modal-overlay').addEventListener('click', e => {
             if (e.target === e.currentTarget) closeModal();
         });
         document.getElementById('session-modal-overlay').addEventListener('click', e => {
             if (e.target === e.currentTarget) closeSessionModal();
+        });
+        document.getElementById('model-download-modal-overlay').addEventListener('click', e => {
+            if (e.target === e.currentTarget) closeDownloadModal();
         });
 
         // -- Initialize --

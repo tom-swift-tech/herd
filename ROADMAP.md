@@ -1,16 +1,17 @@
 # Herd Roadmap
 
-**Updated:** April 5, 2026
+**Updated:** April 8, 2026
 
 ## Vision
 
-Herd is the **fastest way to route AI workloads across local Ollama backends**.
+Herd is the **fastest way to route AI workloads across local inference backends**.
 
 One fast, single Rust binary gives you:
-- GPU-aware routing across multiple Ollama nodes
+- GPU-aware routing across multiple inference nodes (llama-server, Ollama, or any OpenAI-compatible backend)
 - Circuit breaker resilience with configurable failure thresholds
 - Unified observability: metrics, analytics, and a live dashboard
 - OpenAI-compatible API for drop-in compatibility
+- Fleet mode: one host orchestrates multiple GPU nodes across hardware vendors (NVIDIA, AMD, Intel)
 
 No cloud dependency. No API keys exposed. Full local control.
 
@@ -78,7 +79,23 @@ No cloud dependency. No API keys exposed. Full local control.
 - Dashboard: Sessions, Fleet, and Settings (config editor) tabs
 - Config editor API (`GET/PUT /admin/config`) with secret redaction
 
-### v1.0.0+ — Scale & Ecosystem (Future)
+### v1.0.0 — llama.cpp Backend & Multi-Vendor Fleet
+
+> **Strategic shift:** Benchmarking validated that Ollama's Go layer adds 45-80% TTFT overhead vs raw llama-server. Herd v1.0 adds llama-server as a first-class backend, making Herd vendor-agnostic across NVIDIA, AMD, and Intel GPUs. See `docs/LLAMA_CPP_BACKEND.md` for full analysis and benchmark data.
+
+- **llama-server backend support** — route to llama-server (llama.cpp) endpoints alongside Ollama
+- **Backend type field** — `backend: "ollama" | "llama-server" | "openai-compat"` per node in config and registry
+- **herd-tune GPU detection** — auto-detect NVIDIA (nvidia-smi), AMD (rocm-smi), Intel (sycl-ls) and select correct llama-server binary
+- **herd-tune binary provisioning** — download and verify correct llama-server build (CUDA 12/13, ROCm, SYCL, Vulkan fallback)
+- **Blackwell detection** — CUDA 13.x required for RTX 5000-series; CUDA 12.x silently falls back to CPU (critical herd-tune check)
+- **Extended node registration** — `gpu_vendor`, `gpu_backend`, `cuda_version`, `backend_version`, `capabilities` fields
+- **Model search CLI** — `herd search <query>` for HuggingFace GGUF discovery (inspired by Fox engine UX)
+- **Model download with resume** — robust GGUF pull with partial download tracking
+- **Ollama blob extraction** — reuse existing Ollama models by extracting raw GGUF from blob storage
+- **Health check abstraction** — backend-aware health probes (Ollama `/api/ps` vs llama-server `/health`)
+- Backward compatible — existing Ollama-only configs continue to work unchanged
+
+### v1.1.0+ — Scale & Ecosystem (Future)
 
 - Multi-node discovery (mDNS / static fleet config)
 - TLS termination
@@ -88,6 +105,7 @@ No cloud dependency. No API keys exposed. Full local control.
 - Budget caps and cost tracking
 - Routing profiles (named presets)
 - Multi-model consensus routing
+- llama.cpp RPC integration for tensor-parallel sharding across fleet nodes
 
 ## Get Involved
 

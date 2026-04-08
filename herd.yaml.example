@@ -93,6 +93,20 @@ backends:
       - "gpu"
       - "low-vram"
 
+  # llama-server backend example (llama.cpp):
+  # llama-server backends use OpenAI-compatible endpoints for health checks (/health)
+  # and model discovery (/v1/models). hot_models is ignored (model set at server start).
+  #
+  # - name: "citadel-llama"
+  #   url: "http://citadel:8090"      # llama-server listen address
+  #   backend: "llama-server"          # Backend type: "ollama" (default) or "llama-server"
+  #   priority: 100
+  #   tags:
+  #     - "gpu"
+  #     - "high-vram"
+  #   # health_check_path defaults to /health for llama-server (vs / for ollama)
+  #   # Model discovery uses /v1/models instead of /api/tags
+
 # === CIRCUIT BREAKER ===
 # Automatically stops routing to failing backends and probes them for recovery.
 

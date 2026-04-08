@@ -40,7 +40,11 @@ impl HealthChecker {
                     );
                     continue;
                 }
-                let path = state.config.health_check_path.as_deref().unwrap_or("/");
+                let path = state
+                    .config
+                    .health_check_path
+                    .as_deref()
+                    .unwrap_or(state.config.default_health_check_path());
                 let url = format!("{}{}", state.config.url.trim_end_matches('/'), path);
                 match self.client.get(&url).send().await {
                     Ok(resp) => {
@@ -95,5 +99,48 @@ mod tests {
         let b: Backend = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(b.health_check_path.as_deref(), Some("/health"));
         assert_eq!(b.health_check_status, Some(204));
+    }
+
+    #[test]
+    fn llama_server_default_health_check_path() {
+        let b = Backend {
+            name: "llama1".into(),
+            url: "http://localhost:8090".into(),
+            backend: crate::config::BackendType::LlamaServer,
+            priority: 50,
+            ..Default::default()
+        };
+        let path = b
+            .health_check_path
+            .as_deref()
+            .unwrap_or(b.default_health_check_path());
+        assert_eq!(path, "/health");
+    }
+
+    #[test]
+    fn ollama_default_health_check_path() {
+        let b = Backend::default();
+        let path = b
+            .health_check_path
+            .as_deref()
+            .unwrap_or(b.default_health_check_path());
+        assert_eq!(path, "/");
+    }
+
+    #[test]
+    fn explicit_health_check_path_overrides_default() {
+        let b = Backend {
+            name: "custom".into(),
+            url: "http://localhost:8090".into(),
+            backend: crate::config::BackendType::LlamaServer,
+            health_check_path: Some("/v1/models".into()),
+            priority: 50,
+            ..Default::default()
+        };
+        let path = b
+            .health_check_path
+            .as_deref()
+            .unwrap_or(b.default_health_check_path());
+        assert_eq!(path, "/v1/models");
     }
 }

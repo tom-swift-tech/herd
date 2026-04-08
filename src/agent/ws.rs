@@ -126,7 +126,10 @@ async fn handle_ws(mut socket: WebSocket, state: AppState, session_id: String) {
         // Spawn executor in background so we can forward events
         let content = ws_msg.content;
         let exec_handle = tokio::spawn(async move {
-            executor.execute_streaming(&mut session, content, tx).await.map(|result| (result, session))
+            executor
+                .execute_streaming(&mut session, content, tx)
+                .await
+                .map(|result| (result, session))
         });
 
         // Forward events to WebSocket and audit log

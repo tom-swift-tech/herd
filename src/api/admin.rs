@@ -1,4 +1,4 @@
-use crate::config::Backend;
+use crate::config::{Backend, BackendType};
 use crate::server::AppState;
 use axum::{
     extract::{Path, State},
@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 pub struct AddBackendRequest {
     pub name: String,
     pub url: String,
+    #[serde(default)]
+    pub backend: BackendType,
     #[serde(default = "default_priority")]
     pub priority: u32,
     #[serde(default)]
@@ -42,6 +44,7 @@ pub struct UpdateBackendRequest {
 pub struct BackendResponse {
     pub name: String,
     pub url: String,
+    pub backend: String,
     pub priority: u32,
     pub hot_models: Vec<String>,
     pub model_filter: Option<String>,
@@ -66,6 +69,7 @@ fn backend_to_response(b: &crate::backend::BackendState) -> BackendResponse {
     BackendResponse {
         name: b.config.name.clone(),
         url: b.config.url.clone(),
+        backend: b.config.backend.to_string(),
         priority: b.config.priority,
         hot_models: b.config.hot_models.clone(),
         model_filter: b.config.model_filter.clone(),
@@ -120,6 +124,7 @@ pub async fn add_backend(
     let backend = Backend {
         name: req.name.clone(),
         url: req.url,
+        backend: req.backend,
         priority: req.priority,
         hot_models: Vec::new(),
         gpu_hot_url: None,
@@ -176,7 +181,10 @@ pub async fn update_backend(
         state.pool.set_vram(&name, vram_mb).await;
         // Re-fetch so the response reflects the override
         backend = state.pool.get(&name).await.ok_or_else(|| {
-            (StatusCode::NOT_FOUND, format!("Backend '{}' not found", name))
+            (
+                StatusCode::NOT_FOUND,
+                format!("Backend '{}' not found", name),
+            )
         })?;
     }
 

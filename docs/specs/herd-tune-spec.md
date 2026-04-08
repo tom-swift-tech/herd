@@ -105,7 +105,7 @@ Called by `herd-tune` after local detection. Registers or updates a node.
   "model_paths": ["/models/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf"],
   "capabilities": ["cuda", "flash_attn", "moe"],
   "max_context_len": 4096,
-  "herd_tune_version": "0.4.0",
+  "herd_tune_version": "1.0.0",
   "os": "windows",
   "registered_at": "2026-04-08T14:30:00Z"
 }
@@ -132,7 +132,7 @@ For Ollama backends, the payload remains backward-compatible:
     "context_length": 16384
   },
   "config_applied": true,
-  "herd_tune_version": "0.4.0",
+  "herd_tune_version": "1.0.0",
   "os": "linux",
   "registered_at": "2026-04-08T14:30:00Z"
 }

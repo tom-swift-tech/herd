@@ -1,7 +1,7 @@
 # Herd + llama.cpp: Backend Strategy
 
 **Date:** 2026-04-08
-**Status:** Validated via benchmark — proceeding with implementation planning
+**Status:** Implemented in v1.0.0
 
 ## Summary
 
@@ -54,20 +54,21 @@ Evaluated Fox as an intermediate step. Conclusion: **not ready, but architectura
 
 ## Fleet Architecture: Herd + llama-server
 
-### Current (v0.9.0)
+### Before (v0.9.0)
 ```
 [Herd Router] --HTTP--> [Ollama node 1]
               --HTTP--> [Ollama node 2]
               --HTTP--> [Ollama node 3]
 ```
 
-### Target (v1.x)
+### Now (v1.0.0)
 ```
 [Herd Router] --HTTP/OpenAI--> [llama-server node 1 (CUDA)]
               --HTTP/OpenAI--> [llama-server node 2 (CUDA)]
-              --HTTP/OpenAI--> [llama-server node 3 (ROCm)]
-              --HTTP/OpenAI--> [llama-server node 4 (SYCL)]
-              --HTTP/OpenAI--> [llama-server node 5 (Vulkan)]
+              --HTTP/OpenAI--> [Ollama node 3]
+              --HTTP/OpenAI--> [llama-server node 4 (ROCm)]
+              --HTTP/OpenAI--> [llama-server node 5 (SYCL)]
+              --HTTP/OpenAI--> [llama-server node 6 (Vulkan)]
 ```
 
 Herd doesn't care about GPU vendor — it talks OpenAI-compatible HTTP to each node's llama-server. Backend complexity (CUDA vs ROCm vs SYCL) is pushed to node setup via herd-tune.
@@ -144,12 +145,12 @@ Prefix caching (available in llama-server) is directly relevant to VALOR operati
 
 ## TODO
 
-- [ ] Update herd-tune spec to support llama-server backend detection and setup
-- [ ] Add `backend` field to node registration payload
-- [ ] Implement GPU vendor detection in herd-tune (nvidia-smi / rocm-smi / sycl-ls)
-- [ ] Build llama-server binary download + verification into herd-tune
+- [x] Update herd-tune spec to support llama-server backend detection and setup
+- [x] Add `backend` field to node registration payload
+- [x] Implement GPU vendor detection in herd-tune (nvidia-smi / rocm-smi / sycl-ls)
+- [x] Build llama-server binary download + verification into herd-tune
+- [x] Evaluate CUDA 13.x detection logic for Blackwell GPUs in herd-tune
+- [x] Add `herd search` API endpoint (inspired by Fox's model search UX) -- available at `GET /api/models/search`
 - [ ] Test ROCm backend on an AMD node (minipc candidate if swapped to AMD GPU)
 - [ ] Fix streaming token counter in benchmark harness for complete throughput data
 - [ ] Investigate llama.cpp RPC for tensor-parallel sharding across fleet nodes (v2.0+)
-- [ ] Add `herd search` CLI command (inspired by Fox's model search UX)
-- [ ] Evaluate CUDA 13.x detection logic for Blackwell GPUs in herd-tune

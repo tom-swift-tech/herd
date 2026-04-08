@@ -19,10 +19,11 @@ As of v0.9.0, the former private "Herd Pro" repository has been merged into this
 
 ## Backend Strategy
 
-Herd supports two backend types per node:
+Herd supports three backend types per node:
 
-1. **Ollama** (current, stable) — Herd talks to Ollama's HTTP API. herd-tune configures Ollama env vars.
-2. **llama-server** (target for v1.x) — Herd talks to llama.cpp's llama-server via its OpenAI-compatible API. herd-tune detects GPU vendor, downloads the correct llama-server binary, and starts it.
+1. **Ollama** (stable) — Herd talks to Ollama's HTTP API. herd-tune configures Ollama env vars.
+2. **llama-server** (v1.0) — Herd talks to llama.cpp's llama-server via its OpenAI-compatible API. herd-tune detects GPU vendor, downloads the correct llama-server binary, and starts it.
+3. **openai-compat** (v1.0) — Herd talks to any OpenAI-compatible endpoint.
 
 **Why llama-server?** Benchmarked on RTX 5090 (2026-04-08): llama-server delivers 44-80% faster TTFT and ~4x throughput vs Ollama on the same model and hardware. Ollama's Go serving layer is the bottleneck. Full benchmark data and architecture details in `docs/LLAMA_CPP_BACKEND.md`.
 
@@ -87,5 +88,6 @@ Git default branch is `main`. Always `git branch -M main` after `git init`.
 ## Roadmap
 
 See `ROADMAP.md`. Current priorities:
-- **llama-server backend support** — herd-tune GPU detection, binary download, backend-aware health checks
-- Budget caps, routing profiles, multi-model consensus (v1.0+)
+- Budget caps, routing profiles, multi-model consensus (v1.1+)
+- Multi-node discovery (mDNS / static fleet config)
+- llama.cpp RPC integration for tensor-parallel sharding

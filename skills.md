@@ -320,7 +320,7 @@ Herd will route to a healthy backend.
 If Herd has rate limiting enabled, you'll receive `429 Too Many Requests` when
 the limit is exceeded. Back off and retry.
 
-## Hot Models & keep_alive (v0.4.3+)
+## Hot Models & keep_alive
 
 Herd keeps models permanently loaded using two mechanisms:
 
@@ -415,16 +415,16 @@ routing:
   strategy: "model_aware" # priority | model_aware | least_busy | weighted_round_robin
   timeout: 120s           # Per-request timeout
   retry_count: 2          # Retries on failure
-  default_keep_alive: "-1" # v0.4.3+: injected into every Ollama request
+  default_keep_alive: "-1" # injected into every Ollama request
 
-model_warmer:             # v0.4.3+: replaces model_homing
+model_warmer:             # keeps hot_models loaded
   interval_secs: 240      # ping hot_models every 4 min
 
 backends:
   - name: "citadel"
     url: "http://citadel:11434"
     priority: 100
-    hot_models:            # v0.4.3+: replaces default_model
+    hot_models:            # models to keep permanently loaded
       - "qwen2.5-coder:32b"
     tags: ["gpu", "fast"]
     model_filter: "qwen|llama"  # Regex: only route matching models

@@ -1,4 +1,4 @@
-use crate::config::Backend;
+use crate::config::{Backend, BackendType};
 use crate::server::AppState;
 use axum::{
     extract::{Path, State},
@@ -120,6 +120,7 @@ pub async fn add_backend(
     let backend = Backend {
         name: req.name.clone(),
         url: req.url,
+        backend: BackendType::default(),
         priority: req.priority,
         hot_models: Vec::new(),
         gpu_hot_url: None,

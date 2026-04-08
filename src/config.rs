@@ -124,6 +124,25 @@ impl std::fmt::Display for RoutingStrategy {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum BackendType {
+    #[default]
+    #[serde(rename = "ollama")]
+    Ollama,
+
+    #[serde(rename = "llama-server")]
+    LlamaServer,
+}
+
+impl std::fmt::Display for BackendType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BackendType::Ollama => write!(f, "ollama"),
+            BackendType::LlamaServer => write!(f, "llama-server"),
+        }
+    }
+}
+
 fn default_strategy() -> RoutingStrategy {
     RoutingStrategy::ModelAware
 }
@@ -141,6 +160,10 @@ fn default_keep_alive_value() -> String {
 pub struct Backend {
     pub name: String,
     pub url: String,
+
+    #[serde(default)]
+    pub backend: BackendType,
+
     pub priority: u32,
 
     #[serde(default)]
@@ -167,6 +190,7 @@ impl Default for Backend {
         Self {
             name: String::new(),
             url: String::new(),
+            backend: BackendType::default(),
             priority: 50,
             hot_models: Vec::new(),
             gpu_hot_url: None,
@@ -501,6 +525,7 @@ pub fn parse_duration(input: &str) -> Result<Duration> {
 #[cfg(test)]
 mod tests {
     use super::parse_duration;
+    use super::BackendType;
     use super::Config;
     use std::time::Duration;
 
@@ -548,5 +573,26 @@ mod tests {
         let yaml = "backends:\n  - name: x\n    url: http://x\n    priority: 50\n    default_model: llama3:8b\n";
         let result: Result<Config, _> = serde_yaml::from_str(yaml);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn backend_type_defaults_to_ollama() {
+        let yaml = "backends:\n  - name: x\n    url: http://x\n    priority: 50\n";
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.backends[0].backend, BackendType::Ollama);
+    }
+
+    #[test]
+    fn backend_type_llama_server_parses() {
+        let yaml = "backends:\n  - name: x\n    url: http://x\n    priority: 50\n    backend: llama-server\n";
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.backends[0].backend, BackendType::LlamaServer);
+    }
+
+    #[test]
+    fn backend_type_ollama_explicit() {
+        let yaml = "backends:\n  - name: x\n    url: http://x\n    priority: 50\n    backend: ollama\n";
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.backends[0].backend, BackendType::Ollama);
     }
 }

@@ -29,6 +29,24 @@ struct OllamaTagModel {
     name: String,
 }
 
+/// llama-server /v1/models response (OpenAI format)
+#[derive(Debug, Deserialize)]
+struct LlamaServerModelsResponse {
+    #[serde(default)]
+    data: Vec<LlamaServerModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LlamaServerModel {
+    id: String,
+}
+
+/// llama-server /health response
+#[derive(Debug, Deserialize)]
+struct LlamaServerHealthResponse {
+    status: String,
+}
+
 pub struct NodeHealthPoller {
     client: reqwest::Client,
     poll_interval: Duration,
@@ -101,6 +119,7 @@ impl NodeHealthPoller {
             let backend = crate::config::Backend {
                 name: backend_name.clone(),
                 url: node.backend_url.clone(),
+                backend: node.backend,
                 priority: node.priority,
                 tags: node.tags.clone(),
                 ..Default::default()
@@ -154,6 +173,23 @@ impl NodeHealthPoller {
     async fn poll_node(&self, node_db: &NodeDb, node: &crate::nodes::Node, check_tags: bool) {
         let base_url = node.backend_url.trim_end_matches('/');
 
+        match node.backend {
+            crate::config::BackendType::LlamaServer => {
+                self.poll_llama_server(node_db, node, base_url).await;
+            }
+            crate::config::BackendType::Ollama => {
+                self.poll_ollama(node_db, node, base_url, check_tags).await;
+            }
+        }
+    }
+
+    async fn poll_ollama(
+        &self,
+        node_db: &NodeDb,
+        node: &crate::nodes::Node,
+        base_url: &str,
+        check_tags: bool,
+    ) {
         // GET /api/ps — loaded models
         let ps_url = format!("{}/api/ps", base_url);
         let ps_result = self.client.get(&ps_url).send().await;
@@ -235,5 +271,129 @@ impl NodeHealthPoller {
                 }
             }
         }
+    }
+
+    async fn poll_llama_server(
+        &self,
+        node_db: &NodeDb,
+        node: &crate::nodes::Node,
+        base_url: &str,
+    ) {
+        // GET /health — server health status
+        let health_url = format!("{}/health", base_url);
+        let health_result = self.client.get(&health_url).send().await;
+
+        match health_result {
+            Ok(resp) if resp.status().is_success() => {
+                let is_ok = match resp.json::<LlamaServerHealthResponse>().await {
+                    Ok(h) => h.status == "ok",
+                    Err(_) => true, // 200 is good enough
+                };
+
+                if !is_ok {
+                    // Server is loading — mark degraded
+                    if let Err(e) =
+                        node_db.update_health(&node.id, "degraded", &node.models_loaded, None)
+                    {
+                        tracing::error!(
+                            "Failed to update health for node {}: {}",
+                            node.hostname,
+                            e
+                        );
+                    }
+                    return;
+                }
+
+                // GET /v1/models — loaded models
+                let models_url = format!("{}/v1/models", base_url);
+                let models_loaded: Vec<String> = match self.client.get(&models_url).send().await {
+                    Ok(r) if r.status().is_success() => {
+                        match r.json::<LlamaServerModelsResponse>().await {
+                            Ok(m) => m.data.into_iter().map(|d| d.id).collect(),
+                            Err(_) => node.models_loaded.clone(),
+                        }
+                    }
+                    _ => node.models_loaded.clone(),
+                };
+
+                let models_available = Some(models_loaded.len() as u32);
+                if let Err(e) =
+                    node_db.update_health(&node.id, "healthy", &models_loaded, models_available)
+                {
+                    tracing::error!(
+                        "Failed to update health for node {}: {}",
+                        node.hostname,
+                        e
+                    );
+                }
+            }
+            Ok(resp) => {
+                tracing::warn!(
+                    "Node {} ({}) returned status {} from /health",
+                    node.hostname,
+                    base_url,
+                    resp.status()
+                );
+                let new_status = if node.status == "healthy" || node.status == "degraded" {
+                    "degraded"
+                } else {
+                    "unreachable"
+                };
+                if let Err(e) = node_db.update_health(&node.id, new_status, &[], None) {
+                    tracing::error!(
+                        "Failed to update health for node {}: {}",
+                        node.hostname,
+                        e
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Node {} ({}) health check failed: {}",
+                    node.hostname,
+                    base_url,
+                    e
+                );
+                let new_status = match node.status.as_str() {
+                    "healthy" => "degraded",
+                    "degraded" => "unreachable",
+                    _ => "unreachable",
+                };
+                if let Err(e) = node_db.update_health(&node.id, new_status, &[], None) {
+                    tracing::error!(
+                        "Failed to update health for node {}: {}",
+                        node.hostname,
+                        e
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_llama_server_models_response() {
+        let json = r#"{"object":"list","data":[{"id":"gemma-4-26B","object":"model","owned_by":"llamacpp"}]}"#;
+        let resp: LlamaServerModelsResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.data.len(), 1);
+        assert_eq!(resp.data[0].id, "gemma-4-26B");
+    }
+
+    #[test]
+    fn parse_llama_server_health_response() {
+        let json = r#"{"status":"ok"}"#;
+        let resp: LlamaServerHealthResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.status, "ok");
+    }
+
+    #[test]
+    fn parse_llama_server_health_loading() {
+        let json = r#"{"status":"loading model"}"#;
+        let resp: LlamaServerHealthResponse = serde_json::from_str(json).unwrap();
+        assert_ne!(resp.status, "ok");
     }
 }

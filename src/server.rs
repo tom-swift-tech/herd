@@ -782,9 +782,10 @@ async fn proxy_handler(
         }
     }
 
-    // Inject keep_alive for Ollama-native endpoints
+    // Prepare both versions of the body — keep_alive is Ollama-specific
     let keep_alive_value = state.config.read().await.routing.default_keep_alive.clone();
-    let forward_bytes = inject_keep_alive(&body_bytes, &path, &keep_alive_value);
+    let forward_bytes_ollama = inject_keep_alive(&body_bytes, &path, &keep_alive_value);
+    let forward_bytes_raw = body_bytes.clone();
 
     // Extract tags from X-Herd-Tags header (comma-separated)
     let tags: Option<Vec<String>> = headers
@@ -815,11 +816,24 @@ async fn proxy_handler(
         selected_backend = Some(backend.name.clone());
         let url = format!("{}{}", backend.url, path_and_query);
 
+        // Only inject keep_alive for Ollama backends
+        let forward_bytes = if state
+            .pool
+            .get(&backend.name)
+            .await
+            .map(|s| s.config.backend == crate::config::BackendType::Ollama)
+            .unwrap_or(true)
+        {
+            forward_bytes_ollama.clone()
+        } else {
+            forward_bytes_raw.clone()
+        };
+
         let req_builder = state
             .client
             .request(method.clone(), &url)
             .timeout(state.routing_timeout())
-            .body(forward_bytes.clone());
+            .body(forward_bytes);
         let req_builder = copy_request_headers(&headers, req_builder);
 
         match req_builder.send().await {

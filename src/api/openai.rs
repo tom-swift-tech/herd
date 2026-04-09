@@ -189,6 +189,9 @@ pub async fn chat_completions(
                 prompt_eval_ms: None,
                 eval_ms: None,
                 backend_type: None,
+                auto_tier: None,
+                auto_capability: None,
+                auto_model: None,
             };
             state
                 .metrics
@@ -245,6 +248,9 @@ pub async fn chat_completions(
             prompt_eval_ms: None,
             eval_ms: None,
             backend_type: None,
+            auto_tier: None,
+            auto_capability: None,
+            auto_model: None,
         };
         state
             .metrics
@@ -297,6 +303,9 @@ pub async fn chat_completions(
             prompt_eval_ms: None,
             eval_ms: None,
             backend_type: None,
+            auto_tier: None,
+            auto_capability: None,
+            auto_model: None,
         };
         state
             .metrics

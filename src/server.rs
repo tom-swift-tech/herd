@@ -1323,6 +1323,9 @@ async fn proxy_handler(
                 prompt_eval_ms: usage.prompt_eval_ms,
                 eval_ms: usage.eval_ms,
                 backend_type: self.backend_type_str.clone(),
+                auto_tier: None,
+                auto_capability: None,
+                auto_model: None,
             };
 
             self.state

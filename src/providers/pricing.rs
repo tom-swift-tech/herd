@@ -9,24 +9,51 @@ pub struct ModelPricing {
 pub fn get_pricing(model: &str) -> Option<ModelPricing> {
     match model {
         // Anthropic
-        "claude-opus-4-20250514" => Some(ModelPricing { input_per_mtok: 15.0, output_per_mtok: 75.0 }),
-        "claude-sonnet-4-20250514" => Some(ModelPricing { input_per_mtok: 3.0, output_per_mtok: 15.0 }),
+        "claude-opus-4-20250514" => Some(ModelPricing {
+            input_per_mtok: 15.0,
+            output_per_mtok: 75.0,
+        }),
+        "claude-sonnet-4-20250514" => Some(ModelPricing {
+            input_per_mtok: 3.0,
+            output_per_mtok: 15.0,
+        }),
         // OpenAI
-        "gpt-4.1" => Some(ModelPricing { input_per_mtok: 2.0, output_per_mtok: 8.0 }),
-        "o4-mini" => Some(ModelPricing { input_per_mtok: 1.10, output_per_mtok: 4.40 }),
+        "gpt-4.1" => Some(ModelPricing {
+            input_per_mtok: 2.0,
+            output_per_mtok: 8.0,
+        }),
+        "o4-mini" => Some(ModelPricing {
+            input_per_mtok: 1.10,
+            output_per_mtok: 4.40,
+        }),
         // xAI
-        "grok-3" => Some(ModelPricing { input_per_mtok: 3.0, output_per_mtok: 15.0 }),
-        "grok-3-mini" => Some(ModelPricing { input_per_mtok: 0.30, output_per_mtok: 0.50 }),
+        "grok-3" => Some(ModelPricing {
+            input_per_mtok: 3.0,
+            output_per_mtok: 15.0,
+        }),
+        "grok-3-mini" => Some(ModelPricing {
+            input_per_mtok: 0.30,
+            output_per_mtok: 0.50,
+        }),
         // MiniMax
-        "MiniMax-M1" => Some(ModelPricing { input_per_mtok: 0.80, output_per_mtok: 3.20 }),
+        "MiniMax-M1" => Some(ModelPricing {
+            input_per_mtok: 0.80,
+            output_per_mtok: 3.20,
+        }),
         _ => None,
     }
 }
 
 /// Look up pricing with user overrides taking precedence
-pub fn get_pricing_with_overrides(model: &str, overrides: &HashMap<String, crate::config::PricingOverride>) -> Option<ModelPricing> {
+pub fn get_pricing_with_overrides(
+    model: &str,
+    overrides: &HashMap<String, crate::config::PricingOverride>,
+) -> Option<ModelPricing> {
     if let Some(ov) = overrides.get(model) {
-        return Some(ModelPricing { input_per_mtok: ov.input_per_mtok, output_per_mtok: ov.output_per_mtok });
+        return Some(ModelPricing {
+            input_per_mtok: ov.input_per_mtok,
+            output_per_mtok: ov.output_per_mtok,
+        });
     }
     get_pricing(model)
 }
@@ -54,7 +81,10 @@ mod tests {
 
     #[test]
     fn cost_calculation() {
-        let pricing = ModelPricing { input_per_mtok: 3.0, output_per_mtok: 15.0 };
+        let pricing = ModelPricing {
+            input_per_mtok: 3.0,
+            output_per_mtok: 15.0,
+        };
         // 1M input tokens + 500k output tokens
         let cost = calculate_cost(&pricing, 1_000_000, 500_000);
         assert!((cost - 10.5).abs() < 0.0001, "expected 10.5, got {cost}");
@@ -65,7 +95,10 @@ mod tests {
         let mut overrides = HashMap::new();
         overrides.insert(
             "gpt-4.1".to_string(),
-            crate::config::PricingOverride { input_per_mtok: 1.0, output_per_mtok: 2.0 },
+            crate::config::PricingOverride {
+                input_per_mtok: 1.0,
+                output_per_mtok: 2.0,
+            },
         );
         let pricing = get_pricing_with_overrides("gpt-4.1", &overrides)
             .expect("should have pricing via override");

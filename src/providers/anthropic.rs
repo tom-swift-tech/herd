@@ -84,7 +84,10 @@ impl ProviderAdapter for AnthropicAdapter {
         }
 
         let model = body.get("model").cloned().unwrap_or(json!("unknown"));
-        let id = body.get("id").cloned().unwrap_or(json!("chatcmpl-anthropic"));
+        let id = body
+            .get("id")
+            .cloned()
+            .unwrap_or(json!("chatcmpl-anthropic"));
 
         Ok(json!({
             "id": id,
@@ -125,7 +128,10 @@ impl ProviderAdapter for AnthropicAdapter {
                     }],
                 });
 
-                Ok(format!("data: {}\n\n", serde_json::to_string(&openai_chunk)?))
+                Ok(format!(
+                    "data: {}\n\n",
+                    serde_json::to_string(&openai_chunk)?
+                ))
             }
             "message_stop" => {
                 let openai_chunk = json!({
@@ -137,7 +143,10 @@ impl ProviderAdapter for AnthropicAdapter {
                     }],
                 });
 
-                Ok(format!("data: {}\n\n", serde_json::to_string(&openai_chunk)?))
+                Ok(format!(
+                    "data: {}\n\n",
+                    serde_json::to_string(&openai_chunk)?
+                ))
             }
             _ => Ok(String::new()),
         }
@@ -176,7 +185,10 @@ mod tests {
         let result = adapter.transform_request(&openai_req).unwrap();
 
         // System messages extracted and joined
-        assert_eq!(result["system"], "You are a helpful assistant.\nBe concise.");
+        assert_eq!(
+            result["system"],
+            "You are a helpful assistant.\nBe concise."
+        );
 
         // Only non-system messages remain
         let messages = result["messages"].as_array().unwrap();
@@ -278,7 +290,8 @@ mod tests {
         let result = adapter
             .transform_stream_chunk(&serde_json::to_string(&delta_chunk).unwrap())
             .unwrap();
-        let parsed: Value = serde_json::from_str(result.trim_start_matches("data: ").trim()).unwrap();
+        let parsed: Value =
+            serde_json::from_str(result.trim_start_matches("data: ").trim()).unwrap();
         assert_eq!(parsed["choices"][0]["delta"]["content"], "Hello");
         assert!(parsed["choices"][0]["finish_reason"].is_null());
 
@@ -287,7 +300,8 @@ mod tests {
         let result = adapter
             .transform_stream_chunk(&serde_json::to_string(&stop_chunk).unwrap())
             .unwrap();
-        let parsed: Value = serde_json::from_str(result.trim_start_matches("data: ").trim()).unwrap();
+        let parsed: Value =
+            serde_json::from_str(result.trim_start_matches("data: ").trim()).unwrap();
         assert_eq!(parsed["choices"][0]["finish_reason"], "stop");
 
         // Other event types → empty string

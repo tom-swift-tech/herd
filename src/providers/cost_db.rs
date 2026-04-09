@@ -18,13 +18,19 @@ pub struct ProviderCostSummary {
 
 impl CostDb {
     pub fn new(conn: Connection) -> Self {
-        let db = Self { conn: Mutex::new(conn) };
-        db.migrate().unwrap_or_else(|e| tracing::warn!("Frontier cost migration failed: {}", e));
+        let db = Self {
+            conn: Mutex::new(conn),
+        };
+        db.migrate()
+            .unwrap_or_else(|e| tracing::warn!("Frontier cost migration failed: {}", e));
         db
     }
 
     pub fn migrate(&self) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS frontier_costs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -37,13 +43,24 @@ impl CostDb {
                 timestamp TEXT NOT NULL DEFAULT (datetime('now'))
             );
             CREATE INDEX IF NOT EXISTS idx_frontier_costs_provider_month
-                ON frontier_costs(provider, timestamp);"
+                ON frontier_costs(provider, timestamp);",
         )?;
         Ok(())
     }
 
-    pub fn record_cost(&self, provider: &str, model: &str, tokens_in: u64, tokens_out: u64, cost_usd: f32, request_id: Option<&str>) -> Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+    pub fn record_cost(
+        &self,
+        provider: &str,
+        model: &str,
+        tokens_in: u64,
+        tokens_out: u64,
+        cost_usd: f32,
+        request_id: Option<&str>,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
         conn.execute(
             "INSERT INTO frontier_costs (provider, model, tokens_in, tokens_out, cost_usd, request_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             rusqlite::params![provider, model, tokens_in as i64, tokens_out as i64, cost_usd as f64, request_id],
@@ -52,7 +69,10 @@ impl CostDb {
     }
 
     pub fn monthly_spend(&self, provider: &str) -> Result<f64> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
         let now = chrono::Utc::now();
         let month_start = format!("{}-{:02}-01T00:00:00", now.format("%Y"), now.format("%m"));
         let total: f64 = conn.query_row(
@@ -64,21 +84,26 @@ impl CostDb {
     }
 
     pub fn cost_summary(&self) -> Result<Vec<ProviderCostSummary>> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
         let now = chrono::Utc::now();
         let month_start = format!("{}-{:02}-01T00:00:00", now.format("%Y"), now.format("%m"));
         let mut stmt = conn.prepare(
             "SELECT provider, COALESCE(SUM(cost_usd),0), COALESCE(SUM(tokens_in),0), COALESCE(SUM(tokens_out),0), COUNT(*) FROM frontier_costs WHERE timestamp >= ?1 GROUP BY provider"
         )?;
-        let rows = stmt.query_map(rusqlite::params![month_start], |row| {
-            Ok(ProviderCostSummary {
-                provider: row.get(0)?,
-                total_cost_usd: row.get(1)?,
-                total_tokens_in: row.get::<_, i64>(2)? as u64,
-                total_tokens_out: row.get::<_, i64>(3)? as u64,
-                request_count: row.get::<_, i64>(4)? as u64,
-            })
-        })?.collect::<Result<Vec<_>, _>>()?;
+        let rows = stmt
+            .query_map(rusqlite::params![month_start], |row| {
+                Ok(ProviderCostSummary {
+                    provider: row.get(0)?,
+                    total_cost_usd: row.get(1)?,
+                    total_tokens_in: row.get::<_, i64>(2)? as u64,
+                    total_tokens_out: row.get::<_, i64>(3)? as u64,
+                    request_count: row.get::<_, i64>(4)? as u64,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 }
@@ -95,7 +120,8 @@ mod tests {
     #[test]
     fn record_and_query_cost() {
         let db = in_memory_db();
-        db.record_cost("openai", "gpt-4o", 1000, 500, 0.015, Some("req-abc")).unwrap();
+        db.record_cost("openai", "gpt-4o", 1000, 500, 0.015, Some("req-abc"))
+            .unwrap();
 
         let summary = db.cost_summary().unwrap();
         assert_eq!(summary.len(), 1);
@@ -110,9 +136,12 @@ mod tests {
     #[test]
     fn monthly_spend_filters_by_provider() {
         let db = in_memory_db();
-        db.record_cost("openai", "gpt-4o", 1000, 500, 0.10, None).unwrap();
-        db.record_cost("openai", "gpt-4o", 2000, 800, 0.20, None).unwrap();
-        db.record_cost("anthropic", "claude-3-5-sonnet", 500, 200, 0.05, None).unwrap();
+        db.record_cost("openai", "gpt-4o", 1000, 500, 0.10, None)
+            .unwrap();
+        db.record_cost("openai", "gpt-4o", 2000, 800, 0.20, None)
+            .unwrap();
+        db.record_cost("anthropic", "claude-3-5-sonnet", 500, 200, 0.05, None)
+            .unwrap();
 
         let openai_spend = db.monthly_spend("openai").unwrap();
         let anthropic_spend = db.monthly_spend("anthropic").unwrap();
@@ -126,10 +155,14 @@ mod tests {
     #[test]
     fn cost_summary_returns_all_providers() {
         let db = in_memory_db();
-        db.record_cost("openai", "gpt-4o", 1000, 500, 0.10, None).unwrap();
-        db.record_cost("anthropic", "claude-3-5-sonnet", 800, 300, 0.08, None).unwrap();
-        db.record_cost("gemini", "gemini-2.0-flash", 600, 200, 0.04, None).unwrap();
-        db.record_cost("openai", "gpt-4o-mini", 200, 100, 0.01, None).unwrap();
+        db.record_cost("openai", "gpt-4o", 1000, 500, 0.10, None)
+            .unwrap();
+        db.record_cost("anthropic", "claude-3-5-sonnet", 800, 300, 0.08, None)
+            .unwrap();
+        db.record_cost("gemini", "gemini-2.0-flash", 600, 200, 0.04, None)
+            .unwrap();
+        db.record_cost("openai", "gpt-4o-mini", 200, 100, 0.01, None)
+            .unwrap();
 
         let summary = db.cost_summary().unwrap();
         assert_eq!(summary.len(), 3);

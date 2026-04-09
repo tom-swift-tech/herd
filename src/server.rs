@@ -138,6 +138,7 @@ pub struct AppState {
     pub budget: Arc<crate::budget::BudgetTracker>,
     pub rate_limiter: Arc<crate::rate_limit::RateLimiter>,
     pub auto_cache: Arc<crate::classifier_auto::ClassificationCache>,
+    pub cost_db: Arc<crate::providers::cost_db::CostDb>,
     pub routing_timeout_ms: Arc<AtomicU64>,
     pub routing_retry_count: Arc<AtomicU32>,
     pub config_path: Option<PathBuf>,
@@ -421,6 +422,14 @@ impl Server {
         }
 
         let node_db = Arc::new(crate::nodes::NodeDb::open()?);
+        let cost_db = Arc::new(crate::providers::cost_db::CostDb::new(
+            rusqlite::Connection::open(
+                dirs::home_dir()
+                    .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?
+                    .join(".herd")
+                    .join("frontier_costs.db"),
+            )?,
+        ));
 
         // Start node health poller (polls registered nodes every 10s, tags every 60s)
         let node_poller = crate::nodes::NodeHealthPoller::new(10, 60);
@@ -455,6 +464,7 @@ impl Server {
             budget,
             rate_limiter,
             auto_cache: Arc::new(crate::classifier_auto::ClassificationCache::new(1000)),
+            cost_db,
             routing_timeout_ms: Arc::new(AtomicU64::new(routing_timeout.as_millis() as u64)),
             routing_retry_count: Arc::new(AtomicU32::new(self.config.routing.retry_count)),
             config_path: self.config_path.clone(),
@@ -592,6 +602,12 @@ impl Server {
 
         // Budget summary endpoint (always mounted, returns empty if disabled)
         app = app.route("/api/budget", axum::routing::get(budget_handler));
+
+        // Frontier cost summary endpoint
+        app = app.route(
+            "/api/frontier/costs",
+            axum::routing::get(frontier_costs_handler),
+        );
 
         // Conditionally mount admin API (requires auth)
         if admin_api_enabled {
@@ -1207,6 +1223,103 @@ async fn proxy_handler(
         }
     }
 
+    // Frontier gateway: if model is a frontier model, route through providers
+    let frontier_config = state.config.read().await.frontier.clone();
+    let provider_configs = state.config.read().await.providers.clone();
+
+    if frontier_config.enabled
+        && model_name
+            .as_ref()
+            .map(|m| crate::providers::is_frontier_model(m, &provider_configs))
+            .unwrap_or(false)
+    {
+        // Check require_header (unless auto-escalation)
+        if frontier_config.require_header {
+            let has_header = headers
+                .get("x-herd-frontier")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            let is_auto_escalation = auto_classification
+                .as_ref()
+                .map(|c| c.tier == "frontier")
+                .unwrap_or(false)
+                && frontier_config.allow_auto_escalation;
+
+            if !has_header && !is_auto_escalation {
+                return Err(axum::http::StatusCode::FORBIDDEN);
+            }
+        }
+
+        // Parse request body as JSON for transformation
+        let body_json =
+            serde_json::from_slice::<serde_json::Value>(&body_bytes).unwrap_or_default();
+        let model = model_name.as_deref().unwrap_or("");
+
+        // Route through frontier
+        match crate::providers::proxy_frontier_request(
+            &state.client,
+            &frontier_config,
+            &provider_configs,
+            &state.cost_db,
+            model,
+            &body_json,
+            Some(&request_id),
+        )
+        .await
+        {
+            Ok(result) => {
+                let provider_name = result.provider_name.clone();
+                let status_code =
+                    axum::http::StatusCode::from_u16(result.response.status().as_u16())
+                        .unwrap_or(axum::http::StatusCode::OK);
+
+                let mut builder = axum::response::Response::builder()
+                    .status(status_code)
+                    .header("x-request-id", &request_id)
+                    .header("x-herd-provider", &provider_name);
+
+                // Forward response headers
+                for (name, value) in result.response.headers() {
+                    if let (Ok(aname), Ok(aval)) = (
+                        axum::http::header::HeaderName::from_bytes(name.as_ref()),
+                        axum::http::header::HeaderValue::from_bytes(value.as_ref()),
+                    ) {
+                        builder = builder.header(aname, aval);
+                    }
+                }
+
+                // Stream the body
+                let body = axum::body::Body::from_stream(result.response.bytes_stream());
+                return builder
+                    .body(body)
+                    .map_err(|_| axum::http::StatusCode::BAD_GATEWAY);
+            }
+            Err(e) => {
+                tracing::warn!("Frontier gateway error: {}", e);
+                let (status, msg) = match &e {
+                    crate::providers::FrontierError::BudgetExceeded { .. } => {
+                        (axum::http::StatusCode::PAYMENT_REQUIRED, e.to_string())
+                    }
+                    crate::providers::FrontierError::HeaderRequired => {
+                        (axum::http::StatusCode::FORBIDDEN, e.to_string())
+                    }
+                    crate::providers::FrontierError::NoApiKey(_, _) => {
+                        (axum::http::StatusCode::SERVICE_UNAVAILABLE, e.to_string())
+                    }
+                    _ => (axum::http::StatusCode::BAD_GATEWAY, e.to_string()),
+                };
+                let body = axum::body::Body::from(serde_json::json!({"error": msg}).to_string());
+                return Ok(axum::response::Response::builder()
+                    .status(status)
+                    .header("content-type", "application/json")
+                    .header("x-request-id", &request_id)
+                    .body(body)
+                    .unwrap_or_default());
+            }
+        }
+    }
+
     // Prepare both versions of the body — keep_alive is Ollama-specific
     let keep_alive_value = state.config.read().await.routing.default_keep_alive.clone();
     let forward_bytes_ollama = inject_keep_alive(&body_bytes, &path, &keep_alive_value);
@@ -1407,6 +1520,8 @@ async fn proxy_handler(
                 auto_tier: self.auto_tier.clone(),
                 auto_capability: self.auto_capability.clone(),
                 auto_model: self.auto_model.clone(),
+                frontier_provider: None,
+                frontier_cost_usd: None,
             };
 
             self.state
@@ -1791,6 +1906,20 @@ async fn budget_handler(
     )
 }
 
+async fn frontier_costs_handler(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> axum::Json<serde_json::Value> {
+    match state.cost_db.cost_summary() {
+        Ok(summary) => axum::Json(
+            serde_json::to_value(&summary)
+                .unwrap_or_else(|_| serde_json::json!({"error": "serialization failed"})),
+        ),
+        Err(e) => axum::Json(serde_json::json!({
+            "error": format!("Failed to get frontier costs: {}", e)
+        })),
+    }
+}
+
 async fn agent_analytics_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
@@ -2134,6 +2263,9 @@ mod tests {
             budget: crate::budget::BudgetTracker::new(initial.budget.clone()),
             rate_limiter: Arc::new(crate::rate_limit::RateLimiter::new(&initial.rate_limiting)),
             auto_cache: Arc::new(crate::classifier_auto::ClassificationCache::new(1000)),
+            cost_db: Arc::new(crate::providers::cost_db::CostDb::new(
+                rusqlite::Connection::open_in_memory().unwrap(),
+            )),
             routing_timeout_ms: Arc::new(AtomicU64::new(1_000)),
             routing_retry_count: Arc::new(AtomicU32::new(1)),
             config_path: Some(temp_path.clone()),

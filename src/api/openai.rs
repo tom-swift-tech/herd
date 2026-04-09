@@ -211,6 +211,8 @@ pub async fn chat_completions(
                 auto_tier: None,
                 auto_capability: None,
                 auto_model: None,
+                frontier_provider: None,
+                frontier_cost_usd: None,
             };
             state
                 .metrics
@@ -270,6 +272,8 @@ pub async fn chat_completions(
             auto_tier: None,
             auto_capability: None,
             auto_model: None,
+            frontier_provider: None,
+            frontier_cost_usd: None,
         };
         state
             .metrics
@@ -325,6 +329,8 @@ pub async fn chat_completions(
             auto_tier: None,
             auto_capability: None,
             auto_model: None,
+            frontier_provider: None,
+            frontier_cost_usd: None,
         };
         state
             .metrics

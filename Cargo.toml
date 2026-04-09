@@ -1,9 +1,9 @@
 [package]
 name = "herd"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 authors = ["Swift Innovative Technologies"]
-description = "Intelligent Ollama router with GPU awareness"
+description = "Intelligent LLM router with multi-backend GPU-aware routing"
 license = "MIT"
 repository = "https://github.com/swift-innovate/herd"
 keywords = ["ollama", "llm", "router", "load-balancer", "gpu"]

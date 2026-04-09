@@ -91,22 +91,27 @@ No cloud dependency. No API keys exposed. Full local control.
 - ~~**Extended node registration** — `gpu_vendor`, `gpu_backend`, `cuda_version`, `backend_version`, `capabilities` fields~~ ✅
 - ~~**Model search CLI** — `herd search <query>` for HuggingFace GGUF discovery (inspired by Fox engine UX)~~ ✅ (API endpoint, CLI wrapper deferred)
 - ~~**Model download with resume** — robust GGUF pull with partial download tracking~~ ✅ (DB tracking ready, Ollama pull proxied)
-- **Ollama blob extraction** — reuse existing Ollama models by extracting raw GGUF from blob storage *(deferred to v1.1)*
+- **Ollama blob extraction** — reuse existing Ollama models by extracting raw GGUF from blob storage *(shipped in v1.1.0)*
 - ~~**Health check abstraction** — backend-aware health probes (Ollama `/api/ps` vs llama-server `/health`)~~ ✅
 - ~~Backward compatible — existing Ollama-only configs continue to work unchanged~~ ✅
 - ~~**Telemetry enrichment** — token counts, per-model/backend latency, cost estimation, Prometheus metrics~~ ✅
 - ~~**Dashboard control plane** — Models tab with HF search, Fleet GPU badges, analytics visualizations~~ ✅
 - ~~**HuggingFace model search API** — search, download, VRAM compatibility~~ ✅
 
-### v1.1.0+ — Scale & Ecosystem (Future)
+### v1.1.0 — Scale & Security ✅
 
-- Multi-node discovery (mDNS / static fleet config)
-- TLS termination
-- Rate limiting per client / API key
+- ~~TLS termination (optional HTTPS via rustls, feature-gated `--features tls`)~~ ✅
+- ~~Per-client rate limiting (per-API-key token buckets with `X-Herd-RateLimit-*` headers)~~ ✅
+- ~~Budget caps and cost tracking (per-client/per-model USD limits, daily/weekly/monthly reset)~~ ✅
+- ~~Routing profiles (named presets selected via `X-Herd-Profile` header)~~ ✅
+- ~~Ollama blob extraction (extract raw GGUF from Ollama blob storage for llama-server reuse)~~ ✅
+- ~~Multi-node discovery (static fleet config with auto-probe)~~ ✅
+
+### v1.2.0+ — Extensibility (Future)
+
+- Multi-node discovery (mDNS — full implementation)
 - Plugin system for custom routing strategies
 - Distributed health consensus
-- Budget caps and cost tracking
-- Routing profiles (named presets)
 - Multi-model consensus routing
 - llama.cpp RPC integration for tensor-parallel sharding across fleet nodes
 

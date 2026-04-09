@@ -1,4 +1,4 @@
-# Herd Configuration Example (v1.0.0)
+# Herd Configuration Example (v1.1.0)
 # Copy to herd.yaml and customize for your cluster.
 #
 # Herd supports three backend types per node:

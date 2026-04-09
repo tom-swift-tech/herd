@@ -10,7 +10,7 @@
 |-------|-------|
 | **Repo** | `swift-innovate/herd` (GitHub) |
 | **Language** | Rust |
-| **Version** | 1.0.0 |
+| **Version** | 1.1.0 |
 | **Purpose** | Intelligent LLM router — GPU-aware routing, circuit breakers, OpenAI compat, agent sessions, fleet management, dashboard |
 
 Herd is a single-binary reverse proxy for local LLM backends. It routes AI workloads across local GPU nodes with model awareness, health tracking, and observability.
@@ -58,7 +58,7 @@ Herd supports three backend types per node:
 
 ```bash
 cargo build          # Debug build
-cargo test           # 189 tests (unit + integration)
+cargo test           # 257 tests (unit + integration)
 cargo build --release  # Release build
 ```
 
@@ -88,6 +88,8 @@ Git default branch is `main`. Always `git branch -M main` after `git init`.
 ## Roadmap
 
 See `ROADMAP.md`. Current priorities:
-- Budget caps, routing profiles, multi-model consensus (v1.1+)
-- Multi-node discovery (mDNS / static fleet config)
+- Plugin system for custom routing strategies (v1.2+)
+- Multi-node discovery (mDNS — full implementation)
+- Distributed health consensus
+- Multi-model consensus routing
 - llama.cpp RPC integration for tensor-parallel sharding

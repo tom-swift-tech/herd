@@ -4,13 +4,15 @@
 [![GitHub stars](https://img.shields.io/github/stars/swift-innovate/herd?style=social)](https://github.com/swift-innovate/herd/stargazers)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.70+-orange.svg)](https://www.rust-lang.org)
-[![Roadmap](https://img.shields.io/badge/roadmap-v1.0-blue)](ROADMAP.md)
+[![Roadmap](https://img.shields.io/badge/roadmap-v1.1-blue)](ROADMAP.md)
 
 **Intelligent LLM fleet router with GPU awareness, multi-backend support, and real-time observability.**
 
 Route your llama herd with intelligence — Herd sits in front of your inference nodes (Ollama, llama-server, or any self-hosted OpenAI-compatible backend) and routes requests based on model availability, GPU load, and node health. One binary. One endpoint. Your entire fleet, unified.
 
-> **New in v1.0:** llama-server (llama.cpp) as a first-class backend. Benchmarked at **44–80% faster TTFT** and **~4x throughput** vs Ollama on identical hardware. Herd is now vendor-agnostic across NVIDIA, AMD, and Intel GPUs. See [Backend Types](#backend-types) and the [benchmark data](docs/LLAMA_CPP_BACKEND.md).
+> **New in v1.1:** TLS termination, per-client rate limiting, budget caps, routing profiles, Ollama blob extraction, and multi-node discovery. See [What's New in v1.1](#whats-new-in-v11).
+>
+> **v1.0:** llama-server (llama.cpp) as a first-class backend. Benchmarked at **44–80% faster TTFT** and **~4x throughput** vs Ollama on identical hardware. Herd is now vendor-agnostic across NVIDIA, AMD, and Intel GPUs. See [Backend Types](#backend-types) and the [benchmark data](docs/LLAMA_CPP_BACKEND.md).
 
 <img width="1735" height="803" alt="image" src="https://github.com/user-attachments/assets/d625b30f-8110-482e-80cd-e3297a5ff428" />
 
@@ -20,6 +22,93 @@ Running multiple agents + parallel tool calls? Herd stops the GPU wars.
 Point your agents at `http://your-herd:40114` — model homing + live VRAM routing keeps every request on the fastest available node.
 
 Benchmarked on RTX 5090 with 4 concurrent agent requests: **41 seconds average TTFT via Ollama → 8 seconds via llama-server through Herd.** That's the difference between agents waiting and agents working.
+
+## What's New in v1.1
+
+### TLS Termination
+
+Optional HTTPS via rustls, feature-gated behind `--features tls`. Falls back to HTTP gracefully on errors.
+
+```yaml
+tls:
+  enabled: true
+  cert_path: /path/to/cert.pem
+  key_path: /path/to/key.pem
+  redirect_http: true     # 301 redirect HTTP -> HTTPS
+  redirect_port: 80
+```
+
+### Per-Client Rate Limiting
+
+Per-API-key token buckets with response headers (`X-Herd-RateLimit-Limit`, `X-Herd-RateLimit-Remaining`, `X-Herd-RateLimit-Reset`). Returns HTTP 429 when exceeded. Falls back to global limit for unknown keys.
+
+```yaml
+rate_limiting:
+  global: 100              # requests/sec for unknown clients
+  clients:
+    - name: my-agent
+      api_key: sk-agent-12345
+      rate_limit: 50
+    - name: vip-client
+      api_key: sk-vip-99999
+      rate_limit: 0        # unlimited
+```
+
+### Budget Caps & Cost Tracking
+
+Per-client and per-model budget limits in USD with daily/weekly/monthly reset. Action: `reject` (HTTP 429) or `warn` (log + allow). Query current spend via `GET /api/budget`.
+
+```yaml
+budget:
+  enabled: true
+  global_limit_usd: 50.00
+  reset_period: monthly    # daily, weekly, monthly
+  action: reject
+  clients:
+    agent-team: 20.00
+  models:
+    "llama3:70b": 30.00
+```
+
+### Routing Profiles
+
+Named presets combining strategy, tags, backend filter, and preferred model. Clients select via the `X-Herd-Profile` request header. Manage via `GET /api/profiles` and `PUT /api/profiles/default`.
+
+```yaml
+routing_profiles:
+  enabled: true
+  default_profile: balanced
+  profiles:
+    fast:
+      strategy: priority
+    coding:
+      strategy: model_aware
+      preferred_model: "qwen2.5-coder:32b"
+      tags: [gpu, high-vram]
+```
+
+### Ollama Blob Extraction
+
+Extract raw GGUF files from Ollama's blob storage for reuse with llama-server. Symlinks on Unix, copies on Windows.
+
+- `GET /api/ollama/models` -- list extractable models
+- `POST /api/ollama/extract` -- extract GGUF from blob storage
+
+### Multi-Node Discovery
+
+Static fleet configuration with auto-probing. Define known node URLs and Herd probes them on an interval to register backends automatically. mDNS discovery is stubbed (feature-gated, not yet implemented).
+
+```yaml
+discovery:
+  enabled: true
+  probe_interval_secs: 60
+  static_nodes:
+    - url: http://192.168.1.100:8090
+      backend: llama-server
+      tags: [gpu, nvidia]
+    - url: http://192.168.1.101:11434
+      backend: ollama
+```
 
 ## Getting Started
 
@@ -80,7 +169,7 @@ You're now routing through Herd. Point any OpenAI-compatible client at `http://l
 
 ## Backend Types
 
-Herd v1.0 supports three backend types per node:
+Herd supports three backend types per node:
 
 | Backend | Config Value | Health Check | Model Discovery | keep_alive Injection |
 |---------|-------------|-------------|-----------------|---------------------|
@@ -153,7 +242,10 @@ Herd is a **smart stateless proxy with a stateful routing cache**. It is not HA 
 - **keep_alive injection** — Override `keep_alive` centrally; prevents clients from accidentally evicting models
 - **Hot models warmer** — Declare `hot_models` per backend; Herd pre-loads and keeps them warm
 - **Hot-reload config** — File watcher + `POST /admin/reload`
-- **Rate limiting** — Global token-bucket rate limiter
+- **Rate limiting** — Global + per-client token-bucket rate limiter with `X-Herd-RateLimit-*` headers
+- **Budget caps** — Per-client/per-model USD spending limits with configurable reset periods
+- **Routing profiles** — Named presets (strategy + tags + backend filter) selected via `X-Herd-Profile` header
+- **TLS termination** — Optional HTTPS via rustls (`--features tls`) with HTTP redirect
 - **OpenAI-compatible endpoints** — Drop-in `/v1/chat/completions` for any client
 - **Multi-backend** — Route across Ollama, llama-server, and openai-compat backends simultaneously
 - **Auto-update** — `herd --update` or `POST /admin/update`
@@ -166,6 +258,8 @@ Herd is a **smart stateless proxy with a stateful routing cache**. It is not HA 
 - **SQLite node registry** — Persistent fleet state with health polling
 - **HuggingFace model search** — Search GGUF models with VRAM compatibility per-node
 - **Model download** — Pull models to Ollama nodes via API (llama-server download in roadmap)
+- **Ollama blob extraction** — Extract raw GGUF from Ollama blob storage for llama-server reuse
+- **Multi-node discovery** — Static fleet config with auto-probing (mDNS stubbed, not yet active)
 
 ### Agent-Friendly
 - **Agent sessions** — Create, resume, list, and delete sessions with message history and TTL
@@ -424,10 +518,15 @@ Request IDs are included in JSONL analytics logs for correlation across systems.
 | `POST /admin/update` | Self-update from GitHub Releases |
 | `GET /admin/config` | View running config (secrets redacted) |
 | `PUT /admin/config` | Update config via API |
+| `GET /api/budget` | Current budget spend and limits |
+| `GET /api/profiles` | List routing profiles |
+| `PUT /api/profiles/default` | Set default routing profile |
+| `GET /api/ollama/models` | List extractable Ollama models |
+| `POST /api/ollama/extract` | Extract GGUF from Ollama blob storage |
 
 ## Telemetry & Prometheus Metrics
 
-Herd v1.0 exposes rich telemetry at `GET /metrics`:
+Herd exposes rich telemetry at `GET /metrics`:
 
 ```
 # Request totals by status and backend
@@ -611,6 +710,11 @@ On startup, Herd checks for updates in the background and logs a notification if
 | Self-hosted, no cloud | ✅ | ✅ | ✅ |
 | Token-level telemetry | ✅ | ✅ | ❌ |
 | Single binary (Rust) | ✅ | ❌ (Python) | ❌ (Go) |
+| TLS termination | ✅ (feature-gated) | ✅ | ❌ |
+| Per-client rate limiting | ✅ | ✅ | ❌ |
+| Budget caps | ✅ | ✅ | ❌ |
+| Routing profiles | ✅ | ❌ | ❌ |
+| Multi-node discovery | ✅ | ❌ | ❌ |
 | Self-update | ✅ | ❌ | ❌ |
 
 ## License

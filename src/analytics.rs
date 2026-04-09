@@ -39,6 +39,10 @@ pub struct RequestLog {
     pub auto_capability: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontier_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontier_cost_usd: Option<f32>,
 }
 
 pub struct Analytics {
@@ -433,6 +437,8 @@ mod tests {
             auto_tier: None,
             auto_capability: None,
             auto_model: None,
+            frontier_provider: None,
+            frontier_cost_usd: None,
         };
         let json = serde_json::to_string(&log).unwrap();
         assert!(json.contains("abc-123"));
@@ -459,6 +465,8 @@ mod tests {
             auto_tier: None,
             auto_capability: None,
             auto_model: None,
+            frontier_provider: None,
+            frontier_cost_usd: None,
         };
         let json = serde_json::to_string(&log).unwrap();
         assert!(!json.contains("request_id"));
@@ -531,6 +539,8 @@ mod tests {
             auto_tier: None,
             auto_capability: None,
             auto_model: None,
+            frontier_provider: None,
+            frontier_cost_usd: None,
         };
         let json = serde_json::to_string(&log).unwrap();
         let deserialized: RequestLog = serde_json::from_str(&json).unwrap();
@@ -563,6 +573,8 @@ mod tests {
             auto_tier: None,
             auto_capability: None,
             auto_model: None,
+            frontier_provider: None,
+            frontier_cost_usd: None,
         };
         let json = serde_json::to_string(&log).unwrap();
         assert!(!json.contains("tokens_in"));
@@ -651,6 +663,8 @@ mod tests {
                 auto_tier: None,
                 auto_capability: None,
                 auto_model: None,
+                frontier_provider: None,
+                frontier_cost_usd: None,
             },
             RequestLog {
                 timestamp: chrono::Utc::now().timestamp(),
@@ -671,6 +685,8 @@ mod tests {
                 auto_tier: None,
                 auto_capability: None,
                 auto_model: None,
+                frontier_provider: None,
+                frontier_cost_usd: None,
             },
             RequestLog {
                 timestamp: chrono::Utc::now().timestamp(),
@@ -691,6 +707,8 @@ mod tests {
                 auto_tier: None,
                 auto_capability: None,
                 auto_model: None,
+                frontier_provider: None,
+                frontier_cost_usd: None,
             },
         ];
 
@@ -740,6 +758,8 @@ mod tests {
             auto_tier: Some("standard".into()),
             auto_capability: Some("code".into()),
             auto_model: Some("qwen2.5-coder:32b".into()),
+            frontier_provider: None,
+            frontier_cost_usd: None,
         };
         let json = serde_json::to_string(&log).unwrap();
         assert!(json.contains("auto_tier"));

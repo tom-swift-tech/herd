@@ -12,6 +12,7 @@ pub mod discovery;
 pub mod metrics;
 pub mod nodes;
 pub mod profiles;
+pub mod providers;
 pub mod rate_limit;
 pub mod router;
 pub mod server;

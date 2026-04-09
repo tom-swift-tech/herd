@@ -27,6 +27,25 @@ pub async fn list_models(State(state): State<AppState>) -> Json<Value> {
         }
     }
 
+    // Include frontier provider models when frontier is enabled
+    let config = state.config.read().await;
+    if config.frontier.enabled {
+        for provider in &config.providers {
+            for model in &provider.models {
+                if seen.insert(model.clone()) {
+                    models.push(json!({
+                        "id": model,
+                        "object": "model",
+                        "created": 0,
+                        "owned_by": &provider.name,
+                        "herd_provider": &provider.name,
+                        "herd_type": "frontier",
+                    }));
+                }
+            }
+        }
+    }
+
     Json(json!({ "object": "list", "data": models }))
 }
 
@@ -192,6 +211,8 @@ pub async fn chat_completions(
                 auto_tier: None,
                 auto_capability: None,
                 auto_model: None,
+                frontier_provider: None,
+                frontier_cost_usd: None,
             };
             state
                 .metrics
@@ -251,6 +272,8 @@ pub async fn chat_completions(
             auto_tier: None,
             auto_capability: None,
             auto_model: None,
+            frontier_provider: None,
+            frontier_cost_usd: None,
         };
         state
             .metrics
@@ -306,6 +329,8 @@ pub async fn chat_completions(
             auto_tier: None,
             auto_capability: None,
             auto_model: None,
+            frontier_provider: None,
+            frontier_cost_usd: None,
         };
         state
             .metrics

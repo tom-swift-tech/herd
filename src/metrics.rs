@@ -29,6 +29,10 @@ pub struct Metrics {
     pub auto_classification_duration_count: Arc<AtomicU64>,
     /// Cache hit count
     pub auto_cache_hits: Arc<AtomicU64>,
+    /// Frontier requests by "provider|model" → count
+    pub frontier_requests: Arc<RwLock<HashMap<String, AtomicU64>>>,
+    /// Frontier cost by provider → cumulative USD
+    pub frontier_cost_total: Arc<RwLock<HashMap<String, f64>>>,
 }
 
 pub struct LatencyHistogram {
@@ -146,6 +150,8 @@ impl Metrics {
             auto_classification_duration_sum: Arc::new(AtomicU64::new(0)),
             auto_classification_duration_count: Arc::new(AtomicU64::new(0)),
             auto_cache_hits: Arc::new(AtomicU64::new(0)),
+            frontier_requests: Arc::new(RwLock::new(HashMap::new())),
+            frontier_cost_total: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -242,6 +248,18 @@ impl Metrics {
         if cache_hit {
             self.auto_cache_hits.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    pub async fn record_frontier_request(&self, provider: &str, model: &str, cost_usd: f32) {
+        let key = format!("{}|{}", provider, model);
+        let mut map = self.frontier_requests.write().await;
+        map.entry(key)
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+        drop(map);
+
+        let mut cost_map = self.frontier_cost_total.write().await;
+        *cost_map.entry(provider.to_string()).or_insert(0.0) += cost_usd as f64;
     }
 
     pub async fn render(&self) -> String {
@@ -394,6 +412,40 @@ impl Metrics {
             );
             out.push_str("# TYPE herd_auto_cache_hits_total counter\n");
             out.push_str(&format!("herd_auto_cache_hits_total {}\n", cache_hits));
+        }
+
+        // Frontier request counts
+        {
+            let map = self.frontier_requests.read().await;
+            if !map.is_empty() {
+                out.push_str("\n# HELP herd_frontier_requests_total Frontier provider requests by provider and model\n");
+                out.push_str("# TYPE herd_frontier_requests_total counter\n");
+                for (key, count) in map.iter() {
+                    if let Some((provider, model)) = key.split_once('|') {
+                        out.push_str(&format!(
+                            "herd_frontier_requests_total{{provider=\"{}\",model=\"{}\"}} {}\n",
+                            provider,
+                            model,
+                            count.load(Ordering::Relaxed)
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Frontier cost totals
+        {
+            let map = self.frontier_cost_total.read().await;
+            if !map.is_empty() {
+                out.push_str("\n# HELP herd_frontier_cost_usd_total Cumulative frontier provider cost in USD\n");
+                out.push_str("# TYPE herd_frontier_cost_usd_total counter\n");
+                for (provider, cost) in map.iter() {
+                    out.push_str(&format!(
+                        "herd_frontier_cost_usd_total{{provider=\"{}\"}} {:.6}\n",
+                        provider, cost
+                    ));
+                }
+            }
         }
 
         out

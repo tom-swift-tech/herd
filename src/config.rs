@@ -45,6 +45,12 @@ pub struct Config {
 
     #[serde(default)]
     pub discovery: DiscoveryConfig,
+
+    #[serde(default)]
+    pub frontier: FrontierConfig,
+
+    #[serde(default)]
+    pub providers: Vec<ProviderConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -672,6 +678,107 @@ fn default_mdns_service() -> String {
     "_herd._tcp.local.".to_string()
 }
 
+/// Frontier Gateway global settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrontierConfig {
+    #[serde(default)]
+    pub enabled: bool,
+
+    #[serde(default)]
+    pub allow_auto_escalation: bool,
+
+    #[serde(default = "default_true")]
+    pub require_header: bool,
+
+    #[serde(default = "default_true")]
+    pub log_all_requests: bool,
+
+    #[serde(default = "default_warn_threshold")]
+    pub warn_threshold: f32,
+
+    #[serde(default = "default_block_threshold")]
+    pub block_threshold: f32,
+}
+
+impl Default for FrontierConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allow_auto_escalation: false,
+            require_header: true,
+            log_all_requests: true,
+            warn_threshold: default_warn_threshold(),
+            block_threshold: default_block_threshold(),
+        }
+    }
+}
+
+fn default_warn_threshold() -> f32 {
+    0.80
+}
+fn default_block_threshold() -> f32 {
+    1.00
+}
+
+/// Per-model pricing override (USD per million tokens).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PricingOverride {
+    pub input_per_mtok: f32,
+    pub output_per_mtok: f32,
+}
+
+/// A single frontier/external provider (e.g. OpenAI, Anthropic).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderConfig {
+    pub name: String,
+
+    #[serde(default = "default_frontier_type")]
+    pub r#type: String,
+
+    pub api_url: String,
+
+    #[serde(default)]
+    pub api_key_env: String,
+
+    #[serde(default)]
+    pub models: Vec<String>,
+
+    #[serde(default)]
+    pub rate_limit: u64,
+
+    #[serde(default)]
+    pub monthly_budget: f32,
+
+    #[serde(default = "default_provider_priority")]
+    pub priority: u32,
+
+    #[serde(default)]
+    pub pricing: HashMap<String, PricingOverride>,
+}
+
+impl Default for ProviderConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            r#type: default_frontier_type(),
+            api_url: String::new(),
+            api_key_env: String::new(),
+            models: Vec::new(),
+            rate_limit: 0,
+            monthly_budget: 0.0,
+            priority: default_provider_priority(),
+            pricing: HashMap::new(),
+        }
+    }
+}
+
+fn default_frontier_type() -> String {
+    "frontier".to_string()
+}
+fn default_provider_priority() -> u32 {
+    50
+}
+
 impl Config {
     pub fn from_file(path: &Path) -> Result<Self> {
         let content = fs::read_to_string(path)?;
@@ -1271,5 +1378,86 @@ routing:
 "#;
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         assert!(!config.routing.auto.enabled);
+    }
+
+    #[test]
+    fn frontier_config_defaults() {
+        let f = super::FrontierConfig::default();
+        assert!(!f.enabled);
+        assert!(!f.allow_auto_escalation);
+        assert!(f.require_header);
+        assert!(f.log_all_requests);
+        assert!((f.warn_threshold - 0.80).abs() < 0.001);
+        assert!((f.block_threshold - 1.00).abs() < 0.001);
+    }
+
+    #[test]
+    fn provider_config_deserializes() {
+        let yaml = r#"
+providers:
+  - name: openai
+    type: frontier
+    api_url: https://api.openai.com
+    api_key_env: OPENAI_API_KEY
+    models:
+      - gpt-4o
+      - gpt-4o-mini
+    rate_limit: 60
+    monthly_budget: 100.0
+    priority: 10
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.providers.len(), 1);
+        let p = &config.providers[0];
+        assert_eq!(p.name, "openai");
+        assert_eq!(p.r#type, "frontier");
+        assert_eq!(p.api_url, "https://api.openai.com");
+        assert_eq!(p.api_key_env, "OPENAI_API_KEY");
+        assert_eq!(p.models, vec!["gpt-4o", "gpt-4o-mini"]);
+        assert_eq!(p.rate_limit, 60);
+        assert!((p.monthly_budget - 100.0).abs() < 0.001);
+        assert_eq!(p.priority, 10);
+        assert!(p.pricing.is_empty());
+    }
+
+    #[test]
+    fn provider_config_with_pricing_overrides() {
+        let yaml = r#"
+providers:
+  - name: anthropic
+    api_url: https://api.anthropic.com
+    pricing:
+      claude-3-5-sonnet-20241022:
+        input_per_mtok: 3.0
+        output_per_mtok: 15.0
+      claude-3-haiku-20240307:
+        input_per_mtok: 0.25
+        output_per_mtok: 1.25
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let p = &config.providers[0];
+        assert_eq!(p.pricing.len(), 2);
+        let sonnet = &p.pricing["claude-3-5-sonnet-20241022"];
+        assert!((sonnet.input_per_mtok - 3.0).abs() < 0.001);
+        assert!((sonnet.output_per_mtok - 15.0).abs() < 0.001);
+        let haiku = &p.pricing["claude-3-haiku-20240307"];
+        assert!((haiku.input_per_mtok - 0.25).abs() < 0.001);
+        assert!((haiku.output_per_mtok - 1.25).abs() < 0.001);
+    }
+
+    #[test]
+    fn config_without_frontier_section_backward_compat() {
+        let yaml = r#"
+server:
+  host: 0.0.0.0
+  port: 40114
+backends:
+  - name: gpu1
+    url: http://localhost:11434
+    priority: 100
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(!config.frontier.enabled);
+        assert!(config.providers.is_empty());
     }
 }

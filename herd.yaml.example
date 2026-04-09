@@ -285,3 +285,52 @@ observability:
 #     deny_bash_patterns:           # Regex patterns blocking shell commands
 #       - "^rm\\s+-rf"
 #       - "^sudo"
+
+# === FRONTIER GATEWAY ===
+# Route requests to cloud LLM providers when local models can't handle the task.
+# Off by default — frontier routing never activates by accident.
+# API keys are read from environment variables, never stored in config.
+
+# frontier:
+#   enabled: false
+#   allow_auto_escalation: false   # let auto mode route to frontier when local can't handle
+#   require_header: true           # requests must include X-Herd-Frontier: true
+#   log_all_requests: true         # JSONL audit log for every frontier request
+#   warn_threshold: 0.80           # warn at 80% of monthly budget
+#   block_threshold: 1.00          # hard block at 100%
+
+# === PROVIDERS ===
+# Cloud LLM providers for frontier routing. Each needs an env var with the API key.
+
+# providers:
+#   - name: "anthropic"
+#     api_url: "https://api.anthropic.com/v1"
+#     api_key_env: "ANTHROPIC_API_KEY"
+#     models: ["claude-opus-4-20250514", "claude-sonnet-4-20250514"]
+#     rate_limit: 50               # requests per minute
+#     monthly_budget: 100.00       # USD hard cap
+#     priority: 50
+#
+#   - name: "openai"
+#     api_url: "https://api.openai.com/v1"
+#     api_key_env: "OPENAI_API_KEY"
+#     models: ["gpt-4.1", "o4-mini"]
+#     rate_limit: 60
+#     monthly_budget: 50.00
+#     priority: 40
+#
+#   - name: "xai"
+#     api_url: "https://api.x.ai/v1"
+#     api_key_env: "XAI_API_KEY"
+#     models: ["grok-3", "grok-3-mini"]
+#     rate_limit: 30
+#     monthly_budget: 30.00
+#     priority: 30
+#
+#   - name: "openrouter"
+#     api_url: "https://openrouter.ai/api/v1"
+#     api_key_env: "OPENROUTER_API_KEY"
+#     models: []                   # empty = accept any model, proxy through
+#     rate_limit: 100
+#     monthly_budget: 50.00
+#     priority: 20

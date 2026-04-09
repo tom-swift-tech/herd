@@ -21,6 +21,14 @@ pub struct Metrics {
     pub tokens_per_second_ema: Arc<RwLock<f32>>,
     /// Labeled latency histogram by "{backend}|{model}|{status}"
     pub labeled_latency: Arc<RwLock<HashMap<String, LatencyHistogram>>>,
+    /// Auto classification counts by tier|capability
+    pub auto_classifications: Arc<RwLock<HashMap<String, AtomicU64>>>,
+    /// Sum of classification durations in ms
+    pub auto_classification_duration_sum: Arc<AtomicU64>,
+    /// Count of classification calls
+    pub auto_classification_duration_count: Arc<AtomicU64>,
+    /// Cache hit count
+    pub auto_cache_hits: Arc<AtomicU64>,
 }
 
 pub struct LatencyHistogram {
@@ -134,6 +142,10 @@ impl Metrics {
             tokens_total: Arc::new(RwLock::new(HashMap::new())),
             tokens_per_second_ema: Arc::new(RwLock::new(0.0)),
             labeled_latency: Arc::new(RwLock::new(HashMap::new())),
+            auto_classifications: Arc::new(RwLock::new(HashMap::new())),
+            auto_classification_duration_sum: Arc::new(AtomicU64::new(0)),
+            auto_classification_duration_count: Arc::new(AtomicU64::new(0)),
+            auto_cache_hits: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -208,6 +220,28 @@ impl Metrics {
         map.entry(key)
             .or_insert_with(LatencyHistogram::new)
             .observe(duration_ms);
+    }
+
+    pub async fn record_auto_classification(
+        &self,
+        tier: &str,
+        capability: &str,
+        duration_ms: u64,
+        cache_hit: bool,
+    ) {
+        let key = format!("{}|{}", tier, capability);
+        let mut map = self.auto_classifications.write().await;
+        map.entry(key)
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+        drop(map);
+        self.auto_classification_duration_sum
+            .fetch_add(duration_ms, Ordering::Relaxed);
+        self.auto_classification_duration_count
+            .fetch_add(1, Ordering::Relaxed);
+        if cache_hit {
+            self.auto_cache_hits.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub async fn render(&self) -> String {
@@ -312,6 +346,54 @@ impl Metrics {
                     );
                 }
             }
+        }
+
+        // Auto classification metrics
+        {
+            let auto_map = self.auto_classifications.read().await;
+            if !auto_map.is_empty() {
+                out.push_str("# HELP herd_auto_classifications_total Total auto classifications by tier and capability\n");
+                out.push_str("# TYPE herd_auto_classifications_total counter\n");
+                for (key, count) in auto_map.iter() {
+                    let count_val = count.load(Ordering::Relaxed);
+                    if let Some((tier, capability)) = key.split_once('|') {
+                        out.push_str(&format!(
+                            "herd_auto_classifications_total{{tier=\"{}\",capability=\"{}\"}} {}\n",
+                            tier, capability, count_val
+                        ));
+                    }
+                }
+            }
+        }
+        let auto_dur_count = self
+            .auto_classification_duration_count
+            .load(Ordering::Relaxed);
+        if auto_dur_count > 0 {
+            let auto_dur_sum = self
+                .auto_classification_duration_sum
+                .load(Ordering::Relaxed);
+            out.push_str("# HELP herd_auto_classification_duration_ms_sum Total classification duration in ms\n");
+            out.push_str("# TYPE herd_auto_classification_duration_ms_sum counter\n");
+            out.push_str(&format!(
+                "herd_auto_classification_duration_ms_sum {}\n",
+                auto_dur_sum
+            ));
+            out.push_str(
+                "# HELP herd_auto_classification_duration_ms_count Total classification calls\n",
+            );
+            out.push_str("# TYPE herd_auto_classification_duration_ms_count counter\n");
+            out.push_str(&format!(
+                "herd_auto_classification_duration_ms_count {}\n",
+                auto_dur_count
+            ));
+        }
+        let cache_hits = self.auto_cache_hits.load(Ordering::Relaxed);
+        if cache_hits > 0 {
+            out.push_str(
+                "# HELP herd_auto_cache_hits_total Total auto classification cache hits\n",
+            );
+            out.push_str("# TYPE herd_auto_cache_hits_total counter\n");
+            out.push_str(&format!("herd_auto_cache_hits_total {}\n", cache_hits));
         }
 
         out
@@ -446,6 +528,26 @@ mod tests {
             let hist = map.get("gpu1|model-0|success").unwrap();
             assert_eq!(hist.count.load(Ordering::Relaxed), 2);
         }
+    }
+
+    #[tokio::test]
+    async fn auto_classification_metrics_render() {
+        let metrics = Metrics::new();
+        metrics
+            .record_auto_classification("standard", "code", 150, false)
+            .await;
+        metrics
+            .record_auto_classification("heavy", "reasoning", 200, true)
+            .await;
+        let output = metrics.render().await;
+        assert!(output
+            .contains("herd_auto_classifications_total{tier=\"standard\",capability=\"code\"} 1"));
+        assert!(output.contains(
+            "herd_auto_classifications_total{tier=\"heavy\",capability=\"reasoning\"} 1"
+        ));
+        assert!(output.contains("herd_auto_classification_duration_ms_sum 350"));
+        assert!(output.contains("herd_auto_classification_duration_ms_count 2"));
+        assert!(output.contains("herd_auto_cache_hits_total 1"));
     }
 
     #[test]

@@ -308,6 +308,15 @@ impl BackendPool {
         }
     }
 
+    /// Find the URL of a healthy backend that has a specific model loaded.
+    pub async fn find_model_backend(&self, model: &str) -> Option<String> {
+        let backends = self.backends.read().await;
+        backends
+            .iter()
+            .find(|b| b.healthy && b.models.iter().any(|m| m == model))
+            .map(|b| b.config.url.clone())
+    }
+
     pub async fn remove(&self, name: &str) -> bool {
         let mut backends = self.backends.write().await;
         let len_before = backends.len();

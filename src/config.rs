@@ -100,6 +100,9 @@ pub struct RoutingConfig {
     // Read by proxy_handler (Task 2) — injected into every /api/generate and /api/chat request.
     #[serde(default = "default_keep_alive_value")]
     pub default_keep_alive: String,
+
+    #[serde(default)]
+    pub auto: AutoRoutingConfig,
 }
 
 impl Default for RoutingConfig {
@@ -109,8 +112,57 @@ impl Default for RoutingConfig {
             timeout: default_timeout(),
             retry_count: default_retry_count(),
             default_keep_alive: default_keep_alive_value(),
+            auto: AutoRoutingConfig::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoRoutingConfig {
+    #[serde(default)]
+    pub enabled: bool,
+
+    #[serde(default = "default_classifier_model")]
+    pub classifier_model: String,
+
+    #[serde(default)]
+    pub classifier_backend: Option<String>,
+
+    #[serde(default = "default_classifier_timeout")]
+    pub classifier_timeout_ms: u64,
+
+    #[serde(default)]
+    pub fallback_model: String,
+
+    #[serde(default = "default_cache_ttl")]
+    pub cache_ttl_secs: u64,
+
+    #[serde(default)]
+    pub model_map: HashMap<String, HashMap<String, String>>,
+}
+
+impl Default for AutoRoutingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            classifier_model: default_classifier_model(),
+            classifier_backend: None,
+            classifier_timeout_ms: default_classifier_timeout(),
+            fallback_model: String::new(),
+            cache_ttl_secs: default_cache_ttl(),
+            model_map: HashMap::new(),
+        }
+    }
+}
+
+fn default_classifier_model() -> String {
+    "qwen3:1.7b".to_string()
+}
+fn default_classifier_timeout() -> u64 {
+    3000
+}
+fn default_cache_ttl() -> u64 {
+    60
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1167,5 +1219,57 @@ backends:
 "#;
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         assert!(!config.budget.enabled);
+    }
+
+    #[test]
+    fn auto_routing_config_defaults() {
+        let config: super::AutoRoutingConfig = Default::default();
+        assert!(!config.enabled);
+        assert_eq!(config.classifier_model, "qwen3:1.7b");
+        assert_eq!(config.classifier_timeout_ms, 3000);
+        assert_eq!(config.fallback_model, "");
+        assert_eq!(config.cache_ttl_secs, 60);
+        assert!(config.model_map.is_empty());
+    }
+
+    #[test]
+    fn auto_routing_config_deserializes_from_yaml() {
+        let yaml = r#"
+enabled: true
+classifier_model: "qwen3:1.7b"
+classifier_timeout_ms: 2000
+fallback_model: "qwen2.5-coder:32b"
+cache_ttl_secs: 120
+model_map:
+  light:
+    general: "qwen3:1.7b"
+    code: "qwen2.5-coder:7b"
+  standard:
+    general: "qwen3:8b"
+    code: "qwen2.5-coder:32b"
+  heavy:
+    general: "qwen3:32b"
+  frontier:
+    _provider: "true"
+    general: "claude-sonnet-4-20250514"
+"#;
+        let config: super::AutoRoutingConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.enabled);
+        assert_eq!(config.classifier_timeout_ms, 2000);
+        assert_eq!(config.model_map.len(), 4);
+        assert_eq!(config.model_map["standard"]["code"], "qwen2.5-coder:32b");
+    }
+
+    #[test]
+    fn config_without_auto_section_backward_compat() {
+        let yaml = r#"
+server:
+  host: "0.0.0.0"
+  port: 40114
+routing:
+  strategy: "model_aware"
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(!config.routing.auto.enabled);
     }
 }

@@ -137,6 +137,7 @@ pub struct AppState {
     pub node_db: Arc<crate::nodes::NodeDb>,
     pub budget: Arc<crate::budget::BudgetTracker>,
     pub rate_limiter: Arc<crate::rate_limit::RateLimiter>,
+    pub auto_cache: Arc<crate::classifier_auto::ClassificationCache>,
     pub routing_timeout_ms: Arc<AtomicU64>,
     pub routing_retry_count: Arc<AtomicU32>,
     pub config_path: Option<PathBuf>,
@@ -453,6 +454,7 @@ impl Server {
             node_db,
             budget,
             rate_limiter,
+            auto_cache: Arc::new(crate::classifier_auto::ClassificationCache::new(1000)),
             routing_timeout_ms: Arc::new(AtomicU64::new(routing_timeout.as_millis() as u64)),
             routing_retry_count: Arc::new(AtomicU32::new(self.config.routing.retry_count)),
             config_path: self.config_path.clone(),
@@ -1077,6 +1079,82 @@ async fn proxy_handler(
         }
     }
 
+    // Auto classification: if model is "auto" or absent, classify and resolve
+    let mut auto_classification: Option<crate::classifier_auto::Classification> = None;
+    if crate::classifier_auto::should_auto_classify(model_name.as_deref()) {
+        let auto_config = state.config.read().await.routing.auto.clone();
+        if auto_config.enabled {
+            let body_json =
+                serde_json::from_slice::<serde_json::Value>(&body_bytes).unwrap_or_default();
+            let user_message = crate::classifier::extract_last_user_message(&body_json);
+
+            if !user_message.is_empty() {
+                let ck = crate::classifier_auto::cache_key(&user_message);
+                let ttl = std::time::Duration::from_secs(auto_config.cache_ttl_secs);
+
+                if let Some(cached) = state.auto_cache.get(&ck, ttl) {
+                    state
+                        .metrics
+                        .record_auto_classification(&cached.tier, &cached.capability, 0, true)
+                        .await;
+                    auto_classification = Some(cached);
+                } else {
+                    let classify_start = std::time::Instant::now();
+                    let backend_url = state
+                        .pool
+                        .find_model_backend(&auto_config.classifier_model)
+                        .await;
+
+                    if let Some(url) = backend_url {
+                        let timeout =
+                            std::time::Duration::from_millis(auto_config.classifier_timeout_ms);
+                        let result = crate::classifier_auto::classify_request(
+                            &state.client,
+                            &url,
+                            &auto_config.classifier_model,
+                            &user_message,
+                            timeout,
+                        )
+                        .await;
+
+                        let dur = classify_start.elapsed().as_millis() as u64;
+                        if let Some(ref c) = result {
+                            state.auto_cache.put(&ck, c.clone());
+                            state
+                                .metrics
+                                .record_auto_classification(&c.tier, &c.capability, dur, false)
+                                .await;
+                        }
+                        auto_classification = result;
+                    } else {
+                        tracing::warn!(
+                            "Auto classifier: no backend with model '{}' — using fallback",
+                            auto_config.classifier_model
+                        );
+                    }
+                }
+
+                // Resolve classification to a model name
+                let resolved = if let Some(ref c) = auto_classification {
+                    crate::classifier_auto::resolve_model(
+                        &auto_config.model_map,
+                        &c.tier,
+                        &c.capability,
+                        &auto_config.fallback_model,
+                    )
+                } else if !auto_config.fallback_model.is_empty() {
+                    auto_config.fallback_model.clone()
+                } else {
+                    String::new()
+                };
+
+                if !resolved.is_empty() {
+                    model_name = Some(resolved);
+                }
+            }
+        }
+    }
+
     // Extract client identifier from X-Herd-Client header (for budget tracking)
     let client_name: Option<String> = headers
         .get("x-herd-client")
@@ -1301,6 +1379,9 @@ async fn proxy_handler(
         tier: Option<String>,
         classified_by: Option<String>,
         backend_type_str: Option<String>,
+        auto_tier: Option<String>,
+        auto_capability: Option<String>,
+        auto_model: Option<String>,
         start: std::time::Instant,
     }
 
@@ -1323,6 +1404,9 @@ async fn proxy_handler(
                 prompt_eval_ms: usage.prompt_eval_ms,
                 eval_ms: usage.eval_ms,
                 backend_type: self.backend_type_str.clone(),
+                auto_tier: self.auto_tier.clone(),
+                auto_capability: self.auto_capability.clone(),
+                auto_model: self.auto_model.clone(),
             };
 
             self.state
@@ -1366,6 +1450,15 @@ async fn proxy_handler(
         }
     }
 
+    // Extract auto classification fields for logging and headers
+    let auto_tier = auto_classification.as_ref().map(|c| c.tier.clone());
+    let auto_capability = auto_classification.as_ref().map(|c| c.capability.clone());
+    let auto_model = if auto_classification.is_some() {
+        model_name.clone()
+    } else {
+        None
+    };
+
     match response {
         Some(r) => {
             let status_code = axum::http::StatusCode::from_u16(r.status().as_u16())
@@ -1379,6 +1472,23 @@ async fn proxy_handler(
             if let Some(ref pname) = profile_name {
                 if let Ok(val) = axum::http::HeaderValue::from_str(pname) {
                     builder = builder.header("x-herd-profile", val);
+                }
+            }
+
+            // Add auto classification response headers
+            if let Some(ref tier) = auto_tier {
+                if let Ok(val) = axum::http::HeaderValue::from_str(tier) {
+                    builder = builder.header("x-herd-auto-tier", val);
+                }
+            }
+            if let Some(ref cap) = auto_capability {
+                if let Ok(val) = axum::http::HeaderValue::from_str(cap) {
+                    builder = builder.header("x-herd-auto-capability", val);
+                }
+            }
+            if let Some(ref model) = auto_model {
+                if let Ok(val) = axum::http::HeaderValue::from_str(model) {
+                    builder = builder.header("x-herd-auto-model", val);
                 }
             }
 
@@ -1464,6 +1574,9 @@ async fn proxy_handler(
                     tier,
                     classified_by,
                     backend_type_str: backend_type_str.clone(),
+                    auto_tier: auto_tier.clone(),
+                    auto_capability: auto_capability.clone(),
+                    auto_model: auto_model.clone(),
                     start,
                 };
                 tokio::spawn(async move {
@@ -1494,6 +1607,9 @@ async fn proxy_handler(
                     tier,
                     classified_by,
                     backend_type_str,
+                    auto_tier,
+                    auto_capability,
+                    auto_model,
                     start,
                 };
                 ctx.log_and_record(status, usage).await;
@@ -1515,6 +1631,9 @@ async fn proxy_handler(
                 tier: classification.map(|c| c.tier.clone()),
                 classified_by: classification.map(|c| c.classified_by.clone()),
                 backend_type_str,
+                auto_tier,
+                auto_capability,
+                auto_model,
                 start,
             };
             ctx.log_and_record(status, TokenUsage::default()).await;
@@ -2014,6 +2133,7 @@ mod tests {
             node_db: Arc::new(crate::nodes::NodeDb::open().unwrap()),
             budget: crate::budget::BudgetTracker::new(initial.budget.clone()),
             rate_limiter: Arc::new(crate::rate_limit::RateLimiter::new(&initial.rate_limiting)),
+            auto_cache: Arc::new(crate::classifier_auto::ClassificationCache::new(1000)),
             routing_timeout_ms: Arc::new(AtomicU64::new(1_000)),
             routing_retry_count: Arc::new(AtomicU32::new(1)),
             config_path: Some(temp_path.clone()),

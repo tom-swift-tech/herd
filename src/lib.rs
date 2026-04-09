@@ -5,6 +5,7 @@ pub mod backend;
 pub mod blob;
 pub mod budget;
 pub mod classifier;
+pub mod classifier_auto;
 pub mod cli;
 pub mod config;
 pub mod discovery;

@@ -33,6 +33,12 @@ pub struct RequestLog {
     pub eval_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_tier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_capability: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_model: Option<String>,
 }
 
 pub struct Analytics {
@@ -424,6 +430,9 @@ mod tests {
             prompt_eval_ms: None,
             eval_ms: None,
             backend_type: None,
+            auto_tier: None,
+            auto_capability: None,
+            auto_model: None,
         };
         let json = serde_json::to_string(&log).unwrap();
         assert!(json.contains("abc-123"));
@@ -447,6 +456,9 @@ mod tests {
             prompt_eval_ms: None,
             eval_ms: None,
             backend_type: None,
+            auto_tier: None,
+            auto_capability: None,
+            auto_model: None,
         };
         let json = serde_json::to_string(&log).unwrap();
         assert!(!json.contains("request_id"));
@@ -516,6 +528,9 @@ mod tests {
             prompt_eval_ms: Some(80),
             eval_ms: Some(420),
             backend_type: Some("llama-server".into()),
+            auto_tier: None,
+            auto_capability: None,
+            auto_model: None,
         };
         let json = serde_json::to_string(&log).unwrap();
         let deserialized: RequestLog = serde_json::from_str(&json).unwrap();
@@ -545,6 +560,9 @@ mod tests {
             prompt_eval_ms: None,
             eval_ms: None,
             backend_type: None,
+            auto_tier: None,
+            auto_capability: None,
+            auto_model: None,
         };
         let json = serde_json::to_string(&log).unwrap();
         assert!(!json.contains("tokens_in"));
@@ -630,6 +648,9 @@ mod tests {
                 prompt_eval_ms: None,
                 eval_ms: None,
                 backend_type: Some("ollama".into()),
+                auto_tier: None,
+                auto_capability: None,
+                auto_model: None,
             },
             RequestLog {
                 timestamp: chrono::Utc::now().timestamp(),
@@ -647,6 +668,9 @@ mod tests {
                 prompt_eval_ms: None,
                 eval_ms: None,
                 backend_type: Some("ollama".into()),
+                auto_tier: None,
+                auto_capability: None,
+                auto_model: None,
             },
             RequestLog {
                 timestamp: chrono::Utc::now().timestamp(),
@@ -664,6 +688,9 @@ mod tests {
                 prompt_eval_ms: None,
                 eval_ms: None,
                 backend_type: Some("llama-server".into()),
+                auto_tier: None,
+                auto_capability: None,
+                auto_model: None,
             },
         ];
 
@@ -690,6 +717,46 @@ mod tests {
         assert_eq!(total_out, 700);
         assert_eq!(model_tokens["llama3:8b"], (150, 300));
         assert_eq!(model_tokens["qwen2:14b"], (200, 400));
+    }
+
+    #[test]
+    fn request_log_auto_fields_round_trip() {
+        let log = RequestLog {
+            timestamp: 1000,
+            model: Some("qwen3:8b".into()),
+            backend: "node1".into(),
+            duration_ms: 500,
+            status: "success".into(),
+            path: "/v1/chat/completions".into(),
+            request_id: None,
+            tier: None,
+            classified_by: None,
+            tokens_in: None,
+            tokens_out: None,
+            tokens_per_second: None,
+            prompt_eval_ms: None,
+            eval_ms: None,
+            backend_type: None,
+            auto_tier: Some("standard".into()),
+            auto_capability: Some("code".into()),
+            auto_model: Some("qwen2.5-coder:32b".into()),
+        };
+        let json = serde_json::to_string(&log).unwrap();
+        assert!(json.contains("auto_tier"));
+        assert!(json.contains("standard"));
+        let deser: RequestLog = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.auto_tier.as_deref(), Some("standard"));
+        assert_eq!(deser.auto_capability.as_deref(), Some("code"));
+        assert_eq!(deser.auto_model.as_deref(), Some("qwen2.5-coder:32b"));
+    }
+
+    #[test]
+    fn request_log_without_auto_fields_backward_compat() {
+        let json = r#"{"timestamp":1000,"model":null,"backend":"b1","duration_ms":100,"status":"success","path":"/test"}"#;
+        let log: RequestLog = serde_json::from_str(json).unwrap();
+        assert!(log.auto_tier.is_none());
+        assert!(log.auto_capability.is_none());
+        assert!(log.auto_model.is_none());
     }
 
     #[test]

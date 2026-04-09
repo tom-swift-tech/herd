@@ -49,6 +49,33 @@ routing:
                                  # "-1" = never unload; "5m" = 5 minutes; "0" = unload immediately.
                                  # Overrides whatever the client sent. Not injected on /v1/* paths.
 
+  # === AUTO MODE ===
+  # LLM-based request classification. When model is "auto" or omitted, Herd calls
+  # a small local model to classify the request, then routes to the best model.
+  # Off by default — zero overhead when disabled.
+
+  # auto:
+  #   enabled: false
+  #   classifier_model: "qwen3:1.7b"       # Small local model for classification
+  #   classifier_timeout_ms: 3000           # Max time for the classification call
+  #   fallback_model: "qwen2.5-coder:32b"  # Used when classifier fails or times out
+  #   cache_ttl_secs: 60                    # Cache classification results by message hash
+  #   model_map:
+  #     light:
+  #       general: "qwen3:1.7b"
+  #       code: "qwen2.5-coder:7b"
+  #     standard:
+  #       general: "qwen3:8b"
+  #       code: "qwen2.5-coder:32b"
+  #       reasoning: "qwen3:32b"
+  #     heavy:
+  #       general: "qwen3:32b"
+  #       code: "qwen2.5-coder:32b"
+  #     frontier:
+  #       _provider: "true"                 # Signals: route to frontier gateway (future)
+  #       general: "claude-sonnet-4-20250514"
+  #       reasoning: "claude-opus-4-20250514"
+
 # === ROUTING PROFILES ===
 # Named routing presets. Clients select via X-Herd-Profile header.
 # Off by default — when disabled, global routing config is used for all requests.

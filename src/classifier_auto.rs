@@ -210,13 +210,7 @@ pub async fn classify_request(
 
     let url = format!("{}/v1/chat/completions", backend_url.trim_end_matches('/'));
 
-    let response = match client
-        .post(&url)
-        .json(&body)
-        .timeout(timeout)
-        .send()
-        .await
-    {
+    let response = match client.post(&url).json(&body).timeout(timeout).send().await {
         Ok(resp) => resp,
         Err(e) => {
             warn!("Auto-classifier request failed: {}", e);
@@ -225,10 +219,7 @@ pub async fn classify_request(
     };
 
     if !response.status().is_success() {
-        warn!(
-            "Auto-classifier returned status {}",
-            response.status()
-        );
+        warn!("Auto-classifier returned status {}", response.status());
         return None;
     }
 

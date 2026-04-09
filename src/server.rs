@@ -1084,8 +1084,8 @@ async fn proxy_handler(
     if crate::classifier_auto::should_auto_classify(model_name.as_deref()) {
         let auto_config = state.config.read().await.routing.auto.clone();
         if auto_config.enabled {
-            let body_json = serde_json::from_slice::<serde_json::Value>(&body_bytes)
-                .unwrap_or_default();
+            let body_json =
+                serde_json::from_slice::<serde_json::Value>(&body_bytes).unwrap_or_default();
             let user_message = crate::classifier::extract_last_user_message(&body_json);
 
             if !user_message.is_empty() {
@@ -1095,12 +1095,7 @@ async fn proxy_handler(
                 if let Some(cached) = state.auto_cache.get(&ck, ttl) {
                     state
                         .metrics
-                        .record_auto_classification(
-                            &cached.tier,
-                            &cached.capability,
-                            0,
-                            true,
-                        )
+                        .record_auto_classification(&cached.tier, &cached.capability, 0, true)
                         .await;
                     auto_classification = Some(cached);
                 } else {
@@ -1111,9 +1106,8 @@ async fn proxy_handler(
                         .await;
 
                     if let Some(url) = backend_url {
-                        let timeout = std::time::Duration::from_millis(
-                            auto_config.classifier_timeout_ms,
-                        );
+                        let timeout =
+                            std::time::Duration::from_millis(auto_config.classifier_timeout_ms);
                         let result = crate::classifier_auto::classify_request(
                             &state.client,
                             &url,
@@ -1128,12 +1122,7 @@ async fn proxy_handler(
                             state.auto_cache.put(&ck, c.clone());
                             state
                                 .metrics
-                                .record_auto_classification(
-                                    &c.tier,
-                                    &c.capability,
-                                    dur,
-                                    false,
-                                )
+                                .record_auto_classification(&c.tier, &c.capability, dur, false)
                                 .await;
                         }
                         auto_classification = result;

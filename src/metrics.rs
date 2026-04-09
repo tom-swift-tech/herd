@@ -222,15 +222,23 @@ impl Metrics {
             .observe(duration_ms);
     }
 
-    pub async fn record_auto_classification(&self, tier: &str, capability: &str, duration_ms: u64, cache_hit: bool) {
+    pub async fn record_auto_classification(
+        &self,
+        tier: &str,
+        capability: &str,
+        duration_ms: u64,
+        cache_hit: bool,
+    ) {
         let key = format!("{}|{}", tier, capability);
         let mut map = self.auto_classifications.write().await;
         map.entry(key)
             .or_insert_with(|| AtomicU64::new(0))
             .fetch_add(1, Ordering::Relaxed);
         drop(map);
-        self.auto_classification_duration_sum.fetch_add(duration_ms, Ordering::Relaxed);
-        self.auto_classification_duration_count.fetch_add(1, Ordering::Relaxed);
+        self.auto_classification_duration_sum
+            .fetch_add(duration_ms, Ordering::Relaxed);
+        self.auto_classification_duration_count
+            .fetch_add(1, Ordering::Relaxed);
         if cache_hit {
             self.auto_cache_hits.fetch_add(1, Ordering::Relaxed);
         }
@@ -357,19 +365,33 @@ impl Metrics {
                 }
             }
         }
-        let auto_dur_count = self.auto_classification_duration_count.load(Ordering::Relaxed);
+        let auto_dur_count = self
+            .auto_classification_duration_count
+            .load(Ordering::Relaxed);
         if auto_dur_count > 0 {
-            let auto_dur_sum = self.auto_classification_duration_sum.load(Ordering::Relaxed);
+            let auto_dur_sum = self
+                .auto_classification_duration_sum
+                .load(Ordering::Relaxed);
             out.push_str("# HELP herd_auto_classification_duration_ms_sum Total classification duration in ms\n");
             out.push_str("# TYPE herd_auto_classification_duration_ms_sum counter\n");
-            out.push_str(&format!("herd_auto_classification_duration_ms_sum {}\n", auto_dur_sum));
-            out.push_str("# HELP herd_auto_classification_duration_ms_count Total classification calls\n");
+            out.push_str(&format!(
+                "herd_auto_classification_duration_ms_sum {}\n",
+                auto_dur_sum
+            ));
+            out.push_str(
+                "# HELP herd_auto_classification_duration_ms_count Total classification calls\n",
+            );
             out.push_str("# TYPE herd_auto_classification_duration_ms_count counter\n");
-            out.push_str(&format!("herd_auto_classification_duration_ms_count {}\n", auto_dur_count));
+            out.push_str(&format!(
+                "herd_auto_classification_duration_ms_count {}\n",
+                auto_dur_count
+            ));
         }
         let cache_hits = self.auto_cache_hits.load(Ordering::Relaxed);
         if cache_hits > 0 {
-            out.push_str("# HELP herd_auto_cache_hits_total Total auto classification cache hits\n");
+            out.push_str(
+                "# HELP herd_auto_cache_hits_total Total auto classification cache hits\n",
+            );
             out.push_str("# TYPE herd_auto_cache_hits_total counter\n");
             out.push_str(&format!("herd_auto_cache_hits_total {}\n", cache_hits));
         }
@@ -511,11 +533,18 @@ mod tests {
     #[tokio::test]
     async fn auto_classification_metrics_render() {
         let metrics = Metrics::new();
-        metrics.record_auto_classification("standard", "code", 150, false).await;
-        metrics.record_auto_classification("heavy", "reasoning", 200, true).await;
+        metrics
+            .record_auto_classification("standard", "code", 150, false)
+            .await;
+        metrics
+            .record_auto_classification("heavy", "reasoning", 200, true)
+            .await;
         let output = metrics.render().await;
-        assert!(output.contains("herd_auto_classifications_total{tier=\"standard\",capability=\"code\"} 1"));
-        assert!(output.contains("herd_auto_classifications_total{tier=\"heavy\",capability=\"reasoning\"} 1"));
+        assert!(output
+            .contains("herd_auto_classifications_total{tier=\"standard\",capability=\"code\"} 1"));
+        assert!(output.contains(
+            "herd_auto_classifications_total{tier=\"heavy\",capability=\"reasoning\"} 1"
+        ));
         assert!(output.contains("herd_auto_classification_duration_ms_sum 350"));
         assert!(output.contains("herd_auto_classification_duration_ms_count 2"));
         assert!(output.contains("herd_auto_cache_hits_total 1"));

@@ -81,13 +81,93 @@ pub async fn chat_completions(
 
     // Extract model and streaming flag from body
     let request_json = serde_json::from_slice::<Value>(&body_bytes).ok();
-    let model_name = request_json
+    let mut model_name = request_json
         .as_ref()
         .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(String::from));
     let is_streaming = request_json
         .as_ref()
         .and_then(|v| v.get("stream").and_then(|s| s.as_bool()))
         .unwrap_or(false);
+
+    // Auto classification: if model is "auto" or absent, classify and resolve
+    let mut auto_tier: Option<String> = None;
+    let mut auto_capability: Option<String> = None;
+    let mut auto_model: Option<String> = None;
+    if crate::classifier_auto::should_auto_classify(model_name.as_deref()) {
+        let auto_config = state.config.read().await.routing.auto.clone();
+        if auto_config.enabled {
+            let user_message = request_json
+                .as_ref()
+                .map(crate::classifier::extract_last_user_message)
+                .unwrap_or_default();
+
+            if !user_message.is_empty() {
+                let ck = crate::classifier_auto::cache_key(&user_message);
+                let ttl = std::time::Duration::from_secs(auto_config.cache_ttl_secs);
+
+                let classification = if let Some(cached) = state.auto_cache.get(&ck, ttl) {
+                    state
+                        .metrics
+                        .record_auto_classification(&cached.tier, &cached.capability, 0, true)
+                        .await;
+                    Some(cached)
+                } else {
+                    let classify_start = std::time::Instant::now();
+                    let backend_url = state
+                        .pool
+                        .find_model_backend(&auto_config.classifier_model)
+                        .await;
+                    if let Some(url) = backend_url {
+                        let timeout =
+                            std::time::Duration::from_millis(auto_config.classifier_timeout_ms);
+                        let result = crate::classifier_auto::classify_request(
+                            &state.client,
+                            &url,
+                            &auto_config.classifier_model,
+                            &user_message,
+                            timeout,
+                        )
+                        .await;
+                        let dur = classify_start.elapsed().as_millis() as u64;
+                        if let Some(ref c) = result {
+                            state.auto_cache.put(&ck, c.clone());
+                            state
+                                .metrics
+                                .record_auto_classification(&c.tier, &c.capability, dur, false)
+                                .await;
+                        }
+                        result
+                    } else {
+                        tracing::warn!(
+                            "Auto classifier: no backend with model '{}' — using fallback",
+                            auto_config.classifier_model
+                        );
+                        None
+                    }
+                };
+
+                let resolved = if let Some(ref c) = classification {
+                    auto_tier = Some(c.tier.clone());
+                    auto_capability = Some(c.capability.clone());
+                    crate::classifier_auto::resolve_model(
+                        &auto_config.model_map,
+                        &c.tier,
+                        &c.capability,
+                        &auto_config.fallback_model,
+                    )
+                } else if !auto_config.fallback_model.is_empty() {
+                    auto_config.fallback_model.clone()
+                } else {
+                    String::new()
+                };
+
+                if !resolved.is_empty() {
+                    auto_model = Some(resolved.clone());
+                    model_name = Some(resolved);
+                }
+            }
+        }
+    }
 
     // Extract tags from X-Herd-Tags header (comma-separated)
     let tags: Option<Vec<String>> = headers
@@ -208,9 +288,9 @@ pub async fn chat_completions(
                 prompt_eval_ms: None,
                 eval_ms: None,
                 backend_type: None,
-                auto_tier: None,
-                auto_capability: None,
-                auto_model: None,
+                auto_tier: auto_tier.clone(),
+                auto_capability: auto_capability.clone(),
+                auto_model: auto_model.clone(),
                 frontier_provider: None,
                 frontier_cost_usd: None,
             };
@@ -242,6 +322,22 @@ pub async fn chat_completions(
     let mut builder = axum::response::Response::builder()
         .status(status_code)
         .header("x-request-id", &request_id);
+    // Auto classification response headers
+    if let Some(ref tier) = auto_tier {
+        if let Ok(val) = axum::http::HeaderValue::from_str(tier) {
+            builder = builder.header("x-herd-auto-tier", val);
+        }
+    }
+    if let Some(ref cap) = auto_capability {
+        if let Ok(val) = axum::http::HeaderValue::from_str(cap) {
+            builder = builder.header("x-herd-auto-capability", val);
+        }
+    }
+    if let Some(ref m) = auto_model {
+        if let Ok(val) = axum::http::HeaderValue::from_str(m) {
+            builder = builder.header("x-herd-auto-model", val);
+        }
+    }
     for (name, value) in response.headers() {
         if let (Ok(an), Ok(av)) = (
             axum::http::HeaderName::from_bytes(name.as_ref()),

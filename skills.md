@@ -168,6 +168,31 @@ Herd can automatically classify requests by complexity tier when no explicit mod
 
 **Configuration:** See `task_classifier` section in `herd.yaml`
 
+## Auto Mode
+
+When enabled, Auto Mode routes requests that specify `"model": "auto"` (or omit the model entirely) to the best available model using an LLM-based classifier.
+
+**How it works:**
+1. Herd calls a small local classifier model (default: `qwen3:1.7b`) to classify the request
+2. The classifier assigns a **tier** (`light`, `standard`, `heavy`, `frontier`) and **capability** (`general`, `code`, `reasoning`, `creative`, `vision`, `extraction`)
+3. Herd looks up the best model in the configured `model_map` and routes there
+4. Classification results are cached by message hash — repeated requests skip the classifier
+
+**Response headers:**
+- `X-Herd-Auto-Tier` — tier assigned (`light`, `standard`, `heavy`, `frontier`)
+- `X-Herd-Auto-Capability` — capability assigned (`general`, `code`, `reasoning`, etc.)
+- `X-Herd-Auto-Model` — model selected from the map
+
+**To use Auto Mode:**
+
+```json
+{"model": "auto", "messages": [{"role": "user", "content": "Write a Rust function to parse JSON"}]}
+```
+
+Or omit the model entirely — Herd detects the missing field and runs the classifier.
+
+**Auto Mode is off by default.** Operators must enable it with `routing.auto.enabled: true` and configure a `model_map`. If not enabled, requests with `"model": "auto"` are rejected with `400 Bad Request`.
+
 ## Headers You Should Know
 
 ### X-Herd-Tags (Request Routing)
@@ -337,6 +362,7 @@ every 4 minutes with `keep_alive: "-1"` to pre-load on startup and recover from 
 |--------|--------|----------|-------|
 | **Chat (native — recommended)** | POST | `/api/chat` | Works with all models |
 | **Generate (native — recommended)** | POST | `/api/generate` | Works with all models |
+| Chat with auto routing | POST | `/api/chat` | Set `"model": "auto"` (requires Auto Mode enabled) |
 | Chat (OpenAI compat) | POST | `/v1/chat/completions` | Some models may not support |
 | List models (OpenAI format) | GET | `/v1/models` | |
 | List models (Ollama native) | GET | `/api/tags` | |

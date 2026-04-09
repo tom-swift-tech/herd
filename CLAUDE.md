@@ -51,6 +51,7 @@ Herd supports three backend types per node:
 | `src/nodes/` | SQLite node registry, health polling, herd-tune integration |
 | `src/api/` | Admin CRUD, OpenAI compat, agent endpoints, node endpoints |
 | `src/classifier.rs` | Task-based tier classification middleware |
+| `src/classifier_auto.rs` | LLM-based auto mode classifier (tier + capability routing) |
 | `src/analytics.rs` | JSONL request logging with rotation |
 | `src/metrics.rs` | In-memory Prometheus metrics |
 
@@ -58,7 +59,7 @@ Herd supports three backend types per node:
 
 ```bash
 cargo build          # Debug build
-cargo test           # 257 tests (unit + integration)
+cargo test           # 258 tests (unit + integration)
 cargo build --release  # Release build
 ```
 

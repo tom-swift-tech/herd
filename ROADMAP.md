@@ -106,6 +106,7 @@ No cloud dependency. No API keys exposed. Full local control.
 - ~~Routing profiles (named presets selected via `X-Herd-Profile` header)~~ ✅
 - ~~Ollama blob extraction (extract raw GGUF from Ollama blob storage for llama-server reuse)~~ ✅
 - ~~Multi-node discovery (static fleet config with auto-probe)~~ ✅
+- ~~**Auto Mode classifier** — LLM-based request classification when `"model": "auto"` or model omitted; classifies tier (light/standard/heavy/frontier) and capability (general/code/reasoning/creative/vision/extraction), routes to best model from configurable map; results cached by message hash; off by default~~ ✅
 
 ### v1.2.0+ — Extensibility (Future)
 

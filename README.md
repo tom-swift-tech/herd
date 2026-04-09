@@ -282,6 +282,7 @@ Herd is a **smart stateless proxy with a stateful routing cache**. It is not HA 
 - **Latency tracking** — P50, P95, P99 percentiles
 - **Log rotation** — Size-based rotation with configurable retention
 - **Task classification** — Keyword-based tier classification middleware with `X-Herd-Tier` header
+- **Auto Mode** — LLM-based classifier routes `"model": "auto"` requests to the best model by tier and capability; results cached; off by default
 - **Update checker** — Automatic GitHub release notifications
 
 ## Quick Start
@@ -436,7 +437,23 @@ observability:
 
 agent:
   enabled: false             # Agent sessions, tool calling, permissions
+
+routing:
+  auto:
+    enabled: false           # Auto Mode: off by default
+    classifier_model: "qwen3:1.7b"
+    classifier_timeout_ms: 3000
+    fallback_model: "llama3.1:8b"
+    cache_ttl_secs: 300
+    model_map:
+      light:
+        general: "llama3.1:8b"
+      heavy:
+        code: "qwen2.5-coder:32b"
+        reasoning: "deepseek-r1:32b"
 ```
+
+When `auto` is enabled, requests with `"model": "auto"` (or no model) are classified by a small local model and routed to the best match in `model_map`. Response headers `X-Herd-Auto-Tier`, `X-Herd-Auto-Capability`, and `X-Herd-Auto-Model` indicate the decision.
 
 ## Choosing the Right Endpoint
 

@@ -1227,97 +1227,20 @@ async fn proxy_handler(
     let frontier_config = state.config.read().await.frontier.clone();
     let provider_configs = state.config.read().await.providers.clone();
 
-    if frontier_config.enabled
-        && model_name
-            .as_ref()
-            .map(|m| crate::providers::is_frontier_model(m, &provider_configs))
-            .unwrap_or(false)
+    if let Some(response) = crate::providers::frontier_route_if_applicable(
+        &state.client,
+        &frontier_config,
+        &provider_configs,
+        &state.cost_db,
+        model_name.as_deref(),
+        &headers,
+        auto_classification.as_ref(),
+        &body_bytes,
+        &request_id,
+    )
+    .await
     {
-        // Check require_header (unless auto-escalation)
-        if frontier_config.require_header {
-            let has_header = headers
-                .get("x-herd-frontier")
-                .and_then(|v| v.to_str().ok())
-                .map(|v| v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
-            let is_auto_escalation = auto_classification
-                .as_ref()
-                .map(|c| c.tier == "frontier")
-                .unwrap_or(false)
-                && frontier_config.allow_auto_escalation;
-
-            if !has_header && !is_auto_escalation {
-                return Err(axum::http::StatusCode::FORBIDDEN);
-            }
-        }
-
-        // Parse request body as JSON for transformation
-        let body_json =
-            serde_json::from_slice::<serde_json::Value>(&body_bytes).unwrap_or_default();
-        let model = model_name.as_deref().unwrap_or("");
-
-        // Route through frontier
-        match crate::providers::proxy_frontier_request(
-            &state.client,
-            &frontier_config,
-            &provider_configs,
-            &state.cost_db,
-            model,
-            &body_json,
-            Some(&request_id),
-        )
-        .await
-        {
-            Ok(result) => {
-                let provider_name = result.provider_name.clone();
-                let status_code =
-                    axum::http::StatusCode::from_u16(result.response.status().as_u16())
-                        .unwrap_or(axum::http::StatusCode::OK);
-
-                let mut builder = axum::response::Response::builder()
-                    .status(status_code)
-                    .header("x-request-id", &request_id)
-                    .header("x-herd-provider", &provider_name);
-
-                // Forward response headers
-                for (name, value) in result.response.headers() {
-                    if let (Ok(aname), Ok(aval)) = (
-                        axum::http::header::HeaderName::from_bytes(name.as_ref()),
-                        axum::http::header::HeaderValue::from_bytes(value.as_ref()),
-                    ) {
-                        builder = builder.header(aname, aval);
-                    }
-                }
-
-                // Stream the body
-                let body = axum::body::Body::from_stream(result.response.bytes_stream());
-                return builder
-                    .body(body)
-                    .map_err(|_| axum::http::StatusCode::BAD_GATEWAY);
-            }
-            Err(e) => {
-                tracing::warn!("Frontier gateway error: {}", e);
-                let (status, msg) = match &e {
-                    crate::providers::FrontierError::BudgetExceeded { .. } => {
-                        (axum::http::StatusCode::PAYMENT_REQUIRED, e.to_string())
-                    }
-                    crate::providers::FrontierError::HeaderRequired => {
-                        (axum::http::StatusCode::FORBIDDEN, e.to_string())
-                    }
-                    crate::providers::FrontierError::NoApiKey(_, _) => {
-                        (axum::http::StatusCode::SERVICE_UNAVAILABLE, e.to_string())
-                    }
-                    _ => (axum::http::StatusCode::BAD_GATEWAY, e.to_string()),
-                };
-                let body = axum::body::Body::from(serde_json::json!({"error": msg}).to_string());
-                return Ok(axum::response::Response::builder()
-                    .status(status)
-                    .header("content-type", "application/json")
-                    .header("x-request-id", &request_id)
-                    .body(body)
-                    .unwrap_or_default());
-            }
-        }
+        return Ok(response);
     }
 
     // Prepare both versions of the body — keep_alive is Ollama-specific

@@ -3,7 +3,7 @@ pub mod cost_db;
 pub mod openai_compat;
 pub mod pricing;
 
-use crate::config::ProviderConfig;
+use crate::config::{FrontierConfig, ProviderConfig};
 use anyhow::Result;
 
 pub trait ProviderAdapter: Send + Sync {
@@ -170,6 +170,142 @@ pub async fn proxy_frontier_request(
         response,
         provider_name: provider.name.clone(),
     })
+}
+
+// ---------------------------------------------------------------------------
+// frontier_route_if_applicable
+// ---------------------------------------------------------------------------
+//
+// Shared entry point for both the generic proxy handler (src/server.rs) and
+// the OpenAI-compat handler (src/api/openai.rs). Returns None when the model
+// is not a frontier model or the frontier gateway is disabled — the caller
+// should fall through to local routing. Returns Some(response) when the
+// request was handled by the gateway (either successfully proxied, or
+// rejected with a 402/403/502/503).
+
+#[allow(clippy::too_many_arguments)]
+pub async fn frontier_route_if_applicable(
+    client: &reqwest::Client,
+    frontier_config: &FrontierConfig,
+    providers: &[ProviderConfig],
+    cost_db: &cost_db::CostDb,
+    model_name: Option<&str>,
+    headers: &axum::http::HeaderMap,
+    auto_classification: Option<&crate::classifier_auto::Classification>,
+    body_bytes: &[u8],
+    request_id: &str,
+) -> Option<axum::response::Response> {
+    if !frontier_config.enabled {
+        return None;
+    }
+    let model = model_name?;
+    if !is_frontier_model(model, providers) {
+        return None;
+    }
+
+    let classified_as_frontier = auto_classification
+        .map(|c| c.tier == "frontier")
+        .unwrap_or(false);
+
+    // Auto-escalation gate: if the model was resolved by the auto classifier
+    // to the frontier tier, the allow_auto_escalation flag must be set.
+    // Returning None here lets the caller fall back to the configured
+    // fallback_model instead of firing an unintended cloud request.
+    if classified_as_frontier && !frontier_config.allow_auto_escalation {
+        return None;
+    }
+
+    let is_auto_escalation = classified_as_frontier && frontier_config.allow_auto_escalation;
+
+    if frontier_config.require_header {
+        let has_header = headers
+            .get("x-herd-frontier")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
+        if !has_header && !is_auto_escalation {
+            return Some(build_frontier_error_response(
+                axum::http::StatusCode::FORBIDDEN,
+                "X-Herd-Frontier: true header required",
+                request_id,
+            ));
+        }
+    }
+
+    let body_json = serde_json::from_slice::<serde_json::Value>(body_bytes).unwrap_or_default();
+
+    match proxy_frontier_request(
+        client,
+        frontier_config,
+        providers,
+        cost_db,
+        model,
+        &body_json,
+        Some(request_id),
+    )
+    .await
+    {
+        Ok(result) => {
+            let provider_name = result.provider_name.clone();
+            let status_code = axum::http::StatusCode::from_u16(result.response.status().as_u16())
+                .unwrap_or(axum::http::StatusCode::OK);
+
+            let mut builder = axum::response::Response::builder()
+                .status(status_code)
+                .header("x-request-id", request_id)
+                .header("x-herd-provider", &provider_name);
+
+            if is_auto_escalation {
+                if let Some(c) = auto_classification {
+                    builder = builder
+                        .header("x-herd-auto-tier", &c.tier)
+                        .header("x-herd-auto-capability", &c.capability)
+                        .header("x-herd-auto-model", model);
+                }
+            }
+
+            for (name, value) in result.response.headers() {
+                if let (Ok(aname), Ok(aval)) = (
+                    axum::http::header::HeaderName::from_bytes(name.as_ref()),
+                    axum::http::header::HeaderValue::from_bytes(value.as_ref()),
+                ) {
+                    builder = builder.header(aname, aval);
+                }
+            }
+
+            let body = axum::body::Body::from_stream(result.response.bytes_stream());
+            Some(builder.body(body).unwrap_or_default())
+        }
+        Err(e) => {
+            tracing::warn!("Frontier gateway error: {}", e);
+            let (status, msg) = match &e {
+                FrontierError::BudgetExceeded { .. } => {
+                    (axum::http::StatusCode::PAYMENT_REQUIRED, e.to_string())
+                }
+                FrontierError::HeaderRequired => (axum::http::StatusCode::FORBIDDEN, e.to_string()),
+                FrontierError::NoApiKey(_, _) => {
+                    (axum::http::StatusCode::SERVICE_UNAVAILABLE, e.to_string())
+                }
+                _ => (axum::http::StatusCode::BAD_GATEWAY, e.to_string()),
+            };
+            Some(build_frontier_error_response(status, &msg, request_id))
+        }
+    }
+}
+
+fn build_frontier_error_response(
+    status: axum::http::StatusCode,
+    msg: &str,
+    request_id: &str,
+) -> axum::response::Response {
+    let body = axum::body::Body::from(serde_json::json!({ "error": msg }).to_string());
+    axum::response::Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .header("x-request-id", request_id)
+        .body(body)
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

@@ -98,6 +98,15 @@ No cloud dependency. No API keys exposed. Full local control.
 - ~~**Dashboard control plane** — Models tab with HF search, Fleet GPU badges, analytics visualizations~~ ✅
 - ~~**HuggingFace model search API** — search, download, VRAM compatibility~~ ✅
 
+### v1.1.2 — Frontier Gateway Enforcement ✅
+
+- ~~Per-provider rate limiting (fixed-window token bucket, `rate_limit` requests/minute from `ProviderConfig`)~~ ✅
+- ~~Rate-limited requests return `429 Too Many Requests`~~ ✅
+- ~~Automatic cost recording after successful non-streaming frontier responses~~ ✅
+- ~~`X-Herd-Cost-Estimate` response header with per-request USD cost~~ ✅
+- ~~Cost DB hot-reload support: rate limiter + provider config rebuild on `/admin/reload`~~ ✅
+- ~~Streaming responses (`stream: true`) pass through unchanged — SSE cost parsing deferred~~ ✅
+
 ### v1.1.1 — Sprint 3 Integration ✅
 
 - ~~Auto-mode → frontier gateway escalation in OpenAI-compat handler (`/v1/chat/completions`)~~ ✅

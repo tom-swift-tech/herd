@@ -10,7 +10,7 @@
 |-------|-------|
 | **Repo** | `swift-innovate/herd` (GitHub) |
 | **Language** | Rust |
-| **Version** | 1.1.1 |
+| **Version** | 1.1.2 |
 | **Purpose** | Intelligent LLM router — GPU-aware routing, circuit breakers, OpenAI compat, agent sessions, fleet management, dashboard |
 
 Herd is a single-binary reverse proxy for local LLM backends. It routes AI workloads across local GPU nodes with model awareness, health tracking, and observability.
@@ -59,7 +59,7 @@ Herd supports three backend types per node:
 
 ```bash
 cargo build          # Debug build
-cargo test           # 305 tests (unit + integration)
+cargo test           # 321 tests (unit + integration)
 cargo build --release  # Release build
 ```
 

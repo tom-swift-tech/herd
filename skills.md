@@ -202,11 +202,13 @@ When a request targets a frontier (cloud) model — either by sending the model 
 
 **Response headers:**
 - `X-Herd-Provider` — which provider served the request (e.g. `anthropic`, `openai`)
+- `X-Herd-Cost-Estimate` — USD cost for this request (non-streaming only), calculated from response token usage and the pricing table
 - `X-Herd-Auto-Tier` / `-Capability` / `-Model` — set when the request was auto-escalated from Auto Mode
 
 **Status codes:**
 - `403 Forbidden` — `require_header: true` and no `X-Herd-Frontier: true` header and not auto-escalated
 - `402 Payment Required` — provider monthly budget cap exceeded
+- `429 Too Many Requests` — per-provider `rate_limit` (requests/minute) exhausted; bucket refills at the next minute boundary
 - `503 Service Unavailable` — provider API key env var is missing
 - `502 Bad Gateway` — provider request failed
 

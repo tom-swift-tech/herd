@@ -455,6 +455,8 @@ routing:
 
 When `auto` is enabled, requests with `"model": "auto"` (or no model) are classified by a small local model and routed to the best match in `model_map`. Response headers `X-Herd-Auto-Tier`, `X-Herd-Auto-Capability`, and `X-Herd-Auto-Model` indicate the decision.
 
+**Frontier auto-escalation** (v1.1.1): If the classifier returns `tier: "frontier"` and `frontier.allow_auto_escalation: true`, Herd routes the request through the configured cloud provider (e.g. Anthropic, OpenAI) via the Frontier Gateway. When escalation is disabled, `routing.auto.fallback_model` is used instead — no cloud request fires without explicit opt-in. See `skills.md` for the full Frontier Gateway reference.
+
 ## Choosing the Right Endpoint
 
 > **Important:** Not all models work on all endpoints. Choose based on your model and client.
@@ -540,6 +542,7 @@ Request IDs are included in JSONL analytics logs for correlation across systems.
 | `PUT /api/profiles/default` | Set default routing profile |
 | `GET /api/ollama/models` | List extractable Ollama models |
 | `POST /api/ollama/extract` | Extract GGUF from Ollama blob storage |
+| `GET /api/frontier/costs` | Per-provider monthly spend and token totals |
 
 ## Telemetry & Prometheus Metrics
 

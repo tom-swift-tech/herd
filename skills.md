@@ -193,6 +193,35 @@ Or omit the model entirely — Herd detects the missing field and runs the class
 
 **Auto Mode is off by default.** Operators must enable it with `routing.auto.enabled: true` and configure a `model_map`. If not enabled, requests with `"model": "auto"` are rejected with `400 Bad Request`.
 
+## Frontier Gateway
+
+When a request targets a frontier (cloud) model — either by sending the model name explicitly or via Auto Mode classifying to the `frontier` tier — Herd proxies through the configured provider (Anthropic, OpenAI, xAI, OpenRouter, MiniMax).
+
+**Request headers:**
+- `X-Herd-Frontier: true` — required unless `require_header: false` in config, or Auto-Mode auto-escalation is enabled
+
+**Response headers:**
+- `X-Herd-Provider` — which provider served the request (e.g. `anthropic`, `openai`)
+- `X-Herd-Auto-Tier` / `-Capability` / `-Model` — set when the request was auto-escalated from Auto Mode
+
+**Status codes:**
+- `403 Forbidden` — `require_header: true` and no `X-Herd-Frontier: true` header and not auto-escalated
+- `402 Payment Required` — provider monthly budget cap exceeded
+- `503 Service Unavailable` — provider API key env var is missing
+- `502 Bad Gateway` — provider request failed
+
+**Auto-Mode escalation behavior:**
+- If `routing.auto.enabled: true` and the classifier returns `tier: "frontier"`, Herd routes to the frontier gateway **only** when `frontier.allow_auto_escalation: true`.
+- When escalation is disabled, the request falls back to `routing.auto.fallback_model` — no cloud request fires.
+
+**Cost visibility:**
+```
+GET /api/frontier/costs
+```
+Returns per-provider monthly spend, token totals, and request counts pulled from the SQLite cost log.
+
+**The Frontier Gateway is off by default** (`frontier.enabled: false`). Operators must enable it explicitly and set provider API keys via environment variables.
+
 ## Headers You Should Know
 
 ### X-Herd-Tags (Request Routing)

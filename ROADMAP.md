@@ -98,6 +98,14 @@ No cloud dependency. No API keys exposed. Full local control.
 - ~~**Dashboard control plane** — Models tab with HF search, Fleet GPU badges, analytics visualizations~~ ✅
 - ~~**HuggingFace model search API** — search, download, VRAM compatibility~~ ✅
 
+### v1.1.1 — Sprint 3 Integration ✅
+
+- ~~Auto-mode → frontier gateway escalation in OpenAI-compat handler (`/v1/chat/completions`)~~ ✅
+- ~~Shared `frontier_route_if_applicable` helper for both proxy paths~~ ✅
+- ~~`allow_auto_escalation` gate prevents unintended cloud requests when classifier returns `tier: "frontier"` but escalation is disabled~~ ✅
+- ~~Auto-mode `X-Herd-Auto-*` headers emitted on escalated responses~~ ✅
+- ~~Fallback to `auto.fallback_model` when gateway declines to handle a frontier-tier classification~~ ✅
+
 ### v1.1.0 — Scale & Security ✅
 
 - ~~TLS termination (optional HTTPS via rustls, feature-gated `--features tls`)~~ ✅

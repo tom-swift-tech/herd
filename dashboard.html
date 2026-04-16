@@ -868,6 +868,14 @@ Content-Type: application/json
                         <pre><code>X-Request-Id: agent-task-42</code></pre>
                         <p>Send a correlation ID to trace requests in logs. If omitted, Herd generates a UUID v4 and returns it.</p>
                     </div>
+
+                    <div class="guide-card">
+                        <h3>5. Frontier Gateway (optional)</h3>
+                        <pre><code>X-Herd-Frontier: true
+
+{"model": "claude-sonnet-4-20250514", ...}</code></pre>
+                        <p>When the operator has enabled the Frontier Gateway, requests to cloud models are proxied to Anthropic / OpenAI / xAI / OpenRouter. Auto Mode can also auto-escalate to frontier when <code>allow_auto_escalation: true</code>. Response includes <code>X-Herd-Provider</code>; check <code>/api/frontier/costs</code> for monthly spend.</p>
+                    </div>
                 </div>
 
                 <div class="guide-section">
@@ -887,6 +895,7 @@ Content-Type: application/json
                             <tr><td>Ollama generate</td><td>POST</td><td><code>/api/generate</code></td><td>No</td></tr>
                             <tr><td>Ollama chat</td><td>POST</td><td><code>/api/chat</code></td><td>No</td></tr>
                             <tr><td>Ollama models</td><td>GET</td><td><code>/api/tags</code></td><td>No</td></tr>
+                            <tr><td>Frontier costs</td><td>GET</td><td><code>/api/frontier/costs</code></td><td>No</td></tr>
                             <tr class="admin-row"><td>List backends</td><td>GET</td><td><code>/admin/backends</code></td><td>Yes</td></tr>
                             <tr class="admin-row"><td>Add backend</td><td>POST</td><td><code>/admin/backends</code></td><td>Yes</td></tr>
                             <tr class="admin-row"><td>Reload config</td><td>POST</td><td><code>/admin/reload</code></td><td>Yes</td></tr>

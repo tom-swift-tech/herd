@@ -10,7 +10,7 @@
 
 Route your llama herd with intelligence — Herd sits in front of your inference nodes (Ollama, llama-server, or any self-hosted OpenAI-compatible backend) and routes requests based on model availability, GPU load, and node health. One binary. One endpoint. Your entire fleet, unified.
 
-> **New in v1.1:** TLS termination, per-client rate limiting, budget caps, routing profiles, Ollama blob extraction, and multi-node discovery. See [What's New in v1.1](#whats-new-in-v11).
+> **New in v1.1:** TLS termination, per-client rate limiting, budget caps, routing profiles, Ollama blob extraction, multi-node discovery, **Frontier Gateway** (cloud-model routing with per-provider rate limits and live USD cost tracking), and auto-mode → frontier escalation. See [What's New in v1.1](#whats-new-in-v11).
 >
 > **v1.0:** llama-server (llama.cpp) as a first-class backend. Benchmarked at **44–80% faster TTFT** and **~4x throughput** vs Ollama on identical hardware. Herd is now vendor-agnostic across NVIDIA, AMD, and Intel GPUs. See [Backend Types](#backend-types) and the [benchmark data](docs/LLAMA_CPP_BACKEND.md).
 
@@ -109,6 +109,45 @@ discovery:
     - url: http://192.168.1.101:11434
       backend: ollama
 ```
+
+### Frontier Gateway (v1.1.1)
+
+Route requests for cloud-hosted frontier models (Anthropic, OpenAI, xAI, OpenRouter, MiniMax) through Herd alongside your local fleet. Off by default; providers opt in explicitly with API keys loaded from env vars. Each provider is pluggable via the `ProviderAdapter` trait (OpenAI-compat pass-through and Anthropic Messages-API translation ship built-in).
+
+Auto-mode can escalate to frontier when the classifier returns `tier: "frontier"` — gated by `allow_auto_escalation` so no cloud request fires without explicit opt-in. When escalation is off, Herd falls back to `routing.auto.fallback_model`.
+
+```yaml
+frontier:
+  enabled: true
+  require_header: true        # X-Herd-Frontier: true required unless auto-escalating
+  allow_auto_escalation: false
+  providers:
+    - name: anthropic
+      api_key_env: ANTHROPIC_API_KEY
+      models: ["claude-opus-4-7", "claude-sonnet-4-6"]
+    - name: openai
+      api_key_env: OPENAI_API_KEY
+      models: ["gpt-5", "gpt-5-mini"]
+```
+
+Response headers: `X-Herd-Provider`, `X-Herd-Frontier-Model`, `X-Herd-Auto-*` (when escalated). See `skills.md` for the full reference.
+
+### Frontier Rate Limits & Cost Tracking (v1.1.2)
+
+Per-provider fixed-window token buckets (`rate_limit` requests/minute from `ProviderConfig`) enforce spend budgets at the gateway layer. Rate-limited requests return `429 Too Many Requests` with bucket-refill semantics at the next minute boundary.
+
+Every non-streaming frontier response records cost to SQLite and returns an `X-Herd-Cost-Estimate` header with the per-request USD cost, computed from response token usage against the built-in pricing table. Streaming responses pass through unchanged — SSE cost parsing is deferred to a later release. Both the rate limiter and provider config rebuild on `POST /admin/reload`.
+
+```yaml
+frontier:
+  providers:
+    - name: anthropic
+      api_key_env: ANTHROPIC_API_KEY
+      rate_limit: 60          # requests/minute; 0 = unlimited
+      models: ["claude-opus-4-7"]
+```
+
+Query spend: `GET /api/frontier/costs` returns per-provider monthly totals and token counts.
 
 ## Getting Started
 
@@ -260,6 +299,10 @@ Herd is a **smart stateless proxy with a stateful routing cache**. It is not HA 
 - **Model download** — Pull models to Ollama nodes via API (llama-server download in roadmap)
 - **Ollama blob extraction** — Extract raw GGUF from Ollama blob storage for llama-server reuse
 - **Multi-node discovery** — Static fleet config with auto-probing (mDNS stubbed, not yet active)
+- **Frontier Gateway** — Opt-in cloud-model routing (Anthropic, OpenAI, xAI, OpenRouter, MiniMax) with pluggable `ProviderAdapter` trait
+- **Per-provider rate limits** — Fixed-window token buckets per frontier provider; `429` on exhaustion with minute-boundary refill
+- **Live cost tracking** — SQLite-persisted per-request USD cost with `X-Herd-Cost-Estimate` header and `GET /api/frontier/costs`
+- **Auto-mode frontier escalation** — Classifier-driven escalation to frontier models gated by `allow_auto_escalation` so no cloud request fires without explicit opt-in
 
 ### Agent-Friendly
 - **Agent sessions** — Create, resume, list, and delete sessions with message history and TTL

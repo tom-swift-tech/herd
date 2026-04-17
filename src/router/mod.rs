@@ -1,3 +1,4 @@
+pub mod deployment;
 pub mod least_busy;
 pub mod model_aware;
 pub mod priority;

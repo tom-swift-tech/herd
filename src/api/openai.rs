@@ -6,6 +6,29 @@ use axum::Json;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 
+/// Rewrite the JSON body's `model` field to match the resolved model name.
+///
+/// Auto-mode classification, frontier-fallback, and profile `preferred_model`
+/// all mutate `model_name` in memory for routing purposes, but the outgoing
+/// body still carries the client's original `"model"` (often `"auto"` or
+/// missing). Backends receive that literal and 404 it, which the retry loop
+/// mis-reads as backend failure and exhausts into a 503. This helper closes
+/// that gap. Falls through on non-JSON bodies per Herd's "degrade gracefully"
+/// policy.
+pub(crate) fn rewrite_request_model(body: &[u8], model: Option<&str>) -> Vec<u8> {
+    let Some(model) = model else {
+        return body.to_vec();
+    };
+    let Ok(mut parsed) = serde_json::from_slice::<Value>(body) else {
+        return body.to_vec();
+    };
+    let Some(obj) = parsed.as_object_mut() else {
+        return body.to_vec();
+    };
+    obj.insert("model".to_string(), Value::String(model.to_string()));
+    serde_json::to_vec(&parsed).unwrap_or_else(|_| body.to_vec())
+}
+
 /// GET /v1/models — OpenAI-compatible model listing.
 /// Aggregates unique model names from all healthy backends.
 pub async fn list_models(State(state): State<AppState>) -> Json<Value> {
@@ -237,6 +260,8 @@ pub async fn chat_completions(
     let mut selected_backend = None;
     let mut excluded = HashSet::new();
 
+    let forward_body = rewrite_request_model(&body_bytes, model_name.as_deref());
+
     for _ in 0..=state.retry_count() {
         let backend = state
             .router
@@ -265,7 +290,7 @@ pub async fn chat_completions(
             .client
             .request(method.clone(), &url)
             .timeout(state.routing_timeout())
-            .body(body_bytes.clone());
+            .body(forward_body.clone());
 
         for (name, value) in &headers {
             if name == axum::http::header::HOST || name == axum::http::header::CONTENT_LENGTH {
@@ -517,4 +542,49 @@ fn openai_error(status: StatusCode, message: &str) -> (StatusCode, Json<Value>) 
             }
         })),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(bytes: &[u8]) -> Value {
+        serde_json::from_slice(bytes).unwrap()
+    }
+
+    #[test]
+    fn rewrite_replaces_existing_model() {
+        let body = br#"{"model":"auto","messages":[{"role":"user","content":"hi"}]}"#;
+        let out = rewrite_request_model(body, Some("qwen3:1.7b"));
+        assert_eq!(parse(&out)["model"], "qwen3:1.7b");
+        assert_eq!(parse(&out)["messages"][0]["content"], "hi");
+    }
+
+    #[test]
+    fn rewrite_adds_missing_model() {
+        let body = br#"{"messages":[{"role":"user","content":"hi"}]}"#;
+        let out = rewrite_request_model(body, Some("gemma4:e4b"));
+        assert_eq!(parse(&out)["model"], "gemma4:e4b");
+    }
+
+    #[test]
+    fn rewrite_noop_when_model_is_none() {
+        let body = br#"{"model":"llama3","messages":[]}"#;
+        let out = rewrite_request_model(body, None);
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn rewrite_falls_through_on_non_json() {
+        let body = b"not json at all";
+        let out = rewrite_request_model(body, Some("qwen3:1.7b"));
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn rewrite_falls_through_on_non_object_json() {
+        let body = br#"["array","not","object"]"#;
+        let out = rewrite_request_model(body, Some("qwen3:1.7b"));
+        assert_eq!(out, body);
+    }
 }

@@ -1257,11 +1257,6 @@ async fn proxy_handler(
     }
     drop(frontier_limiter);
 
-    // Prepare both versions of the body — keep_alive is Ollama-specific
-    let keep_alive_value = state.config.read().await.routing.default_keep_alive.clone();
-    let forward_bytes_ollama = inject_keep_alive(&body_bytes, &path, &keep_alive_value);
-    let forward_bytes_raw = body_bytes.clone();
-
     // Extract tags from X-Herd-Tags header (comma-separated)
     let request_tags: Option<Vec<String>> = headers
         .get("x-herd-tags")
@@ -1300,6 +1295,17 @@ async fn proxy_handler(
     }
 
     let profile_name = resolved.profile_name.clone();
+
+    // Rewrite the outgoing body so the backend sees the resolved model name.
+    // Must run after all model_name mutations (auto-mode, frontier fallback,
+    // profile preferred_model) — otherwise Ollama receives "model":"auto" or
+    // a stale name and 404s the request. See api::openai::rewrite_request_model.
+    let rewritten_body = crate::api::openai::rewrite_request_model(&body_bytes, model_name.as_deref());
+
+    // Prepare both versions of the body — keep_alive is Ollama-specific
+    let keep_alive_value = state.config.read().await.routing.default_keep_alive.clone();
+    let forward_bytes_ollama = inject_keep_alive(&rewritten_body, &path, &keep_alive_value);
+    let forward_bytes_raw = axum::body::Bytes::from(rewritten_body);
 
     // Retry loop: try routing to different backends on failure
     let mut response = None;

@@ -1,10 +1,10 @@
-FROM rust:1.83 as builder
+FROM rust:latest AS builder
 
 WORKDIR /app
 COPY . .
 RUN cargo build --release
 
-FROM debian:bookworm-slim
+FROM ubuntu:24.04
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \

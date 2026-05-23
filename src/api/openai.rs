@@ -6,6 +6,29 @@ use axum::Json;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 
+fn frontier_provider_is_available(provider: &crate::config::ProviderConfig) -> bool {
+    !provider.api_key_env.is_empty() && std::env::var(&provider.api_key_env).is_ok()
+}
+
+fn extract_client_name(headers: &axum::http::HeaderMap) -> Option<String> {
+    headers
+        .get("x-herd-client")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+}
+
+fn extract_tags(headers: &axum::http::HeaderMap) -> Option<Vec<String>> {
+    headers
+        .get("x-herd-tags")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| {
+            s.split(',')
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect()
+        })
+}
+
 /// Rewrite the JSON body's `model` field to match the resolved model name.
 ///
 /// Auto-mode classification, frontier-fallback, and profile `preferred_model`
@@ -54,6 +77,9 @@ pub async fn list_models(State(state): State<AppState>) -> Json<Value> {
     let config = state.config.read().await;
     if config.frontier.enabled {
         for provider in &config.providers {
+            if !frontier_provider_is_available(provider) {
+                continue;
+            }
             for model in &provider.models {
                 if seen.insert(model.clone()) {
                     models.push(json!({
@@ -193,6 +219,8 @@ pub async fn chat_completions(
         }
     }
 
+    let client_name = extract_client_name(&headers);
+
     // Frontier gateway: escalate to cloud provider if model resolved to a
     // frontier model (either explicitly by the client or via auto mode).
     let frontier_config = state.config.read().await.frontier.clone();
@@ -236,16 +264,69 @@ pub async fn chat_completions(
         }
     }
 
-    // Extract tags from X-Herd-Tags header (comma-separated)
-    let tags: Option<Vec<String>> = headers
-        .get("x-herd-tags")
+    state.budget.reset_if_needed().await;
+    match state
+        .budget
+        .check_budget(
+            client_name.as_deref(),
+            model_name.as_deref().unwrap_or("unknown"),
+        )
+        .await
+    {
+        crate::budget::BudgetStatus::Exceeded {
+            cap_type,
+            limit,
+            current,
+        } => {
+            return Err(openai_error_with_code(
+                StatusCode::TOO_MANY_REQUESTS,
+                "budget_exceeded",
+                &format!(
+                    "Budget exceeded (cap={}, limit={:.2}, current={:.2})",
+                    cap_type, limit, current
+                ),
+            ));
+        }
+        crate::budget::BudgetStatus::Warning {
+            cap_type,
+            limit,
+            current,
+        } => {
+            tracing::warn!(
+                "Budget warning: {} at {:.2}/{:.2} USD",
+                cap_type,
+                current,
+                limit
+            );
+        }
+        crate::budget::BudgetStatus::Ok { .. } => {}
+    }
+
+    let request_tags = extract_tags(&headers);
+    let profile_header = headers
+        .get("x-herd-profile")
         .and_then(|v| v.to_str().ok())
-        .map(|s| {
-            s.split(',')
-                .map(|t| t.trim().to_string())
-                .filter(|t| !t.is_empty())
-                .collect()
-        });
+        .map(|s| s.to_string());
+    let resolved = {
+        let config = state.config.read().await;
+        crate::profiles::resolve_profile(&config, profile_header.as_deref())
+    };
+
+    let tags: Option<Vec<String>> = if request_tags.is_some() {
+        request_tags
+    } else if !resolved.tags.is_empty() {
+        Some(resolved.tags.clone())
+    } else {
+        None
+    };
+
+    if model_name.is_none() {
+        if let Some(ref preferred) = resolved.preferred_model {
+            model_name = Some(preferred.clone());
+        }
+    }
+
+    let profile_name = resolved.profile_name.clone();
 
     // Preserve query string if present
     let path_and_query = parts
@@ -259,6 +340,14 @@ pub async fn chat_completions(
     let mut response = None;
     let mut selected_backend = None;
     let mut excluded = HashSet::new();
+
+    if !resolved.backends.is_empty() {
+        for name in state.pool.all().await {
+            if !resolved.backends.contains(&name) {
+                excluded.insert(name);
+            }
+        }
+    }
 
     let forward_body = rewrite_request_model(&body_bytes, model_name.as_deref());
 
@@ -391,6 +480,11 @@ pub async fn chat_completions(
     let mut builder = axum::response::Response::builder()
         .status(status_code)
         .header("x-request-id", &request_id);
+    if let Some(ref pname) = profile_name {
+        if let Ok(val) = axum::http::HeaderValue::from_str(pname) {
+            builder = builder.header("x-herd-profile", val);
+        }
+    }
     // Auto classification response headers
     if let Some(ref tier) = auto_tier {
         if let Ok(val) = axum::http::HeaderValue::from_str(tier) {
@@ -520,6 +614,15 @@ pub async fn chat_completions(
             tracing::error!("Failed to log request: {}", e);
         }
 
+        if let (Some(tin), Some(tout)) = (tokens_in, tokens_out) {
+            let model = model_name.as_deref().unwrap_or("unknown");
+            let cost = crate::analytics::estimate_api_cost(model, tin as u64, tout as u64);
+            state
+                .budget
+                .record_cost(client_name.as_deref(), model, cost)
+                .await;
+        }
+
         let body = axum::body::Body::from(body_bytes);
         builder.body(body).map_err(|_| {
             openai_error(
@@ -532,12 +635,20 @@ pub async fn chat_completions(
 
 /// Returns an OpenAI-format error response.
 fn openai_error(status: StatusCode, message: &str) -> (StatusCode, Json<Value>) {
+    openai_error_with_code(status, "server_error", message)
+}
+
+fn openai_error_with_code(
+    status: StatusCode,
+    error_type: &str,
+    message: &str,
+) -> (StatusCode, Json<Value>) {
     (
         status,
         Json(json!({
             "error": {
                 "message": message,
-                "type": "server_error",
+                "type": error_type,
                 "code": status.as_u16(),
             }
         })),

@@ -24,10 +24,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build
-        run: cargo build --release
+        run: cargo build --release --all-features
 
       - name: Test
-        run: cargo test
+        run: cargo test --all-features
 
   clippy:
     name: Clippy
@@ -38,7 +38,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy -- -D warnings
+      - run: cargo clippy --all-targets --all-features -- -D warnings
 
   fmt:
     name: Format
@@ -49,3 +49,13 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --check
+
+  audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit

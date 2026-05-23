@@ -1,5 +1,4 @@
 /target
-/Cargo.lock
 *.yaml
 !herd.yaml.example
 .DS_Store

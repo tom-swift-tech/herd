@@ -136,7 +136,7 @@ pub struct AppState {
     pub agent_audit: Arc<AgentAudit>,
     pub node_db: Arc<crate::nodes::NodeDb>,
     pub budget: Arc<crate::budget::BudgetTracker>,
-    pub rate_limiter: Arc<crate::rate_limit::RateLimiter>,
+    pub rate_limiter: Arc<tokio::sync::RwLock<crate::rate_limit::RateLimiter>>,
     pub frontier_rate_limiter:
         Arc<tokio::sync::RwLock<crate::providers::rate_limit::ProviderRateLimiter>>,
     pub auto_cache: Arc<crate::classifier_auto::ClassificationCache>,
@@ -169,7 +169,6 @@ impl AppState {
     ///
     /// **NOT reloaded (requires restart):**
     /// - `server.host`, `server.port`
-    /// - `server.rate_limit`
     /// - `server.api_key`
     /// - `observability.admin_api` (admin API enable/disable)
     /// - `observability.metrics` (metrics route enable/disable)
@@ -196,9 +195,6 @@ impl AppState {
                 || old.server.port != new_config.server.port
             {
                 restart_warnings.push("server.host/port".to_string());
-            }
-            if old.server.rate_limit != new_config.server.rate_limit {
-                restart_warnings.push("server.rate_limit".to_string());
             }
             if old.server.api_key != new_config.server.api_key {
                 restart_warnings.push("server.api_key".to_string());
@@ -261,6 +257,12 @@ impl AppState {
         self.routing_retry_count
             .store(new_config.routing.retry_count, Ordering::Relaxed);
         self.budget.update_config(new_config.budget.clone()).await;
+
+        let mut rl_config = new_config.rate_limiting.clone();
+        if rl_config.global == 0 && new_config.server.rate_limit > 0 {
+            rl_config.global = new_config.server.rate_limit;
+        }
+        *self.rate_limiter.write().await = crate::rate_limit::RateLimiter::new(&rl_config);
 
         // Rebuild the per-provider rate limiter (tokens reset, new providers picked up)
         *self.frontier_rate_limiter.write().await =
@@ -455,7 +457,9 @@ impl Server {
         if rl_config.global == 0 && self.config.server.rate_limit > 0 {
             rl_config.global = self.config.server.rate_limit;
         }
-        let rate_limiter = Arc::new(crate::rate_limit::RateLimiter::new(&rl_config));
+        let rate_limiter = Arc::new(tokio::sync::RwLock::new(
+            crate::rate_limit::RateLimiter::new(&rl_config),
+        ));
         let frontier_rate_limiter = Arc::new(tokio::sync::RwLock::new(
             crate::providers::rate_limit::ProviderRateLimiter::new(&self.config.providers),
         ));
@@ -718,7 +722,11 @@ impl Server {
                     let limiter = Arc::clone(&rate_limiter_mw);
                     async move {
                         let api_key = extract_api_key(&req);
-                        let result = limiter.check_rate_limit(api_key.as_deref()).await;
+                        let result = limiter
+                            .read()
+                            .await
+                            .check_rate_limit(api_key.as_deref())
+                            .await;
 
                         match result {
                             Ok(info) => {
@@ -1300,7 +1308,8 @@ async fn proxy_handler(
     // Must run after all model_name mutations (auto-mode, frontier fallback,
     // profile preferred_model) — otherwise Ollama receives "model":"auto" or
     // a stale name and 404s the request. See api::openai::rewrite_request_model.
-    let rewritten_body = crate::api::openai::rewrite_request_model(&body_bytes, model_name.as_deref());
+    let rewritten_body =
+        crate::api::openai::rewrite_request_model(&body_bytes, model_name.as_deref());
 
     // Prepare both versions of the body — keep_alive is Ollama-specific
     let keep_alive_value = state.config.read().await.routing.default_keep_alive.clone();
@@ -2204,7 +2213,9 @@ mod tests {
             metrics: Arc::new(crate::metrics::Metrics::new()),
             node_db: Arc::new(crate::nodes::NodeDb::open().unwrap()),
             budget: crate::budget::BudgetTracker::new(initial.budget.clone()),
-            rate_limiter: Arc::new(crate::rate_limit::RateLimiter::new(&initial.rate_limiting)),
+            rate_limiter: Arc::new(tokio::sync::RwLock::new(
+                crate::rate_limit::RateLimiter::new(&initial.rate_limiting),
+            )),
             frontier_rate_limiter: Arc::new(tokio::sync::RwLock::new(
                 crate::providers::rate_limit::ProviderRateLimiter::new(&initial.providers),
             )),

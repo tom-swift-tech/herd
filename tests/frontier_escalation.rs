@@ -5,10 +5,24 @@
 //! mock frontier provider.
 
 use axum::http::HeaderMap;
+use herd::api::openai::list_models;
 use herd::classifier_auto::Classification;
 use herd::config::{FrontierConfig, ProviderConfig};
 use herd::providers::{
     cost_db::CostDb, frontier_route_if_applicable, rate_limit::ProviderRateLimiter,
+};
+use herd::server::AppState;
+use herd::{
+    agent::{AgentAudit, SessionStore},
+    analytics::Analytics,
+    backend::BackendPool,
+    budget::BudgetTracker,
+    classifier_auto::ClassificationCache,
+    config::{Backend, Config},
+    metrics::Metrics,
+    nodes::NodeDb,
+    rate_limit::RateLimiter,
+    router::create_router,
 };
 use rusqlite::Connection;
 use std::sync::Arc;
@@ -73,6 +87,45 @@ fn frontier_tier() -> Classification {
         capability: "reasoning".to_string(),
         needs_large_context: false,
         language: "en".to_string(),
+    }
+}
+
+fn test_state(config: Config) -> AppState {
+    let pool = BackendPool::new(
+        vec![Backend {
+            name: "gpu-1".into(),
+            url: "http://127.0.0.1:11434".into(),
+            priority: 100,
+            ..Default::default()
+        }],
+        config.circuit_breaker.failure_threshold,
+        std::time::Duration::from_secs(30),
+    );
+    let router = create_router(config.routing.strategy.clone(), pool.clone());
+
+    AppState {
+        pool: Arc::new(pool),
+        router: Arc::new(tokio::sync::RwLock::new(router)),
+        client: Arc::new(reqwest::Client::new()),
+        mgmt_client: Arc::new(reqwest::Client::new()),
+        config: Arc::new(tokio::sync::RwLock::new(config.clone())),
+        analytics: Arc::new(Analytics::new().unwrap()),
+        metrics: Arc::new(Metrics::new()),
+        session_store: Arc::new(SessionStore::new(10)),
+        agent_audit: Arc::new(AgentAudit::new().unwrap()),
+        node_db: Arc::new(NodeDb::open().unwrap()),
+        budget: BudgetTracker::new(config.budget.clone()),
+        rate_limiter: Arc::new(tokio::sync::RwLock::new(RateLimiter::new(
+            &config.rate_limiting,
+        ))),
+        frontier_rate_limiter: Arc::new(tokio::sync::RwLock::new(ProviderRateLimiter::new(
+            &config.providers,
+        ))),
+        auto_cache: Arc::new(ClassificationCache::new(10)),
+        cost_db: Arc::new(CostDb::new(Connection::open_in_memory().unwrap())),
+        routing_timeout_ms: Arc::new(std::sync::atomic::AtomicU64::new(1_000)),
+        routing_retry_count: Arc::new(std::sync::atomic::AtomicU32::new(1)),
+        config_path: None,
     }
 }
 
@@ -519,5 +572,33 @@ async fn streaming_response_passes_through_without_cost_recording() {
     assert!(
         response.headers().get("x-herd-cost-estimate").is_none(),
         "streaming response must not emit X-Herd-Cost-Estimate"
+    );
+}
+
+#[tokio::test]
+async fn list_models_omits_frontier_provider_without_api_key() {
+    std::env::remove_var("TEST_MISSING_FRONTIER_KEY");
+
+    let state = test_state(Config {
+        frontier: FrontierConfig {
+            enabled: true,
+            ..Default::default()
+        },
+        providers: vec![ProviderConfig {
+            name: "missing".into(),
+            api_url: "https://api.example.com".into(),
+            api_key_env: "TEST_MISSING_FRONTIER_KEY".into(),
+            models: vec!["gpt-missing".into()],
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+
+    let axum::Json(body) = list_models(axum::extract::State(state)).await;
+    let data = body["data"].as_array().unwrap();
+
+    assert!(
+        !data.iter().any(|item| item["id"] == "gpt-missing"),
+        "models without a configured provider API key should not be advertised"
     );
 }

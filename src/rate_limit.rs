@@ -1,7 +1,8 @@
 use crate::config::RateLimitConfig;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 // ---------------------------------------------------------------------------
@@ -12,6 +13,8 @@ use tokio::sync::RwLock;
 struct TokenBucket {
     tokens: AtomicU64,
     max_tokens: u64,
+    refill_interval: Duration,
+    last_refill: Mutex<Instant>,
 }
 
 impl TokenBucket {
@@ -19,10 +22,24 @@ impl TokenBucket {
         Self {
             tokens: AtomicU64::new(max_tokens),
             max_tokens,
+            refill_interval: Duration::from_secs(1),
+            last_refill: Mutex::new(Instant::now()),
+        }
+    }
+
+    fn refill_if_due(&self) {
+        let mut last_refill = match self.last_refill.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if last_refill.elapsed() >= self.refill_interval {
+            self.tokens.store(self.max_tokens, Ordering::Relaxed);
+            *last_refill = Instant::now();
         }
     }
 
     fn try_acquire(&self) -> bool {
+        self.refill_if_due();
         loop {
             let current = self.tokens.load(Ordering::Relaxed);
             if current == 0 {
@@ -39,11 +56,8 @@ impl TokenBucket {
     }
 
     fn remaining(&self) -> u64 {
+        self.refill_if_due();
         self.tokens.load(Ordering::Relaxed)
-    }
-
-    fn refill(&self) {
-        self.tokens.store(self.max_tokens, Ordering::Relaxed);
     }
 
     fn limit(&self) -> u64 {
@@ -86,7 +100,7 @@ pub struct RateLimiter {
 }
 
 impl RateLimiter {
-    /// Creates a new rate limiter from config. Spawns a background refill task.
+    /// Creates a new rate limiter from config.
     pub fn new(config: &RateLimitConfig) -> Self {
         let global_bucket = if config.global > 0 {
             Some(Arc::new(TokenBucket::new(config.global)))
@@ -107,25 +121,6 @@ impl RateLimiter {
         }
 
         let client_entries = Arc::new(RwLock::new(client_map));
-
-        // Spawn refill task — refills all buckets every second
-        let refill_global = global_bucket.clone();
-        let refill_clients = Arc::clone(&client_entries);
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
-            loop {
-                ticker.tick().await;
-                if let Some(ref bucket) = refill_global {
-                    bucket.refill();
-                }
-                let clients = refill_clients.read().await;
-                for entry in clients.values() {
-                    if let ClientEntry::Limited(bucket) = entry {
-                        bucket.refill();
-                    }
-                }
-            }
-        });
 
         Self {
             global_bucket,
@@ -222,6 +217,14 @@ mod tests {
 
     fn make_config(global: u64, clients: Vec<ClientRateLimit>) -> RateLimitConfig {
         RateLimitConfig { global, clients }
+    }
+
+    #[test]
+    fn constructing_rate_limiter_does_not_require_tokio_runtime() {
+        let config = make_config(1, vec![]);
+        let limiter = RateLimiter::new(&config);
+
+        assert_eq!(limiter.global_bucket.as_ref().unwrap().limit(), 1);
     }
 
     #[tokio::test]

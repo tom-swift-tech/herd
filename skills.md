@@ -405,6 +405,7 @@ every 4 minutes with `keep_alive: "-1"` to pre-load on startup and recover from 
 | Update check | GET | `/update` | |
 | Dashboard | GET | `/dashboard` | |
 | Skills (this data as JSON) | GET | `/skills` | |
+| Agent node heartbeat | POST | `/api/internal/nodes/heartbeat` | Internal `herd agent` daemon endpoint. Requires `Authorization: Bearer <HERD_AGENT_TOKEN>`; client chat agents should not call it. |
 
 ## Self-Onboarding
 

@@ -5,6 +5,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
+const DEFAULT_MAX_AGENT_NODES: usize = 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentCapabilities {
     pub node_id: String,
@@ -49,12 +51,30 @@ pub enum HeartbeatOutcome {
     Updated,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegistryError {
+    CapacityExceeded { max_nodes: usize },
+}
+
+impl std::fmt::Display for RegistryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CapacityExceeded { max_nodes } => {
+                write!(f, "agent node registry capacity exceeded ({max_nodes})")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RegistryError {}
+
 type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
 
 #[derive(Clone)]
 pub struct NodeRegistry {
     nodes: Arc<RwLock<HashMap<String, AgentState>>>,
     ttl: Duration,
+    max_nodes: usize,
     clock: Clock,
 }
 
@@ -63,15 +83,27 @@ impl NodeRegistry {
         Self::with_clock(ttl, Arc::new(Instant::now))
     }
 
+    pub fn with_max_nodes(ttl: Duration, max_nodes: usize) -> Self {
+        Self::with_clock_and_max(ttl, Arc::new(Instant::now), max_nodes)
+    }
+
     fn with_clock(ttl: Duration, clock: Clock) -> Self {
+        Self::with_clock_and_max(ttl, clock, DEFAULT_MAX_AGENT_NODES)
+    }
+
+    fn with_clock_and_max(ttl: Duration, clock: Clock, max_nodes: usize) -> Self {
         Self {
             nodes: Arc::new(RwLock::new(HashMap::new())),
             ttl,
+            max_nodes: max_nodes.max(1),
             clock,
         }
     }
 
-    pub async fn heartbeat(&self, caps: AgentCapabilities) -> HeartbeatOutcome {
+    pub async fn heartbeat(
+        &self,
+        caps: AgentCapabilities,
+    ) -> Result<HeartbeatOutcome, RegistryError> {
         let now = (self.clock)();
         let mut nodes = self.nodes.write().await;
         let node_id = caps.node_id.clone();
@@ -79,9 +111,14 @@ impl NodeRegistry {
             Some(existing) => {
                 existing.capabilities = caps;
                 existing.last_heartbeat = now;
-                HeartbeatOutcome::Updated
+                Ok(HeartbeatOutcome::Updated)
             }
             None => {
+                if nodes.len() >= self.max_nodes {
+                    return Err(RegistryError::CapacityExceeded {
+                        max_nodes: self.max_nodes,
+                    });
+                }
                 nodes.insert(
                     node_id,
                     AgentState {
@@ -89,7 +126,7 @@ impl NodeRegistry {
                         last_heartbeat: now,
                     },
                 );
-                HeartbeatOutcome::Registered
+                Ok(HeartbeatOutcome::Registered)
             }
         }
     }
@@ -193,10 +230,16 @@ mod tests {
         (reg, clock)
     }
 
+    fn registry_with_clock_and_max(ttl: Duration, max_nodes: usize) -> (NodeRegistry, TestClock) {
+        let clock = TestClock::new();
+        let reg = NodeRegistry::with_clock_and_max(ttl, clock.as_fn(), max_nodes);
+        (reg, clock)
+    }
+
     #[tokio::test]
     async fn heartbeat_on_unknown_returns_registered() {
         let (reg, _clock) = registry_with_clock(Duration::from_secs(30));
-        let outcome = reg.heartbeat(sample_caps("a")).await;
+        let outcome = reg.heartbeat(sample_caps("a")).await.unwrap();
         assert_eq!(outcome, HeartbeatOutcome::Registered);
         assert_eq!(reg.len().await, 1);
     }
@@ -204,8 +247,8 @@ mod tests {
     #[tokio::test]
     async fn heartbeat_on_known_returns_updated() {
         let (reg, _clock) = registry_with_clock(Duration::from_secs(30));
-        reg.heartbeat(sample_caps("a")).await;
-        let outcome = reg.heartbeat(sample_caps("a")).await;
+        reg.heartbeat(sample_caps("a")).await.unwrap();
+        let outcome = reg.heartbeat(sample_caps("a")).await.unwrap();
         assert_eq!(outcome, HeartbeatOutcome::Updated);
         assert_eq!(reg.len().await, 1);
     }
@@ -213,10 +256,10 @@ mod tests {
     #[tokio::test]
     async fn heartbeat_updates_last_heartbeat_timestamp() {
         let (reg, clock) = registry_with_clock(Duration::from_secs(30));
-        reg.heartbeat(sample_caps("a")).await;
+        reg.heartbeat(sample_caps("a")).await.unwrap();
         let first_ts = reg.get("a").await.unwrap().last_heartbeat;
         clock.advance(Duration::from_secs(5));
-        reg.heartbeat(sample_caps("a")).await;
+        reg.heartbeat(sample_caps("a")).await.unwrap();
         let second_ts = reg.get("a").await.unwrap().last_heartbeat;
         assert!(second_ts > first_ts);
     }
@@ -224,7 +267,7 @@ mod tests {
     #[tokio::test]
     async fn evict_stale_removes_nodes_past_ttl() {
         let (reg, clock) = registry_with_clock(Duration::from_secs(30));
-        reg.heartbeat(sample_caps("a")).await;
+        reg.heartbeat(sample_caps("a")).await.unwrap();
         clock.advance(Duration::from_secs(31));
         let evicted = reg.evict_stale().await;
         assert_eq!(evicted, vec!["a".to_string()]);
@@ -234,7 +277,7 @@ mod tests {
     #[tokio::test]
     async fn evict_stale_keeps_fresh_nodes() {
         let (reg, clock) = registry_with_clock(Duration::from_secs(30));
-        reg.heartbeat(sample_caps("a")).await;
+        reg.heartbeat(sample_caps("a")).await.unwrap();
         clock.advance(Duration::from_secs(10));
         let evicted = reg.evict_stale().await;
         assert!(evicted.is_empty());
@@ -244,7 +287,7 @@ mod tests {
     #[tokio::test]
     async fn fresh_nodes_excludes_stale_but_not_yet_evicted() {
         let (reg, clock) = registry_with_clock(Duration::from_secs(30));
-        reg.heartbeat(sample_caps("a")).await;
+        reg.heartbeat(sample_caps("a")).await.unwrap();
         clock.advance(Duration::from_secs(31));
         assert!(reg.fresh_nodes().await.is_empty());
         assert_eq!(reg.list().await.len(), 1);
@@ -268,9 +311,9 @@ mod tests {
     #[tokio::test]
     async fn list_returns_all_current_states() {
         let (reg, _clock) = registry_with_clock(Duration::from_secs(30));
-        reg.heartbeat(sample_caps("a")).await;
-        reg.heartbeat(sample_caps("b")).await;
-        reg.heartbeat(sample_caps("c")).await;
+        reg.heartbeat(sample_caps("a")).await.unwrap();
+        reg.heartbeat(sample_caps("b")).await.unwrap();
+        reg.heartbeat(sample_caps("c")).await.unwrap();
         assert_eq!(reg.list().await.len(), 3);
     }
 
@@ -278,18 +321,38 @@ mod tests {
     async fn get_returns_none_for_unknown() {
         let (reg, _clock) = registry_with_clock(Duration::from_secs(30));
         assert!(reg.get("missing").await.is_none());
-        reg.heartbeat(sample_caps("a")).await;
+        reg.heartbeat(sample_caps("a")).await.unwrap();
         assert!(reg.get("a").await.is_some());
     }
 
     #[tokio::test]
     async fn heartbeat_re_registers_after_eviction() {
         let (reg, clock) = registry_with_clock(Duration::from_secs(30));
-        reg.heartbeat(sample_caps("a")).await;
+        reg.heartbeat(sample_caps("a")).await.unwrap();
         clock.advance(Duration::from_secs(31));
         let evicted = reg.evict_stale().await;
         assert_eq!(evicted, vec!["a".to_string()]);
-        let outcome = reg.heartbeat(sample_caps("a")).await;
+        let outcome = reg.heartbeat(sample_caps("a")).await.unwrap();
         assert_eq!(outcome, HeartbeatOutcome::Registered);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_rejects_new_node_when_registry_is_full() {
+        let (reg, _clock) = registry_with_clock_and_max(Duration::from_secs(30), 1);
+        reg.heartbeat(sample_caps("a")).await.unwrap();
+
+        let err = reg.heartbeat(sample_caps("b")).await.unwrap_err();
+        assert_eq!(err, RegistryError::CapacityExceeded { max_nodes: 1 });
+        assert_eq!(reg.len().await, 1);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_allows_existing_node_update_when_registry_is_full() {
+        let (reg, _clock) = registry_with_clock_and_max(Duration::from_secs(30), 1);
+        reg.heartbeat(sample_caps("a")).await.unwrap();
+
+        let outcome = reg.heartbeat(sample_caps("a")).await.unwrap();
+        assert_eq!(outcome, HeartbeatOutcome::Updated);
+        assert_eq!(reg.len().await, 1);
     }
 }

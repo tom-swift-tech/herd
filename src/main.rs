@@ -68,7 +68,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let (config, config_path) = if let Some(config_path) = cli.config {
+    let (mut config, config_path) = if let Some(config_path) = cli.config {
         let config = match Config::from_file(&config_path) {
             Ok(c) => c,
             Err(e) => {

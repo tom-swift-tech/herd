@@ -23,7 +23,7 @@ pub trait ProviderAdapter: Send + Sync {
 /// Check if a model name belongs to any configured frontier provider
 pub fn is_frontier_model(model: &str, providers: &[ProviderConfig]) -> bool {
     providers.iter().any(|p| {
-        p.models.contains(&model.to_string()) || (p.models.is_empty() && !model.is_empty())
+        p.models.iter().any(|m| m == model) || (p.models.is_empty() && !model.is_empty())
     })
 }
 
@@ -32,9 +32,18 @@ pub fn resolve_provider<'a>(
     model: &str,
     providers: &'a [ProviderConfig],
 ) -> Option<&'a ProviderConfig> {
+    let exact = providers
+        .iter()
+        .filter(|p| p.models.iter().any(|m| m == model))
+        .max_by_key(|p| p.priority);
+
+    if exact.is_some() {
+        return exact;
+    }
+
     providers
         .iter()
-        .filter(|p| p.models.contains(&model.to_string()) || p.models.is_empty())
+        .filter(|p| p.models.is_empty())
         .max_by_key(|p| p.priority)
 }
 
@@ -432,6 +441,31 @@ mod tests {
         // Wildcard matches all, so we get the highest-priority wildcard.
         let p = resolve_provider("unknown-model", &providers).unwrap();
         assert_eq!(p.name, "fallback");
+    }
+
+    #[test]
+    fn resolve_provider_prefers_exact_match_over_higher_priority_wildcard() {
+        let providers = vec![
+            ProviderConfig {
+                name: "wildcard".to_string(),
+                api_url: "https://api.example.com".to_string(),
+                api_key_env: "WILDCARD_API_KEY".to_string(),
+                models: vec![],
+                priority: 1000,
+                ..Default::default()
+            },
+            ProviderConfig {
+                name: "openai".to_string(),
+                api_url: "https://api.openai.com".to_string(),
+                api_key_env: "OPENAI_API_KEY".to_string(),
+                models: vec!["gpt-4.1".to_string()],
+                priority: 10,
+                ..Default::default()
+            },
+        ];
+
+        let p = resolve_provider("gpt-4.1", &providers).unwrap();
+        assert_eq!(p.name, "openai");
     }
 
     #[test]

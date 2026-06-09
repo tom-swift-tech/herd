@@ -1,5 +1,6 @@
 use crate::agent::session::Session;
 use crate::agent::types::{AgentMessage, MessageRole, SessionStatus};
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -133,7 +134,7 @@ impl SessionStore {
     pub async fn list(&self) -> Vec<Session> {
         let sessions = self.sessions.read().await;
         let mut list: Vec<Session> = sessions.values().cloned().collect();
-        list.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        list.sort_by_key(|s| Reverse(s.updated_at));
         list
     }
 

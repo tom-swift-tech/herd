@@ -86,7 +86,12 @@ fn check_agent_token(
 
 fn env_truthy(name: &str) -> bool {
     std::env::var(name)
-        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"))
+        .map(|v| {
+            matches!(
+                v.as_str(),
+                "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -120,7 +125,9 @@ fn validate_capabilities(caps: &AgentCapabilities) -> Result<(), String> {
     }
 
     if caps.address.len() > MAX_ADDRESS_LEN {
-        return Err(format!("capabilities.address exceeds {MAX_ADDRESS_LEN} bytes"));
+        return Err(format!(
+            "capabilities.address exceeds {MAX_ADDRESS_LEN} bytes"
+        ));
     }
     let parsed = reqwest::Url::parse(&caps.address)
         .map_err(|e| format!("capabilities.address is not a valid URL: {e}"))?;
@@ -139,7 +146,11 @@ fn validate_capabilities(caps: &AgentCapabilities) -> Result<(), String> {
             "capabilities.models_loaded exceeds {MAX_MODELS_LOADED} entries"
         ));
     }
-    if caps.models_loaded.iter().any(|m| m.len() > MAX_MODEL_NAME_LEN) {
+    if caps
+        .models_loaded
+        .iter()
+        .any(|m| m.len() > MAX_MODEL_NAME_LEN)
+    {
         return Err(format!(
             "capabilities.models_loaded entries must be <= {MAX_MODEL_NAME_LEN} bytes"
         ));
@@ -229,8 +240,8 @@ pub async fn heartbeat(
         &headers,
         req,
     )
-        .await
-        .map(Json)
+    .await
+    .map(Json)
 }
 
 #[cfg(test)]

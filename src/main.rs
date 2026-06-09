@@ -1,33 +1,8 @@
 use clap::Parser;
+use herd::cli::{Cli, Command, ServeArgs};
 use herd::config::Config;
 use herd::server;
-use std::path::PathBuf;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-
-#[derive(Parser)]
-#[command(name = "herd")]
-#[command(about = "Intelligent Ollama router with GPU awareness", long_about = None)]
-struct Cli {
-    /// Path to config file
-    #[arg(short, long, value_name = "FILE")]
-    config: Option<PathBuf>,
-
-    /// Port to listen on
-    #[arg(short, long, default_value = "40114")]
-    port: u16,
-
-    /// Host to bind to
-    #[arg(long, default_value = "0.0.0.0")]
-    host: String,
-
-    /// Backend URLs (format: name=url:priority)
-    #[arg(short, long)]
-    backend: Vec<String>,
-
-    /// Check for updates and install if available
-    #[arg(long)]
-    update: bool,
-}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -68,7 +43,15 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let (mut config, config_path) = if let Some(config_path) = cli.config {
+    match cli.command {
+        Some(Command::Agent(args)) => herd::daemon::run(args).await,
+        Some(Command::Serve(args)) => serve(args).await,
+        None => serve(cli.serve).await,
+    }
+}
+
+async fn serve(args: ServeArgs) -> anyhow::Result<()> {
+    let (mut config, config_path) = if let Some(config_path) = args.config {
         let config = match Config::from_file(&config_path) {
             Ok(c) => c,
             Err(e) => {
@@ -80,10 +63,10 @@ async fn main() -> anyhow::Result<()> {
         (config, Some(config_path))
     } else {
         let mut config = Config::default();
-        config.server.host = cli.host;
-        config.server.port = cli.port;
+        config.server.host = args.host;
+        config.server.port = args.port;
 
-        for spec in cli.backend {
+        for spec in args.backend {
             match herd::cli::parse_backend_spec(&spec) {
                 Some(backend) => config.backends.push(backend),
                 None => tracing::warn!("Ignoring invalid backend spec: {}", spec),

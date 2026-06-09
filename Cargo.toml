@@ -23,7 +23,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 regex = "1"
 anyhow = "1"
 thiserror = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 async-trait = "0.1"
 chrono = "0.4"
 dirs = "5.0"
@@ -31,6 +31,7 @@ uuid = { version = "1", features = ["v4"] }
 self_update = { version = "0.42", features = ["archive-zip", "archive-tar", "compression-flate2", "compression-zip-deflate"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 futures-util = "0.3"
+hostname = "0.4"
 axum-server = { version = "0.7", features = ["tls-rustls"], optional = true }
 
 [features]

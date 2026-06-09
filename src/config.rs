@@ -844,11 +844,7 @@ impl Config {
                 .is_some();
 
             if url.is_empty() {
-                tracing::warn!(
-                    "Skipping backends[{}] ('{}'): empty URL",
-                    i,
-                    backend.name
-                );
+                tracing::warn!("Skipping backends[{}] ('{}'): empty URL", i, backend.name);
                 continue;
             }
             if !valid {

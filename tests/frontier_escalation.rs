@@ -20,7 +20,7 @@ use herd::{
     classifier_auto::ClassificationCache,
     config::{Backend, Config},
     metrics::Metrics,
-    nodes::NodeDb,
+    nodes::{NodeDb, NodeRegistry},
     rate_limit::RateLimiter,
     router::create_router,
 };
@@ -114,6 +114,7 @@ fn test_state(config: Config) -> AppState {
         session_store: Arc::new(SessionStore::new(10)),
         agent_audit: Arc::new(AgentAudit::new().unwrap()),
         node_db: Arc::new(NodeDb::open().unwrap()),
+        node_registry: Arc::new(NodeRegistry::new(std::time::Duration::from_secs(30))),
         budget: BudgetTracker::new(config.budget.clone()),
         rate_limiter: Arc::new(tokio::sync::RwLock::new(RateLimiter::new(
             &config.rate_limiting,

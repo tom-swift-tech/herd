@@ -821,29 +821,48 @@ impl Config {
         }
     }
 
-    pub fn validate(&self) -> Result<()> {
-        // Validate model_warmer interval
+    pub fn validate(&mut self) -> Result<()> {
+        // Validate model_warmer interval. A value of 0 disables the warmer.
         if self.model_warmer.interval_secs > 0 && self.model_warmer.interval_secs < 10 {
-            anyhow::bail!(
-                "model_warmer.interval_secs must be >= 10 (got {})",
+            tracing::warn!(
+                "model_warmer.interval_secs must be >= 10 or 0 to disable (got {}) - disabling model warmer",
                 self.model_warmer.interval_secs
             );
+            self.model_warmer.interval_secs = 0;
         }
 
-        // Validate backend URLs
-        for (i, backend) in self.backends.iter().enumerate() {
-            if backend.url.is_empty() {
-                anyhow::bail!("backends[{}] ('{}') has an empty URL", i, backend.name);
+        // Validate backend URLs. Bad backend entries are skipped so the rest of
+        // the fleet can keep serving.
+        let mut valid_backends = Vec::with_capacity(self.backends.len());
+        for (i, backend) in self.backends.drain(..).enumerate() {
+            let url = backend.url.trim();
+            let parsed = reqwest::Url::parse(url);
+            let valid = parsed
+                .as_ref()
+                .ok()
+                .filter(|u| matches!(u.scheme(), "http" | "https") && u.host_str().is_some())
+                .is_some();
+
+            if url.is_empty() {
+                tracing::warn!(
+                    "Skipping backends[{}] ('{}'): empty URL",
+                    i,
+                    backend.name
+                );
+                continue;
             }
-            if !backend.url.starts_with("http://") && !backend.url.starts_with("https://") {
-                anyhow::bail!(
-                    "backends[{}] ('{}') has an invalid URL (must start with http:// or https://): '{}'",
+            if !valid {
+                tracing::warn!(
+                    "Skipping backends[{}] ('{}'): invalid URL '{}'. Backend URLs must be absolute http(s) URLs with a host",
                     i,
                     backend.name,
                     backend.url
                 );
+                continue;
             }
+            valid_backends.push(backend);
         }
+        self.backends = valid_backends;
 
         // Warn if recovery_time <= timeout on circuit breaker
         if let (Ok(recovery), Ok(timeout)) = (

@@ -23,6 +23,11 @@ impl ModelWarmer {
     }
 
     pub async fn spawn(self, pool: BackendPool) {
+        if self.interval.is_zero() {
+            tracing::info!("Model warmer disabled");
+            return;
+        }
+
         tokio::spawn(async move {
             let mut ticker = interval(self.interval);
             loop {
@@ -102,5 +107,12 @@ mod tests {
         assert_eq!(payload["model"], "llama3:8b");
         assert_eq!(payload["keep_alive"], -1);
         assert_eq!(payload["prompt"], "");
+    }
+
+    #[tokio::test]
+    async fn zero_interval_disables_warmer() {
+        let warmer = ModelWarmer::new(0, 1);
+        let pool = BackendPool::new(vec![], 1, Duration::from_secs(1));
+        warmer.spawn(pool).await;
     }
 }

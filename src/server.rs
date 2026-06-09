@@ -135,6 +135,10 @@ pub struct AppState {
     pub session_store: Arc<SessionStore>,
     pub agent_audit: Arc<AgentAudit>,
     pub node_db: Arc<crate::nodes::NodeDb>,
+    /// In-memory registry of live agent nodes (v1.2 distributed inference).
+    /// Populated by agent heartbeats; distinct from `node_db` (operator-managed,
+    /// SQLite-persisted). Liveness is TTL-based via stale eviction.
+    pub node_registry: Arc<crate::nodes::NodeRegistry>,
     pub budget: Arc<crate::budget::BudgetTracker>,
     pub rate_limiter: Arc<tokio::sync::RwLock<crate::rate_limit::RateLimiter>>,
     pub frontier_rate_limiter:
@@ -184,7 +188,7 @@ impl AppState {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("No config file path (started with CLI args)"))?;
 
-        let new_config = Config::from_file(path)?;
+        let mut new_config = Config::from_file(path)?;
         new_config.validate()?;
 
         // Detect settings that changed but require a restart to take effect
@@ -450,6 +454,10 @@ impl Server {
             discovery.spawn(Arc::clone(&node_db));
         }
 
+        // In-memory registry for agent-heartbeat nodes (v1.2). 30s TTL — an agent
+        // heartbeats every ~2s, so 30s tolerates ~15 missed beats before eviction.
+        let node_registry = Arc::new(crate::nodes::NodeRegistry::new(Duration::from_secs(30)));
+
         let budget = crate::budget::BudgetTracker::new(self.config.budget.clone());
 
         // Build per-client rate limiter config, merging legacy server.rate_limit
@@ -475,6 +483,7 @@ impl Server {
             agent_audit,
             metrics,
             node_db,
+            node_registry,
             budget,
             rate_limiter,
             frontier_rate_limiter,
@@ -500,6 +509,23 @@ impl Server {
                     }
                     if let Err(e) = audit_clone.cleanup_old(7 * 24 * 3600).await {
                         tracing::error!("Audit log cleanup failed: {}", e);
+                    }
+                }
+            });
+        }
+
+        // Start agent-node stale eviction (every 10s). Removes agent nodes that
+        // have missed heartbeats past the registry TTL so the gateway never routes
+        // to a dead agent. Cheap no-op when no agents are registered.
+        {
+            let registry = Arc::clone(&state.node_registry);
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(Duration::from_secs(10));
+                loop {
+                    ticker.tick().await;
+                    let evicted = registry.evict_stale().await;
+                    if !evicted.is_empty() {
+                        tracing::info!("Evicted stale agent nodes: {}", evicted.join(", "));
                     }
                 }
             });
@@ -535,6 +561,12 @@ impl Server {
             .route(
                 "/api/nodes/register",
                 axum::routing::post(crate::api::nodes::register_node),
+            )
+            // Agent heartbeat (HERD_AGENT_TOKEN bearer auth, enforced in handler —
+            // called by `herd agent` daemons; unknown node_id registers implicitly)
+            .route(
+                "/api/internal/nodes/heartbeat",
+                axum::routing::post(crate::api::internal::heartbeat),
             )
             // Node management (public — dashboard uses these)
             .route(
@@ -2094,12 +2126,19 @@ async fn skills_handler(
                 "path": "/metrics",
                 "description": "Prometheus exposition format",
                 "auth": false
+            },
+            "agent_heartbeat": {
+                "method": "POST",
+                "path": "/api/internal/nodes/heartbeat",
+                "description": "Internal herd agent daemon heartbeat; not for client chat agents",
+                "auth": true
             }
         },
         "headers": {
             "X-Herd-Tags": "Comma-separated tags to target specific backends (e.g. 'gpu,fast')",
             "X-Request-Id": "Correlation ID — send your own or Herd generates a UUID v4",
-            "X-API-Key": "Required for admin endpoints only"
+            "X-API-Key": "Required for admin endpoints only",
+            "Authorization: Bearer <HERD_AGENT_TOKEN>": "Required for /api/internal/nodes/heartbeat"
         },
         "best_practices": [
             "Always specify 'model' in requests for optimal routing",
@@ -2212,6 +2251,7 @@ mod tests {
             agent_audit: Arc::new(AgentAudit::new().unwrap()),
             metrics: Arc::new(crate::metrics::Metrics::new()),
             node_db: Arc::new(crate::nodes::NodeDb::open().unwrap()),
+            node_registry: Arc::new(crate::nodes::NodeRegistry::new(Duration::from_secs(30))),
             budget: crate::budget::BudgetTracker::new(initial.budget.clone()),
             rate_limiter: Arc::new(tokio::sync::RwLock::new(
                 crate::rate_limit::RateLimiter::new(&initial.rate_limiting),

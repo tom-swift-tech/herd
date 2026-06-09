@@ -1,8 +1,8 @@
 # Herd v2 — Distributed Inference Spec
 
-**Status:** v1.2 in progress (PRs #1–#2 landed of 8; see `tasks/HERD-V1.2-SPRINT.md`)
+**Status:** v1.2 in progress (PRs #1–#3 landed of 8; see `tasks/HERD-V1.2-SPRINT.md`)
 **Author:** Tom Swift (Director) + Gage
-**Date:** 2026-04-17 (last reconciled with implementation: 2026-05-08)
+**Date:** 2026-04-17 (last reconciled with implementation: 2026-06-05)
 **Targets:** v1.2 (foundation) → v1.3 (speculative) → v1.4 (pipeline)
 **Supersedes:** N/A — extends `ROADMAP.md` v1.2.0+ "llama.cpp RPC integration for tensor-parallel sharding"
 
@@ -118,15 +118,15 @@ Conflict resolution for v1.2 is intentionally narrow: an agent registration over
 
 - [ ] `herd agent --gateway <url> --node-id <id>` subcommand exists
 - [ ] Agent sends heartbeat every 2s with full capability snapshot
-- [ ] `POST /api/internal/nodes/heartbeat` is the only v1.2 agent-control endpoint; unknown `node_id` values are implicitly registered on first heartbeat
-- [~] Gateway maintains in-memory `NodeRegistry` keyed by `node_id` with TTL eviction (default 30s) *(struct landed in `src/nodes/registry.rs`; not yet on `AppState` — pending PR #3)*
-- [ ] Agent-registered nodes appear in `BackendPool` and route identically to static backends
-- [ ] Existing static-backend config path is unchanged
-- [ ] Dashboard Fleet tab shows agent-registered nodes with live state
-- [ ] Both modes can run on the same host (CITADEL self-test scenario)
-- [ ] Auth: shared bearer token via env var (`HERD_AGENT_TOKEN`)
-- [ ] Gateway returns 503 with clear error if all healthy backends — agent and static — are gone (no hidden fallback)
-- [~] Tests: `NodeRegistry` unit tests, integration test with gateway + 1 agent in same process *(10 unit tests landed in PR #2; integration test pending PR #5/#7)*
+- [x] `POST /api/internal/nodes/heartbeat` is the only v1.2 agent-control endpoint; unknown `node_id` values are implicitly registered on first heartbeat *(PR #3, `src/api/internal.rs`)*
+- [x] Gateway maintains in-memory `NodeRegistry` keyed by `node_id` with TTL eviction (default 30s) *(struct in PR #2; on `AppState` + 10s eviction task in PR #3)*
+- [ ] Agent-registered nodes appear in `BackendPool` and route identically to static backends *(PR #7)*
+- [x] Existing static-backend config path is unchanged
+- [ ] Dashboard Fleet tab shows agent-registered nodes with live state *(PR #5)*
+- [ ] Both modes can run on the same host (CITADEL self-test scenario) *(PR #4/#8)*
+- [x] Auth: shared bearer token via env var (`HERD_AGENT_TOKEN`) *(PR #3 — unset = warn+allow, set = required)*
+- [ ] Gateway returns 503 with clear error if all healthy backends — agent and static — are gone (no hidden fallback) *(PR #7)*
+- [~] Tests: `NodeRegistry` unit tests *(10 in PR #2)*, heartbeat protocol tests *(8 in PR #3)*, integration test with gateway + 1 agent in same process *(pending PR #8)*
 
 ### v1.3 — Speculative Decoding Deployments
 
@@ -284,6 +284,8 @@ pub struct DeploymentManager {
 ```
 
 ### Heartbeat protocol
+
+> **Implementation note (2026-06-05):** PR #3 landed the gateway side of this protocol in `src/api/internal.rs`. The `timestamp` field is accepted but ignored — the registry uses its own monotonic clock for freshness, so agent clock skew cannot cause premature eviction. `deployments_assigned` is always `[]` in v1.2 (single-node only). `next_heartbeat_secs` is a fixed `2`. The agent side (the client that *sends* these) lands in PR #4.
 
 Initial implementation: HTTP POST every 2s with full state snapshot. Long-poll or gRPC-streaming as v1.5 if heartbeat overhead becomes measurable.
 

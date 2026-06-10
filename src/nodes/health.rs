@@ -89,6 +89,8 @@ impl NodeHealthPoller {
 
     /// Syncs routable registered nodes into the BackendPool so existing
     /// routing strategies can route to them alongside static config backends.
+    /// Agent rows (`source='agent'`) never appear here: `get_routable_nodes()`
+    /// excludes them by source — they are registry-managed, not poll-managed.
     async fn sync_to_pool(&self, node_db: &NodeDb, pool: &BackendPool) {
         let nodes = match node_db.get_routable_nodes() {
             Ok(n) => n,
@@ -156,6 +158,9 @@ impl NodeHealthPoller {
     }
 
     async fn poll_all(&self, node_db: &NodeDb, check_tags: bool) {
+        // get_pollable_nodes excludes agent rows — their liveness is driven by
+        // heartbeats into the in-memory NodeRegistry, not by HTTP polling, and
+        // polling them would corrupt their 'online'/'offline' status lifecycle.
         let nodes = match node_db.get_pollable_nodes() {
             Ok(n) => n,
             Err(e) => {
@@ -344,6 +349,41 @@ impl NodeHealthPoller {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn sync_to_pool_never_adds_agent_rows() {
+        let node_db = NodeDb::open_in_memory().unwrap();
+        let caps = crate::nodes::AgentCapabilities {
+            node_id: "agent-node".to_string(),
+            backend: crate::config::BackendType::LlamaServer,
+            address: "http://10.0.0.5:8080".to_string(),
+            gpu_model: Some("RTX 5090".to_string()),
+            vram_total_mb: 32_768,
+            vram_free_mb: 30_000,
+            models_loaded: vec!["llama-3-8b".to_string()],
+            queue_depth: 0,
+            ttft_p50_ms: None,
+            rpc_capable: false,
+            rpc_port: None,
+            agent_version: "1.2.0".to_string(),
+        };
+        let (id, _) = node_db.upsert_agent_node(&caps).unwrap();
+
+        // Force the worst case: an operator update flips the row's status to
+        // 'healthy'. The source guard must still keep it out of the pool.
+        let update = crate::nodes::NodeUpdate {
+            priority: None,
+            tags: None,
+            enabled: Some(true),
+        };
+        assert!(node_db.update_node(&id, &update).unwrap());
+
+        let pool = Arc::new(BackendPool::new(vec![], 3, Duration::from_secs(30)));
+        let poller = NodeHealthPoller::new(15, 300);
+        poller.sync_to_pool(&node_db, &pool).await;
+
+        assert!(pool.all().await.is_empty());
+    }
 
     #[test]
     fn parse_llama_server_models_response() {

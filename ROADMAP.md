@@ -131,7 +131,7 @@ No cloud dependency. No API keys exposed. Full local control.
 
 Three-phase delivery introduces self-registering node agents and deployment-aware routing:
 
-- **v1.2** — Agent/Gateway foundation. `herd agent` subcommand, `NodeRegistry`, single-node deployments. Sprint plan: `tasks/HERD-V1.2-SPRINT.md`. *Status: PRs #1–#4 of 8 landed — `Deployment` module, `NodeRegistry` with TTL eviction, gateway heartbeat endpoint (`HERD_AGENT_TOKEN` auth), and the node-side `herd agent` daemon (GPU/VRAM detection, local backend probe, 2s heartbeat with backoff). Remaining: dashboard Fleet integration, protocol hardening, `BackendPool` routing integration, end-to-end test.*
+- **v1.2** — Agent/Gateway foundation. `herd agent` subcommand, `NodeRegistry`, single-node deployments. Sprint plan: `tasks/HERD-V1.2-SPRINT.md`. *Status: PRs #1–#5 of 8 landed — `Deployment` module, `NodeRegistry` with TTL eviction, gateway heartbeat endpoint (`HERD_AGENT_TOKEN` auth), the node-side `herd agent` daemon (GPU/VRAM detection, local backend probe, 2s heartbeat with backoff), and agent node persistence (migration v5 `source`/`agent_version`, write-through on transitions, soft-evict + reaper, Fleet tab reads unified SQLite store). Remaining: protocol hardening, `BackendPool` routing integration, end-to-end test.*
 - **v1.3** — Speculative decoding deployments. Draft/verifier pairs across nodes via llama.cpp's `--model-draft` for 2-3x throughput on daily-driver models.
 - **v1.4** — Pipeline parallel deployments. llama.cpp RPC integration to serve models that don't fit on any single GPU (Qwen2.5-72B-class).
 

@@ -6,11 +6,17 @@
 //! in-memory `NodeRegistry`. Unknown `node_id` values are registered implicitly on
 //! first heartbeat; there is no separate registration endpoint.
 //!
+//! Persistence: the handler also writes a `source='agent'` row to the SQLite
+//! `nodes` table for Fleet-tab visibility — on registration and on material
+//! capability change only (steady beats stay in-memory). The `NodeRegistry`
+//! itself has no DB dependency; this glue lives here and in `server.rs`'s
+//! evictor/reaper tasks.
+//!
 //! Auth: shared bearer token via the `HERD_AGENT_TOKEN` env var. The token is
 //! required by default. Local self-tests can opt into an unauthenticated mode by
 //! setting `HERD_ALLOW_UNAUTHENTICATED_AGENT_HEARTBEAT=true`.
 
-use crate::nodes::{AgentCapabilities, HeartbeatOutcome, NodeRegistry};
+use crate::nodes::{AgentCapabilities, HeartbeatOutcome, NodeDb, NodeRegistry};
 use crate::server::{constant_time_eq, AppState};
 use axum::{
     extract::State,
@@ -162,8 +168,14 @@ fn validate_capabilities(caps: &AgentCapabilities) -> Result<(), String> {
 /// Core heartbeat logic, decoupled from axum extractors so it can be unit-tested
 /// without constructing a full `AppState`. Checks auth, then records the
 /// heartbeat in the registry (registering unknown nodes implicitly).
+///
+/// `node_db` is the SQLite write-through for Fleet visibility: rows are upserted
+/// on registration and on material capability change (`models_loaded` set
+/// differs), never on steady unchanged beats. A DB failure is logged and does
+/// not fail the heartbeat — liveness must not depend on persistence.
 async fn process_heartbeat(
     registry: &NodeRegistry,
+    node_db: Option<&NodeDb>,
     expected_token: Option<&str>,
     allow_unauthenticated: bool,
     headers: &HeaderMap,
@@ -178,6 +190,7 @@ async fn process_heartbeat(
     })?;
 
     let node_id = req.capabilities.node_id.clone();
+    let caps_for_db = node_db.map(|_| req.capabilities.clone());
     let outcome = registry.heartbeat(req.capabilities).await.map_err(|e| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -187,6 +200,21 @@ async fn process_heartbeat(
     let registered = matches!(outcome, HeartbeatOutcome::Registered);
     if registered {
         tracing::info!("Agent node registered via heartbeat: {}", node_id);
+    }
+
+    let persist = registered
+        || matches!(
+            outcome,
+            HeartbeatOutcome::Updated {
+                models_changed: true
+            }
+        );
+    if persist {
+        if let (Some(db), Some(caps)) = (node_db, caps_for_db) {
+            if let Err(e) = db.upsert_agent_node(&caps) {
+                tracing::error!("Failed to persist agent node {}: {}", node_id, e);
+            }
+        }
     }
 
     Ok(HeartbeatResponse {
@@ -235,6 +263,7 @@ pub async fn heartbeat(
 
     process_heartbeat(
         &state.node_registry,
+        Some(&state.node_db),
         expected.as_deref(),
         allow_unauthenticated,
         &headers,
@@ -280,7 +309,8 @@ mod tests {
             capabilities: sample_caps("a", "1.2.0"),
             timestamp: None,
         };
-        let res = process_heartbeat(&reg, Some("secret"), false, &HeaderMap::new(), req).await;
+        let res =
+            process_heartbeat(&reg, None, Some("secret"), false, &HeaderMap::new(), req).await;
         let err = res.unwrap_err();
         assert_eq!(err.0, StatusCode::UNAUTHORIZED);
         assert_eq!(reg.len().await, 0, "rejected heartbeat must not register");
@@ -293,7 +323,7 @@ mod tests {
             capabilities: sample_caps("a", "1.2.0"),
             timestamp: None,
         };
-        let res = process_heartbeat(&reg, Some("secret"), false, &bearer("wrong"), req).await;
+        let res = process_heartbeat(&reg, None, Some("secret"), false, &bearer("wrong"), req).await;
         assert_eq!(res.unwrap_err().0, StatusCode::UNAUTHORIZED);
     }
 
@@ -304,7 +334,7 @@ mod tests {
             capabilities: sample_caps("a", "1.2.0"),
             timestamp: None,
         };
-        let res = process_heartbeat(&reg, None, false, &HeaderMap::new(), req).await;
+        let res = process_heartbeat(&reg, None, None, false, &HeaderMap::new(), req).await;
         assert_eq!(res.unwrap_err().0, StatusCode::UNAUTHORIZED);
         assert_eq!(reg.len().await, 0);
     }
@@ -316,7 +346,7 @@ mod tests {
             capabilities: sample_caps("citadel-5090", "1.2.0"),
             timestamp: None,
         };
-        let resp = process_heartbeat(&reg, Some("secret"), false, &bearer("secret"), req)
+        let resp = process_heartbeat(&reg, None, Some("secret"), false, &bearer("secret"), req)
             .await
             .unwrap();
         assert!(resp.registered);
@@ -334,7 +364,7 @@ mod tests {
             capabilities: sample_caps("a", "1.2.0"),
             timestamp: None,
         };
-        let resp = process_heartbeat(&reg, Some("secret"), false, &headers, req)
+        let resp = process_heartbeat(&reg, None, Some("secret"), false, &headers, req)
             .await
             .unwrap();
         assert!(resp.registered);
@@ -347,7 +377,7 @@ mod tests {
             capabilities: sample_caps("a", "1.2.0"),
             timestamp: None,
         };
-        let resp = process_heartbeat(&reg, None, true, &HeaderMap::new(), req)
+        let resp = process_heartbeat(&reg, None, None, true, &HeaderMap::new(), req)
             .await
             .unwrap();
         assert!(resp.registered);
@@ -362,11 +392,12 @@ mod tests {
                 capabilities: sample_caps("a", "1.2.0"),
                 timestamp: None,
             };
-            let _ = process_heartbeat(&reg, None, true, &HeaderMap::new(), req).await;
+            let _ = process_heartbeat(&reg, None, None, true, &HeaderMap::new(), req).await;
         }
         // First registers, second updates.
         let resp = process_heartbeat(
             &reg,
+            None,
             None,
             true,
             &HeaderMap::new(),
@@ -391,7 +422,7 @@ mod tests {
             capabilities: sample_caps("bad/id", "1.2.0"),
             timestamp: None,
         };
-        let res = process_heartbeat(&reg, None, true, &HeaderMap::new(), req).await;
+        let res = process_heartbeat(&reg, None, None, true, &HeaderMap::new(), req).await;
         assert_eq!(res.unwrap_err().0, StatusCode::BAD_REQUEST);
         assert_eq!(reg.len().await, 0);
     }
@@ -405,7 +436,7 @@ mod tests {
             capabilities: caps,
             timestamp: None,
         };
-        let res = process_heartbeat(&reg, None, true, &HeaderMap::new(), req).await;
+        let res = process_heartbeat(&reg, None, None, true, &HeaderMap::new(), req).await;
         assert_eq!(res.unwrap_err().0, StatusCode::BAD_REQUEST);
         assert_eq!(reg.len().await, 0);
     }
@@ -417,7 +448,7 @@ mod tests {
             capabilities: sample_caps("a", "1.2.0"),
             timestamp: None,
         };
-        process_heartbeat(&reg, None, true, &HeaderMap::new(), first)
+        process_heartbeat(&reg, None, None, true, &HeaderMap::new(), first)
             .await
             .unwrap();
 
@@ -425,9 +456,119 @@ mod tests {
             capabilities: sample_caps("b", "1.2.0"),
             timestamp: None,
         };
-        let res = process_heartbeat(&reg, None, true, &HeaderMap::new(), second).await;
+        let res = process_heartbeat(&reg, None, None, true, &HeaderMap::new(), second).await;
         assert_eq!(res.unwrap_err().0, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(reg.len().await, 1);
+    }
+
+    fn beat(caps: AgentCapabilities) -> HeartbeatRequest {
+        HeartbeatRequest {
+            capabilities: caps,
+            timestamp: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn first_heartbeat_persists_agent_row() {
+        let reg = NodeRegistry::new(Duration::from_secs(30));
+        let db = NodeDb::open_in_memory().unwrap();
+        let resp = process_heartbeat(
+            &reg,
+            Some(&db),
+            None,
+            true,
+            &HeaderMap::new(),
+            beat(sample_caps("citadel-5090", "1.2.0")),
+        )
+        .await
+        .unwrap();
+        assert!(resp.registered);
+
+        let nodes = db.list_nodes().unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].source, "agent");
+        assert_eq!(nodes[0].status, "online");
+        assert_eq!(nodes[0].agent_version.as_deref(), Some("1.2.0"));
+    }
+
+    #[tokio::test]
+    async fn unchanged_beat_does_not_touch_db() {
+        let reg = NodeRegistry::new(Duration::from_secs(30));
+        let db = NodeDb::open_in_memory().unwrap();
+        process_heartbeat(
+            &reg,
+            Some(&db),
+            None,
+            true,
+            &HeaderMap::new(),
+            beat(sample_caps("a", "1.2.0")),
+        )
+        .await
+        .unwrap();
+
+        // Sentinel: if the handler wrote on this beat, the upsert would flip
+        // the row back to 'online'.
+        db.mark_agent_offline("a").unwrap();
+
+        // Same capability snapshot — steady-state beat must not write.
+        let mut caps = sample_caps("a", "1.2.0");
+        caps.vram_free_mb = 1; // dynamic field churn is not material
+        process_heartbeat(&reg, Some(&db), None, true, &HeaderMap::new(), beat(caps))
+            .await
+            .unwrap();
+
+        let nodes = db.list_nodes().unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(
+            nodes[0].status, "offline",
+            "unchanged beat must not write to SQLite"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_change_beat_updates_db() {
+        let reg = NodeRegistry::new(Duration::from_secs(30));
+        let db = NodeDb::open_in_memory().unwrap();
+        process_heartbeat(
+            &reg,
+            Some(&db),
+            None,
+            true,
+            &HeaderMap::new(),
+            beat(sample_caps("a", "1.2.0")),
+        )
+        .await
+        .unwrap();
+
+        let mut caps = sample_caps("a", "1.2.0");
+        caps.models_loaded = vec!["llama-3-8b".to_string(), "qwen3-32b".to_string()];
+        process_heartbeat(&reg, Some(&db), None, true, &HeaderMap::new(), beat(caps))
+            .await
+            .unwrap();
+
+        let nodes = db.list_nodes().unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(
+            nodes[0].models_loaded,
+            vec!["llama-3-8b".to_string(), "qwen3-32b".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_heartbeat_does_not_persist() {
+        let reg = NodeRegistry::new(Duration::from_secs(30));
+        let db = NodeDb::open_in_memory().unwrap();
+        let res = process_heartbeat(
+            &reg,
+            Some(&db),
+            Some("secret"),
+            false,
+            &HeaderMap::new(),
+            beat(sample_caps("a", "1.2.0")),
+        )
+        .await;
+        assert!(res.is_err());
+        assert!(db.list_nodes().unwrap().is_empty());
     }
 
     #[test]

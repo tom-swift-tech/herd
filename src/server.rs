@@ -516,9 +516,11 @@ impl Server {
 
         // Start agent-node stale eviction (every 10s). Removes agent nodes that
         // have missed heartbeats past the registry TTL so the gateway never routes
-        // to a dead agent. Cheap no-op when no agents are registered.
+        // to a dead agent, and soft-evicts the SQLite row (status='offline') so the
+        // Fleet tab reflects it. Cheap no-op when no agents are registered.
         {
             let registry = Arc::clone(&state.node_registry);
+            let node_db = Arc::clone(&state.node_db);
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(Duration::from_secs(10));
                 loop {
@@ -526,6 +528,43 @@ impl Server {
                     let evicted = registry.evict_stale().await;
                     if !evicted.is_empty() {
                         tracing::info!("Evicted stale agent nodes: {}", evicted.join(", "));
+                        for node_id in &evicted {
+                            if let Err(e) = node_db.mark_agent_offline(node_id) {
+                                tracing::error!(
+                                    "Failed to mark agent node {} offline in SQLite: {}",
+                                    node_id,
+                                    e
+                                );
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        // Start agent-row reaper (hourly). Hard-deletes source='agent' rows that
+        // have sat offline past the grace window (default 24h, override via
+        // HERD_AGENT_REAP_GRACE_SECS). Enrolled rows are never reaped.
+        {
+            const DEFAULT_REAP_GRACE_SECS: u64 = 24 * 3600;
+            let grace_secs = std::env::var("HERD_AGENT_REAP_GRACE_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(DEFAULT_REAP_GRACE_SECS);
+            let node_db = Arc::clone(&state.node_db);
+            tokio::spawn(async move {
+                let grace = Duration::from_secs(grace_secs);
+                let mut ticker = tokio::time::interval(Duration::from_secs(3600));
+                loop {
+                    ticker.tick().await;
+                    match node_db.reap_offline_agents(grace) {
+                        Ok(0) => {}
+                        Ok(n) => tracing::info!(
+                            "Reaped {} agent node row(s) offline longer than {}s",
+                            n,
+                            grace_secs
+                        ),
+                        Err(e) => tracing::error!("Agent node reaper failed: {}", e),
                     }
                 }
             });

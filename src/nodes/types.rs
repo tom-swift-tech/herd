@@ -164,6 +164,19 @@ pub struct Node {
     pub last_health_check: Option<String>,
     pub registered_at: String,
     pub updated_at: String,
+    /// How this node entered the registry: 'enrolled' (herd-tune / manual
+    /// registration) or 'agent' (herd agent heartbeat). Agent rows are
+    /// operator-visibility records — routing for them stays in the in-memory
+    /// `NodeRegistry`.
+    #[serde(default = "default_node_source")]
+    pub source: String,
+    /// Version of the `herd agent` daemon, for `source='agent'` rows only.
+    #[serde(default)]
+    pub agent_version: Option<String>,
+}
+
+fn default_node_source() -> String {
+    "enrolled".to_string()
 }
 
 /// Entry in a node's model registry, derived from model_paths and models_loaded.
@@ -328,6 +341,8 @@ mod tests {
             last_health_check: None,
             registered_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
+            source: "enrolled".to_string(),
+            agent_version: None,
         };
         let registry = node.model_registry();
         // "qwen" should NOT match "qwen3-32b.gguf" (no contains matching)
@@ -382,6 +397,8 @@ mod tests {
             last_health_check: None,
             registered_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
+            source: "enrolled".to_string(),
+            agent_version: None,
         };
         let registry = node.model_registry();
         // Match by filename

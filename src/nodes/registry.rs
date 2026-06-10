@@ -48,7 +48,13 @@ impl AgentState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeartbeatOutcome {
     Registered,
-    Updated,
+    Updated {
+        /// True when this beat's `models_loaded` set differs from the previous
+        /// one. Lets callers persist on material change without diffing state
+        /// themselves (the registry already holds both snapshots under the
+        /// write lock).
+        models_changed: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +75,19 @@ impl std::fmt::Display for RegistryError {
 impl std::error::Error for RegistryError {}
 
 type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
+
+/// Order-insensitive comparison of two `models_loaded` lists. Agents may report
+/// the same set in a different order between beats; that is not a material change.
+fn same_model_set(a: &[String], b: &[String]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut a_sorted: Vec<&str> = a.iter().map(String::as_str).collect();
+    let mut b_sorted: Vec<&str> = b.iter().map(String::as_str).collect();
+    a_sorted.sort_unstable();
+    b_sorted.sort_unstable();
+    a_sorted == b_sorted
+}
 
 #[derive(Clone)]
 pub struct NodeRegistry {
@@ -109,9 +128,11 @@ impl NodeRegistry {
         let node_id = caps.node_id.clone();
         match nodes.get_mut(&node_id) {
             Some(existing) => {
+                let models_changed =
+                    !same_model_set(&existing.capabilities.models_loaded, &caps.models_loaded);
                 existing.capabilities = caps;
                 existing.last_heartbeat = now;
-                Ok(HeartbeatOutcome::Updated)
+                Ok(HeartbeatOutcome::Updated { models_changed })
             }
             None => {
                 if nodes.len() >= self.max_nodes {
@@ -249,8 +270,50 @@ mod tests {
         let (reg, _clock) = registry_with_clock(Duration::from_secs(30));
         reg.heartbeat(sample_caps("a")).await.unwrap();
         let outcome = reg.heartbeat(sample_caps("a")).await.unwrap();
-        assert_eq!(outcome, HeartbeatOutcome::Updated);
+        assert_eq!(
+            outcome,
+            HeartbeatOutcome::Updated {
+                models_changed: false
+            }
+        );
         assert_eq!(reg.len().await, 1);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_reports_models_changed_on_set_difference() {
+        let (reg, _clock) = registry_with_clock(Duration::from_secs(30));
+        reg.heartbeat(sample_caps("a")).await.unwrap();
+
+        let mut caps = sample_caps("a");
+        caps.models_loaded = vec!["llama-3-8b".to_string(), "qwen3-32b".to_string()];
+        let outcome = reg.heartbeat(caps).await.unwrap();
+        assert_eq!(
+            outcome,
+            HeartbeatOutcome::Updated {
+                models_changed: true
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn heartbeat_ignores_model_order_and_dynamic_fields() {
+        let (reg, _clock) = registry_with_clock(Duration::from_secs(30));
+        let mut caps = sample_caps("a");
+        caps.models_loaded = vec!["m1".to_string(), "m2".to_string()];
+        reg.heartbeat(caps).await.unwrap();
+
+        // Same set, different order, different dynamic load — not material.
+        let mut caps = sample_caps("a");
+        caps.models_loaded = vec!["m2".to_string(), "m1".to_string()];
+        caps.vram_free_mb = 1;
+        caps.queue_depth = 99;
+        let outcome = reg.heartbeat(caps).await.unwrap();
+        assert_eq!(
+            outcome,
+            HeartbeatOutcome::Updated {
+                models_changed: false
+            }
+        );
     }
 
     #[tokio::test]
@@ -352,7 +415,12 @@ mod tests {
         reg.heartbeat(sample_caps("a")).await.unwrap();
 
         let outcome = reg.heartbeat(sample_caps("a")).await.unwrap();
-        assert_eq!(outcome, HeartbeatOutcome::Updated);
+        assert_eq!(
+            outcome,
+            HeartbeatOutcome::Updated {
+                models_changed: false
+            }
+        );
         assert_eq!(reg.len().await, 1);
     }
 }

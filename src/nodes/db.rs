@@ -1,3 +1,4 @@
+use super::registry::AgentCapabilities;
 use super::types::*;
 use anyhow::Result;
 use rusqlite::Connection;
@@ -65,6 +66,17 @@ impl NodeDb {
         let db_path = herd_dir.join("herd.db");
         let conn = Connection::open(&db_path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+        let db = Self {
+            conn: Mutex::new(conn),
+        };
+        db.migrate()?;
+        Ok(db)
+    }
+
+    /// In-memory database for unit tests (no filesystem access).
+    #[cfg(test)]
+    pub fn open_in_memory() -> Result<Self> {
+        let conn = Connection::open_in_memory()?;
         let db = Self {
             conn: Mutex::new(conn),
         };
@@ -157,6 +169,14 @@ impl NodeDb {
             );",
         )?;
 
+        // Migration v5: agent-heartbeat node persistence. `source` discriminates
+        // how a node entered the registry; the DEFAULT backfills all existing
+        // rows as 'enrolled'.
+        conn.execute_batch("ALTER TABLE nodes ADD COLUMN source TEXT NOT NULL DEFAULT 'enrolled';")
+            .ok();
+        conn.execute_batch("ALTER TABLE nodes ADD COLUMN agent_version TEXT;")
+            .ok();
+
         Ok(())
     }
 
@@ -204,6 +224,8 @@ impl NodeDb {
             last_health_check: row.get("last_health_check")?,
             registered_at: row.get("registered_at")?,
             updated_at: row.get("updated_at")?,
+            source: row.get("source")?,
+            agent_version: row.get("agent_version")?,
         })
     }
 
@@ -214,7 +236,7 @@ impl NodeDb {
          ollama_version, os, status, priority, enabled, tags, models_available,
          models_loaded, model_paths, capabilities, gpu_driver_version, max_context_len,
          recommended_config, config_applied, last_health_check,
-         registered_at, updated_at";
+         registered_at, updated_at, source, agent_version";
 
     /// Insert or update a node by hostname (idempotent registration).
     /// Returns (node_id, is_new).
@@ -503,6 +525,119 @@ impl NodeDb {
         Ok(nodes)
     }
 
+    // ── Agent-heartbeat node persistence (v1.2) ──────────────────────
+    //
+    // Agent rows (`source='agent'`) are operator-visibility records for the
+    // Fleet tab. Routing/liveness for agents lives in the in-memory
+    // `NodeRegistry`; these rows use status 'online'/'offline' — outside the
+    // 'healthy'/'degraded' set — so `get_routable_nodes()` never picks them up.
+
+    /// Insert or update a `source='agent'` row from a heartbeat capability
+    /// snapshot, keyed on `node_id`. Persists durable fields only — dynamic
+    /// perf data (vram_free, queue_depth, ttft) stays in-memory.
+    /// Returns (row_id, is_new).
+    pub fn upsert_agent_node(&self, caps: &AgentCapabilities) -> Result<(String, bool)> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let models_loaded_json = serde_json::to_string(&caps.models_loaded)?;
+        let backend_str = caps.backend.to_string();
+        let vram_mb = caps.vram_total_mb.min(u32::MAX as u64) as u32;
+
+        let existing_id: Option<String> = conn
+            .query_row(
+                "SELECT id FROM nodes WHERE node_id = ?1 AND source = 'agent'",
+                rusqlite::params![caps.node_id],
+                |row| row.get(0),
+            )
+            .ok();
+
+        if let Some(id) = existing_id {
+            conn.execute(
+                "UPDATE nodes SET
+                    hostname = ?1, ollama_url = ?2, backend_url = ?2, backend = ?3,
+                    gpu_model = ?4, vram_mb = ?5, models_loaded = ?6,
+                    agent_version = ?7, status = 'online', updated_at = ?8
+                WHERE id = ?9",
+                rusqlite::params![
+                    caps.node_id,
+                    caps.address,
+                    backend_str,
+                    caps.gpu_model,
+                    vram_mb,
+                    models_loaded_json,
+                    caps.agent_version,
+                    now,
+                    id
+                ],
+            )?;
+            Ok((id, false))
+        } else {
+            // Agents have no separate hostname — node_id doubles as the
+            // hostname (NOT NULL UNIQUE). The on-disk URL column is the legacy
+            // `ollama_url`; mirror upsert_node and write both it and backend_url.
+            let id = uuid::Uuid::new_v4().to_string();
+            conn.execute(
+                "INSERT INTO nodes (id, node_id, hostname, ollama_url, backend_url, backend,
+                    gpu_model, vram_mb, models_loaded, agent_version,
+                    status, source, registered_at, updated_at)
+                VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?6, ?7, ?8, ?9, 'online', 'agent', ?10, ?10)",
+                rusqlite::params![
+                    id,
+                    caps.node_id,
+                    caps.node_id,
+                    caps.address,
+                    backend_str,
+                    caps.gpu_model,
+                    vram_mb,
+                    models_loaded_json,
+                    caps.agent_version,
+                    now
+                ],
+            )?;
+            Ok((id, true))
+        }
+    }
+
+    /// Mark an agent row offline after in-memory TTL eviction. Soft eviction:
+    /// the row stays for the Fleet tab until the reaper's grace window lapses.
+    /// Returns true if a row was updated.
+    pub fn mark_agent_offline(&self, node_id: &str) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let rows = conn.execute(
+            "UPDATE nodes SET status = 'offline', updated_at = ?1
+             WHERE node_id = ?2 AND source = 'agent'",
+            rusqlite::params![now, node_id],
+        )?;
+        Ok(rows > 0)
+    }
+
+    /// Hard-delete `source='agent'` rows that have been offline longer than
+    /// `grace`. Enrolled rows are never touched. Returns the number deleted.
+    pub fn reap_offline_agents(&self, grace: std::time::Duration) -> Result<usize> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+        let grace = chrono::Duration::from_std(grace)
+            .map_err(|e| anyhow::anyhow!("Invalid reap grace duration: {}", e))?;
+        // `updated_at` was stamped by mark_agent_offline, so it anchors the
+        // start of the offline period. RFC3339 UTC strings compare lexically.
+        let cutoff = (chrono::Utc::now() - grace).to_rfc3339();
+        let rows = conn.execute(
+            "DELETE FROM nodes
+             WHERE source = 'agent' AND status = 'offline' AND updated_at < ?1",
+            rusqlite::params![cutoff],
+        )?;
+        Ok(rows)
+    }
+
     // ── Model download tracking ──────────────────────────────────────
 
     /// Create a new download tracking entry. Returns the download ID.
@@ -632,14 +767,7 @@ mod tests {
     use crate::config::BackendType;
 
     fn test_db() -> NodeDb {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
-            .unwrap();
-        let db = NodeDb {
-            conn: Mutex::new(conn),
-        };
-        db.migrate().unwrap();
-        db
+        NodeDb::open_in_memory().unwrap()
     }
 
     #[test]
@@ -912,12 +1040,188 @@ mod tests {
 
     #[test]
     fn node_columns_count_matches_row_to_node() {
-        // Verify NODE_COLUMNS has exactly 31 columns matching row_to_node expectations
+        // Verify NODE_COLUMNS has exactly 33 columns matching row_to_node expectations
         let col_count = NodeDb::NODE_COLUMNS
             .split(',')
             .filter(|s| !s.trim().is_empty())
             .count();
-        assert_eq!(col_count, 31, "NODE_COLUMNS should have 31 columns");
+        assert_eq!(col_count, 33, "NODE_COLUMNS should have 33 columns");
+    }
+
+    fn sample_agent_caps(node_id: &str) -> AgentCapabilities {
+        AgentCapabilities {
+            node_id: node_id.to_string(),
+            backend: BackendType::LlamaServer,
+            address: "http://10.0.0.5:8080".to_string(),
+            gpu_model: Some("RTX 5090".to_string()),
+            vram_total_mb: 32_768,
+            vram_free_mb: 30_000,
+            models_loaded: vec!["llama-3-8b".to_string()],
+            queue_depth: 3,
+            ttft_p50_ms: Some(42),
+            rpc_capable: false,
+            rpc_port: None,
+            agent_version: "1.2.0".to_string(),
+        }
+    }
+
+    /// Re-stamp an agent row's updated_at so reaper tests can age it without
+    /// sleeping.
+    fn backdate_agent(db: &NodeDb, node_id: &str, secs_ago: i64) {
+        let ts = (chrono::Utc::now() - chrono::Duration::seconds(secs_ago)).to_rfc3339();
+        let conn = db.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE nodes SET updated_at = ?1 WHERE node_id = ?2",
+            rusqlite::params![ts, node_id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn migrate_v5_backfills_existing_rows_as_enrolled() {
+        let db = test_db();
+        let reg = NodeRegistration {
+            hostname: "legacy-node".to_string(),
+            ollama_url: "http://legacy:11434".to_string(),
+            ..Default::default()
+        };
+        let (id, _) = db.upsert_node(&reg).unwrap();
+
+        // Re-running migrations must be safe and must not disturb the row.
+        db.migrate().unwrap();
+
+        let node = db.get_node(&id).unwrap().unwrap();
+        assert_eq!(node.source, "enrolled");
+        assert!(node.agent_version.is_none());
+    }
+
+    #[test]
+    fn upsert_agent_node_round_trip() {
+        let db = test_db();
+        let (id, is_new) = db
+            .upsert_agent_node(&sample_agent_caps("citadel-5090"))
+            .unwrap();
+        assert!(is_new);
+
+        let node = db.get_node(&id).unwrap().unwrap();
+        assert_eq!(node.source, "agent");
+        assert_eq!(node.status, "online");
+        assert_eq!(node.node_id.as_deref(), Some("citadel-5090"));
+        assert_eq!(node.hostname, "citadel-5090");
+        assert_eq!(node.backend_url, "http://10.0.0.5:8080");
+        assert_eq!(node.backend, BackendType::LlamaServer);
+        assert_eq!(node.gpu_model.as_deref(), Some("RTX 5090"));
+        assert_eq!(node.vram_mb, 32_768);
+        assert_eq!(node.models_loaded, vec!["llama-3-8b"]);
+        assert_eq!(node.agent_version.as_deref(), Some("1.2.0"));
+    }
+
+    #[test]
+    fn upsert_agent_node_is_idempotent_and_updates() {
+        let db = test_db();
+        let (id1, new1) = db.upsert_agent_node(&sample_agent_caps("node-a")).unwrap();
+        assert!(new1);
+
+        let mut caps = sample_agent_caps("node-a");
+        caps.models_loaded = vec!["qwen3-32b".to_string()];
+        caps.agent_version = "1.2.1".to_string();
+        let (id2, new2) = db.upsert_agent_node(&caps).unwrap();
+        assert!(!new2);
+        assert_eq!(id1, id2);
+
+        let node = db.get_node(&id2).unwrap().unwrap();
+        assert_eq!(node.models_loaded, vec!["qwen3-32b"]);
+        assert_eq!(node.agent_version.as_deref(), Some("1.2.1"));
+        assert_eq!(node.status, "online");
+    }
+
+    #[test]
+    fn agent_nodes_are_never_routable() {
+        let db = test_db();
+        db.upsert_agent_node(&sample_agent_caps("node-a")).unwrap();
+        // status='online' is outside the 'healthy'/'degraded' routable set.
+        assert!(db.get_routable_nodes().unwrap().is_empty());
+    }
+
+    #[test]
+    fn mark_agent_offline_flips_status_and_scopes_to_agents() {
+        let db = test_db();
+        db.upsert_agent_node(&sample_agent_caps("node-a")).unwrap();
+        assert!(db.mark_agent_offline("node-a").unwrap());
+
+        let nodes = db.list_nodes().unwrap();
+        assert_eq!(nodes[0].status, "offline");
+
+        // Unknown node: no-op.
+        assert!(!db.mark_agent_offline("ghost").unwrap());
+
+        // Enrolled node with the same node_id is untouched.
+        let reg = NodeRegistration {
+            hostname: "enrolled-host".to_string(),
+            node_id: Some("enrolled-nid".to_string()),
+            ollama_url: "http://enrolled:11434".to_string(),
+            ..Default::default()
+        };
+        let (eid, _) = db.upsert_node(&reg).unwrap();
+        assert!(!db.mark_agent_offline("enrolled-nid").unwrap());
+        assert_eq!(db.get_node(&eid).unwrap().unwrap().status, "healthy");
+    }
+
+    #[test]
+    fn agent_re_heartbeat_after_offline_comes_back_online() {
+        let db = test_db();
+        let (id, _) = db.upsert_agent_node(&sample_agent_caps("node-a")).unwrap();
+        db.mark_agent_offline("node-a").unwrap();
+        let (id2, is_new) = db.upsert_agent_node(&sample_agent_caps("node-a")).unwrap();
+        assert!(!is_new);
+        assert_eq!(id, id2);
+        assert_eq!(db.get_node(&id).unwrap().unwrap().status, "online");
+    }
+
+    #[test]
+    fn reaper_deletes_only_stale_offline_agents() {
+        let db = test_db();
+        let grace = std::time::Duration::from_secs(3600);
+
+        // Stale offline agent — should be reaped.
+        db.upsert_agent_node(&sample_agent_caps("stale-agent"))
+            .unwrap();
+        db.mark_agent_offline("stale-agent").unwrap();
+        backdate_agent(&db, "stale-agent", 7200);
+
+        // Fresh offline agent — inside grace, kept.
+        db.upsert_agent_node(&sample_agent_caps("fresh-agent"))
+            .unwrap();
+        db.mark_agent_offline("fresh-agent").unwrap();
+
+        // Online agent — kept regardless of age.
+        db.upsert_agent_node(&sample_agent_caps("online-agent"))
+            .unwrap();
+        backdate_agent(&db, "online-agent", 7200);
+
+        // Enrolled node — never reaped, even if ancient.
+        let reg = NodeRegistration {
+            hostname: "enrolled-host".to_string(),
+            node_id: Some("enrolled-nid".to_string()),
+            ollama_url: "http://enrolled:11434".to_string(),
+            ..Default::default()
+        };
+        db.upsert_node(&reg).unwrap();
+        backdate_agent(&db, "enrolled-nid", 999_999);
+
+        let reaped = db.reap_offline_agents(grace).unwrap();
+        assert_eq!(reaped, 1);
+
+        let remaining: Vec<String> = db
+            .list_nodes()
+            .unwrap()
+            .into_iter()
+            .map(|n| n.hostname)
+            .collect();
+        assert!(!remaining.contains(&"stale-agent".to_string()));
+        assert!(remaining.contains(&"fresh-agent".to_string()));
+        assert!(remaining.contains(&"online-agent".to_string()));
+        assert!(remaining.contains(&"enrolled-host".to_string()));
     }
 
     #[test]

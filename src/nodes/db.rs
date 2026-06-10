@@ -495,12 +495,18 @@ impl NodeDb {
     }
 
     /// Get nodes that should be health-checked (enabled, not disabled by operator).
+    /// Agent rows are excluded: their liveness comes from heartbeats via the
+    /// in-memory `NodeRegistry`, and only `upsert_agent_node`/`mark_agent_offline`
+    /// may mutate their status ('online'/'offline').
     pub fn get_pollable_nodes(&self) -> Result<Vec<Node>> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
-        let sql = format!("SELECT {} FROM nodes WHERE enabled = 1", Self::NODE_COLUMNS);
+        let sql = format!(
+            "SELECT {} FROM nodes WHERE enabled = 1 AND source != 'agent'",
+            Self::NODE_COLUMNS
+        );
         let mut stmt = conn.prepare(&sql)?;
         let nodes = stmt
             .query_map([], Self::row_to_node)?
@@ -509,13 +515,16 @@ impl NodeDb {
     }
 
     /// Get nodes eligible for routing (enabled + healthy/degraded).
+    /// Agent rows are excluded by construction — agent routability is decided
+    /// by the in-memory `NodeRegistry` (PR #7), never by this SQLite path,
+    /// regardless of what status the row carries.
     pub fn get_routable_nodes(&self) -> Result<Vec<Node>> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
         let sql = format!(
-            "SELECT {} FROM nodes WHERE enabled = 1 AND status IN ('healthy', 'degraded') ORDER BY priority ASC",
+            "SELECT {} FROM nodes WHERE enabled = 1 AND status IN ('healthy', 'degraded') AND source != 'agent' ORDER BY priority ASC",
             Self::NODE_COLUMNS
         );
         let mut stmt = conn.prepare(&sql)?;
@@ -529,8 +538,11 @@ impl NodeDb {
     //
     // Agent rows (`source='agent'`) are operator-visibility records for the
     // Fleet tab. Routing/liveness for agents lives in the in-memory
-    // `NodeRegistry`; these rows use status 'online'/'offline' — outside the
-    // 'healthy'/'degraded' set — so `get_routable_nodes()` never picks them up.
+    // `NodeRegistry`. These rows use status 'online'/'offline', and both
+    // `get_pollable_nodes()` and `get_routable_nodes()` exclude them by
+    // `source` explicitly — the health poller never touches them, and they
+    // can never enter the static routing pool even if a row's status is
+    // corrupted (e.g. by `update_node(enabled=true)` setting 'healthy').
 
     /// Insert or update a `source='agent'` row from a heartbeat capability
     /// snapshot, keyed on `node_id`. Persists durable fields only — dynamic
@@ -1138,9 +1150,41 @@ mod tests {
     #[test]
     fn agent_nodes_are_never_routable() {
         let db = test_db();
-        db.upsert_agent_node(&sample_agent_caps("node-a")).unwrap();
+        let (id, _) = db.upsert_agent_node(&sample_agent_caps("node-a")).unwrap();
         // status='online' is outside the 'healthy'/'degraded' routable set.
         assert!(db.get_routable_nodes().unwrap().is_empty());
+
+        // Decision 12 must hold even if the row's status is corrupted:
+        // update_node(enabled=true) sets status='healthy' on any row, which
+        // before the explicit source guard would have made the agent routable.
+        let update = NodeUpdate {
+            priority: None,
+            tags: None,
+            enabled: Some(true),
+        };
+        assert!(db.update_node(&id, &update).unwrap());
+        assert_eq!(db.get_node(&id).unwrap().unwrap().status, "healthy");
+        assert!(db.get_routable_nodes().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pollable_nodes_exclude_agent_rows() {
+        let db = test_db();
+        db.upsert_agent_node(&sample_agent_caps("agent-node"))
+            .unwrap();
+        let reg = NodeRegistration {
+            hostname: "enrolled-node".to_string(),
+            ollama_url: "http://enrolled:11434".to_string(),
+            ..Default::default()
+        };
+        db.upsert_node(&reg).unwrap();
+
+        // The health poller must never pick up agent rows: polling would flip
+        // their status into the 'healthy'/'degraded' lifecycle, breaking the
+        // 'online'/'offline' contract owned by upsert_agent_node/mark_agent_offline.
+        let pollable = db.get_pollable_nodes().unwrap();
+        assert_eq!(pollable.len(), 1);
+        assert_eq!(pollable[0].hostname, "enrolled-node");
     }
 
     #[test]

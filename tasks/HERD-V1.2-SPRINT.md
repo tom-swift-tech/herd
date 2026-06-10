@@ -19,8 +19,9 @@
 | #3 | Gateway heartbeat ingestion | `NodeRegistry` onto `AppState`; stale-eviction background task; `POST /api/internal/nodes/heartbeat` with `HERD_AGENT_TOKEN` bearer auth; heartbeat protocol tests | ✅ landed |
 | #4 | `herd agent` CLI + daemon | Restructure CLI into `serve`/`agent` subcommands; `src/daemon/` (heartbeat client, capability detection, lifecycle); single-node deployment | ✅ landed |
 | #5 | Agent node persistence + Fleet | Migration v5 (`source`, `agent_version`); write-through on transition; soft-evict (mark offline) + reaper for stale agent rows; Fleet tab reads unified SQLite store | ✅ |
+| #5.1 | Hard-exclude agent rows from poller + SQLite routing | Live-test fix: `get_pollable_nodes` and `get_routable_nodes` now filter `source != 'agent'` explicitly. Previously the health poller picked up agent rows (`enabled=1`), `update_health` flipped them 'online'→'healthy', and they entered the routable pool — decision 12 was implied by status convention, never enforced. Also closes the `update_node(enabled=true)` side door that sets `status='healthy'` on any row. | ✅ |
 | #6 | Heartbeat protocol hardening | Version-skew handling, deployments-assigned response plumbing, configurable TTL/cadence | ⬜ |
-| #7 | `BackendPool` integration | Agent-registered nodes route identically to static backends; `NodeRegistry::find_for_model()`; conflict resolution (agent overrides static only on exact node-identity match) | ⬜ |
+| #7 | `BackendPool` integration | Agent-registered nodes route identically to static backends; `NodeRegistry::find_for_model()`; conflict resolution (agent overrides static only on exact node-identity match). **Note (PR #5.1):** agents are now hard-excluded from `get_routable_nodes` by `source`; PR #7 must source agent routability from the in-memory registry's heartbeat freshness, not by falling through the SQLite pool path. | ⬜ |
 | #8 | Integration test + smoke | Gateway + 1 agent in same process; request routes through agent's (stub) llama-server end-to-end | ⬜ |
 
 ---
@@ -87,6 +88,10 @@ Locked decisions (extend the list above):
     routable set ('online'/'offline', never 'healthy'/'degraded'), so
     `get_routable_nodes()` cannot pull an agent node into the static routing path before
     PR #7 wires it deliberately through the in-memory registry.
+    *Hardened in PR #5.1:* the status convention alone didn't enforce this — the health
+    poller polled agent rows and flipped them 'healthy'. Both `get_pollable_nodes()` and
+    `get_routable_nodes()` now exclude `source='agent'` explicitly, so the exclusion holds
+    by construction regardless of a row's status.
 13. **Persist durable fields only.** Map node_id→node_id (and hostname, since hostname is
     NOT NULL UNIQUE and agents have no separate hostname), address→backend_url (on-disk
     column is the legacy `ollama_url` — mirror existing `upsert_node`), backend, gpu_model,

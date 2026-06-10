@@ -1074,6 +1074,8 @@ mod tests {
             rpc_capable: false,
             rpc_port: None,
             agent_version: "1.2.0".to_string(),
+            os: Some("linux".to_string()),
+            arch: Some("x86_64".to_string()),
         }
     }
 

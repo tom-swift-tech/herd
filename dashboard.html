@@ -901,6 +901,8 @@ Content-Type: application/json
                             <tr class="admin-row"><td>Add backend</td><td>POST</td><td><code>/admin/backends</code></td><td>Yes</td></tr>
                             <tr class="admin-row"><td>Reload config</td><td>POST</td><td><code>/admin/reload</code></td><td>Yes</td></tr>
                             <tr class="admin-row"><td>Self-update</td><td>POST</td><td><code>/admin/update</code></td><td>Yes</td></tr>
+                            <tr class="admin-row"><td>Agent heartbeat (herd agent daemons only)</td><td>POST</td><td><code>/api/internal/nodes/heartbeat</code></td><td>Yes</td></tr>
+                            <tr class="admin-row"><td>Agent binary download (herd agent self-update)</td><td>GET</td><td><code>/api/internal/nodes/binary/{version}/{os}-{arch}</code></td><td>Yes</td></tr>
                         </tbody>
                     </table>
                 </div>

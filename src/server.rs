@@ -139,6 +139,9 @@ pub struct AppState {
     /// Populated by agent heartbeats; distinct from `node_db` (operator-managed,
     /// SQLite-persisted). Liveness is TTL-based via stale eviction.
     pub node_registry: Arc<crate::nodes::NodeRegistry>,
+    /// sha256 cache over published agent binaries (fleet version authority,
+    /// v1.2 PR #6). The publish dir itself is read from config per request.
+    pub binary_store: Arc<crate::nodes::BinaryStore>,
     pub budget: Arc<crate::budget::BudgetTracker>,
     pub rate_limiter: Arc<tokio::sync::RwLock<crate::rate_limit::RateLimiter>>,
     pub frontier_rate_limiter:
@@ -484,6 +487,7 @@ impl Server {
             metrics,
             node_db,
             node_registry,
+            binary_store: Arc::new(crate::nodes::BinaryStore::new()),
             budget,
             rate_limiter,
             frontier_rate_limiter,
@@ -606,6 +610,12 @@ impl Server {
             .route(
                 "/api/internal/nodes/heartbeat",
                 axum::routing::post(crate::api::internal::heartbeat),
+            )
+            // Published agent-binary download (same HERD_AGENT_TOKEN bearer
+            // auth as the heartbeat — `herd agent` self-update path, PR #6)
+            .route(
+                "/api/internal/nodes/binary/:version/:platform",
+                axum::routing::get(crate::api::internal::download_binary),
             )
             // Node management (public — dashboard uses these)
             .route(
@@ -2169,7 +2179,13 @@ async fn skills_handler(
             "agent_heartbeat": {
                 "method": "POST",
                 "path": "/api/internal/nodes/heartbeat",
-                "description": "Internal herd agent daemon heartbeat; not for client chat agents",
+                "description": "Internal herd agent daemon heartbeat; not for client chat agents. Response advertises target_version plus download_url/sha256 when a binary is published for the agent's platform",
+                "auth": true
+            },
+            "agent_binary_download": {
+                "method": "GET",
+                "path": "/api/internal/nodes/binary/{version}/{os}-{arch}",
+                "description": "Internal herd agent self-update download of a published binary; responds with X-Herd-Sha256. Not for client chat agents",
                 "auth": true
             }
         },
@@ -2177,7 +2193,7 @@ async fn skills_handler(
             "X-Herd-Tags": "Comma-separated tags to target specific backends (e.g. 'gpu,fast')",
             "X-Request-Id": "Correlation ID — send your own or Herd generates a UUID v4",
             "X-API-Key": "Required for admin endpoints only",
-            "Authorization: Bearer <HERD_AGENT_TOKEN>": "Required for /api/internal/nodes/heartbeat"
+            "Authorization: Bearer <HERD_AGENT_TOKEN>": "Required for /api/internal/nodes/* endpoints"
         },
         "best_practices": [
             "Always specify 'model' in requests for optimal routing",
@@ -2291,6 +2307,7 @@ mod tests {
             metrics: Arc::new(crate::metrics::Metrics::new()),
             node_db: Arc::new(crate::nodes::NodeDb::open().unwrap()),
             node_registry: Arc::new(crate::nodes::NodeRegistry::new(Duration::from_secs(30))),
+            binary_store: Arc::new(crate::nodes::BinaryStore::new()),
             budget: crate::budget::BudgetTracker::new(initial.budget.clone()),
             rate_limiter: Arc::new(tokio::sync::RwLock::new(
                 crate::rate_limit::RateLimiter::new(&initial.rate_limiting),

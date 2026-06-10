@@ -239,6 +239,10 @@ impl SnapshotBuilder {
             rpc_capable: false, // v1.4 (pipeline parallel)
             rpc_port: None,
             agent_version: AGENT_VERSION.to_string(),
+            // Reported so the gateway can offer the right published binary
+            // when this agent is behind the fleet target version (PR #6).
+            os: Some(std::env::consts::OS.to_string()),
+            arch: Some(std::env::consts::ARCH.to_string()),
         }
     }
 }
@@ -355,6 +359,8 @@ mod tests {
         assert_eq!(caps.models_loaded, vec!["qwen3-32b"]);
         assert_eq!(caps.agent_version, AGENT_VERSION);
         assert!(!caps.rpc_capable);
+        assert_eq!(caps.os.as_deref(), Some(std::env::consts::OS));
+        assert_eq!(caps.arch.as_deref(), Some(std::env::consts::ARCH));
     }
 
     #[test]

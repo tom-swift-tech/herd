@@ -47,6 +47,9 @@ pub struct Config {
     pub discovery: DiscoveryConfig,
 
     #[serde(default)]
+    pub fleet: FleetConfig,
+
+    #[serde(default)]
     pub frontier: FrontierConfig,
 
     #[serde(default)]
@@ -635,6 +638,79 @@ impl Default for DiscoveryConfig {
     }
 }
 
+/// Fleet version authority (v1.2 PR #6): the gateway declares the version
+/// agents should run and serves published agent binaries. Advertising a target
+/// alone never triggers an update — a binary must also be published under
+/// `publish_dir` for the target version and the agent's platform, so promoting
+/// a build is always a deliberate act, not a side effect of restarting `serve`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FleetConfig {
+    /// Version agents should self-update to. Defaults to the gateway's own
+    /// version; set this (or HERD_TARGET_AGENT_VERSION, which wins over
+    /// config) so a mid-debug gateway build never becomes the fleet target.
+    #[serde(default)]
+    pub target_agent_version: Option<String>,
+
+    /// Directory of published agent binaries, laid out as
+    /// `{publish_dir}/{version}/{os}-{arch}/herd[.exe]`.
+    /// Env override: HERD_AGENT_PUBLISH_DIR. Default: `~/.herd/binaries`.
+    #[serde(default)]
+    pub publish_dir: Option<String>,
+
+    /// Base URL agents download binaries from. Unset (default) means the
+    /// gateway serves them itself and builds the URL from the heartbeat
+    /// request's Host header. Point this at an external host (e.g. GitHub
+    /// release assets) to hand off downloads with no agent-side change —
+    /// agents treat the URL as opaque.
+    #[serde(default)]
+    pub download_url_base: Option<String>,
+}
+
+impl FleetConfig {
+    /// Effective target agent version: env (HERD_TARGET_AGENT_VERSION) wins
+    /// over config, which wins over the gateway's own build version.
+    pub fn resolved_target_version(&self) -> String {
+        Self::target_version_from(
+            std::env::var("HERD_TARGET_AGENT_VERSION").ok().as_deref(),
+            self.target_agent_version.as_deref(),
+        )
+    }
+
+    /// Env-injectable core of [`resolved_target_version`] so tests don't race
+    /// on process-global env vars.
+    pub fn target_version_from(env: Option<&str>, config: Option<&str>) -> String {
+        env.map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or_else(|| config.map(str::trim).filter(|s| !s.is_empty()))
+            .unwrap_or(env!("CARGO_PKG_VERSION"))
+            .to_string()
+    }
+
+    /// Effective publish directory: env (HERD_AGENT_PUBLISH_DIR) wins over
+    /// config, which wins over `~/.herd/binaries`.
+    pub fn resolved_publish_dir(&self) -> std::path::PathBuf {
+        Self::publish_dir_from(
+            std::env::var("HERD_AGENT_PUBLISH_DIR").ok().as_deref(),
+            self.publish_dir.as_deref(),
+        )
+    }
+
+    /// Env-injectable core of [`resolved_publish_dir`].
+    pub fn publish_dir_from(env: Option<&str>, config: Option<&str>) -> std::path::PathBuf {
+        if let Some(dir) = env
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or_else(|| config.map(str::trim).filter(|s| !s.is_empty()))
+        {
+            return std::path::PathBuf::from(dir);
+        }
+        dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".herd")
+            .join("binaries")
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StaticNodeConfig {
     /// URL of the remote node's API (e.g., "http://192.168.1.100:8090")
@@ -822,6 +898,23 @@ impl Config {
     }
 
     pub fn validate(&mut self) -> Result<()> {
+        // Validate fleet.target_agent_version: it is used as a path component
+        // under publish_dir, so restrict to a version-shaped charset. Bad
+        // values warn and fall back to the gateway's own version (never bail).
+        if let Some(v) = &self.fleet.target_agent_version {
+            let v = v.trim();
+            let version_shaped = !v.is_empty()
+                && v.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+'));
+            if !version_shaped {
+                tracing::warn!(
+                    "fleet.target_agent_version '{}' is not a valid version string - ignoring (gateway's own version will be advertised)",
+                    v
+                );
+                self.fleet.target_agent_version = None;
+            }
+        }
+
         // Validate model_warmer interval. A value of 0 disables the warmer.
         if self.model_warmer.interval_secs > 0 && self.model_warmer.interval_secs < 10 {
             tracing::warn!(
@@ -934,6 +1027,71 @@ mod tests {
     #[test]
     fn parse_duration_millis() {
         assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
+    }
+
+    #[test]
+    fn fleet_section_defaults_to_unset() {
+        let config: Config = serde_yaml::from_str("{}").unwrap();
+        assert!(config.fleet.target_agent_version.is_none());
+        assert!(config.fleet.publish_dir.is_none());
+        assert!(config.fleet.download_url_base.is_none());
+    }
+
+    #[test]
+    fn fleet_target_version_resolution_order() {
+        use super::FleetConfig;
+        // env wins over config wins over own version
+        assert_eq!(
+            FleetConfig::target_version_from(Some("1.3.0"), Some("1.2.5")),
+            "1.3.0"
+        );
+        assert_eq!(
+            FleetConfig::target_version_from(None, Some("1.2.5")),
+            "1.2.5"
+        );
+        assert_eq!(
+            FleetConfig::target_version_from(None, None),
+            env!("CARGO_PKG_VERSION")
+        );
+        // empty/whitespace values are treated as unset
+        assert_eq!(
+            FleetConfig::target_version_from(Some("  "), Some("")),
+            env!("CARGO_PKG_VERSION")
+        );
+    }
+
+    #[test]
+    fn fleet_publish_dir_resolution_order() {
+        use super::FleetConfig;
+        assert_eq!(
+            FleetConfig::publish_dir_from(Some("/srv/bin"), Some("/cfg/bin")),
+            std::path::PathBuf::from("/srv/bin")
+        );
+        assert_eq!(
+            FleetConfig::publish_dir_from(None, Some("/cfg/bin")),
+            std::path::PathBuf::from("/cfg/bin")
+        );
+        let default = FleetConfig::publish_dir_from(None, None);
+        assert!(default.ends_with(std::path::Path::new(".herd/binaries")));
+    }
+
+    #[test]
+    fn fleet_invalid_target_version_warns_and_clears() {
+        let yaml = "fleet:\n  target_agent_version: \"../../etc\"\n";
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        config.validate().unwrap();
+        assert!(config.fleet.target_agent_version.is_none());
+    }
+
+    #[test]
+    fn fleet_valid_target_version_survives_validate() {
+        let yaml = "fleet:\n  target_agent_version: \"1.2.0-rc.1\"\n";
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        config.validate().unwrap();
+        assert_eq!(
+            config.fleet.target_agent_version.as_deref(),
+            Some("1.2.0-rc.1")
+        );
     }
 
     #[test]

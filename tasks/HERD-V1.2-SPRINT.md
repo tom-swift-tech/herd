@@ -2,7 +2,7 @@
 
 **Spec:** `docs/specs/v2-distributed-inference-spec.md`
 **Target:** v1.2 (foundation) — `herd agent` ships, single-node deployments only. No speculative, no pipeline.
-**Status:** PRs #1–#5 landed of 8 (last reconciled with implementation: 2026-06-10)
+**Status:** PRs #1–#5.1 and #6a landed; #6b/#6c next (last reconciled with implementation: 2026-06-10)
 
 > This doc tracks the PR breakdown and acceptance checklist for the v1.2 milestone.
 > The architecture, data structures, and rationale live in the spec — this is the
@@ -20,7 +20,9 @@
 | #4 | `herd agent` CLI + daemon | Restructure CLI into `serve`/`agent` subcommands; `src/daemon/` (heartbeat client, capability detection, lifecycle); single-node deployment | ✅ landed |
 | #5 | Agent node persistence + Fleet | Migration v5 (`source`, `agent_version`); write-through on transition; soft-evict (mark offline) + reaper for stale agent rows; Fleet tab reads unified SQLite store | ✅ |
 | #5.1 | Hard-exclude agent rows from poller + SQLite routing | Live-test fix: `get_pollable_nodes` and `get_routable_nodes` now filter `source != 'agent'` explicitly. Previously the health poller picked up agent rows (`enabled=1`), `update_health` flipped them 'online'→'healthy', and they entered the routable pool — decision 12 was implied by status convention, never enforced. Also closes the `update_node(enabled=true)` side door that sets `status='healthy'` on any row. | ✅ |
-| #6 | Heartbeat protocol hardening | Version-skew handling, deployments-assigned response plumbing, configurable TTL/cadence | ⬜ |
+| #6a | Gateway version authority | Reshaped scope (supersedes "heartbeat protocol hardening" — the old "deployments-assigned plumbing" line is folded into this response-channel work). `fleet:` config (`target_agent_version`, `publish_dir`, `download_url_base`); agents report `os`/`arch`; `BinaryStore` (sha256 cache over `{publish_dir}/{version}/{os}-{arch}/herd[.exe]`); heartbeat response gains `target_version` + `download_url`/`sha256` when a binary is published for the agent's platform; authed `GET /api/internal/nodes/binary/:version/:platform`. | ✅ |
+| #6b | Agent self-update | Agent acts on the heartbeat offer: download → verify sha256 (abort + keep running on mismatch) → self-replace → restart (Windows-safe swap via `self_replace`); `updating` registry state with eviction grace so the restart gap never looks like node death; persist `agent_version` change on re-register. | ⬜ |
+| #6c | `herd publish` helper | Thin promote step: copy a binary into the publish-dir layout for an os/arch, print its sha256 and a reminder to bump `fleet.target_agent_version` (config hot-reload picks it up). Docs for the manual drop-in flow. | ⬜ |
 | #7 | `BackendPool` integration | Agent-registered nodes route identically to static backends; `NodeRegistry::find_for_model()`; conflict resolution (agent overrides static only on exact node-identity match). **Note (PR #5.1):** agents are now hard-excluded from `get_routable_nodes` by `source`; PR #7 must source agent routability from the in-memory registry's heartbeat freshness, not by falling through the SQLite pool path. | ⬜ |
 | #8 | Integration test + smoke | Gateway + 1 agent in same process; request routes through agent's (stub) llama-server end-to-end | ⬜ |
 
@@ -99,6 +101,44 @@ Locked decisions (extend the list above):
     (vram_free, queue_depth, ttft_p50) stay in-memory only — routing inputs, not records.
 14. **No agent/enrolled merge in v1.2.** If one physical host is both enrolled and running
     an agent, two rows coexist (different hostname/source). Dedup deferred.
+
+---
+
+## PR #6 — Gateway Version Authority + Agent Self-Update (reshaped scope)
+
+Supersedes the original "heartbeat protocol hardening" framing. The gateway is the fleet's
+version authority: it advertises a target agent version on every heartbeat and serves
+published binaries; agents self-update to the declared target. Split into three stacked
+PRs (#6a gateway, #6b agent, #6c publish helper).
+
+Locked decisions (extend the list above):
+
+15. **Model A with an opaque download source.** The gateway serves the binary itself
+    (no GitHub-release dependency for dev), but the agent treats `download_url` as
+    opaque — pointing `fleet.download_url_base` at an external host (Model B) later
+    requires no agent change. With an external base, the sha256 still comes from the
+    gateway's local publish dir: the local copy is the source of truth for what was
+    promoted.
+16. **The fleet target is a SET value.** `fleet.target_agent_version` defaults to the
+    gateway's own version, overridable via config or `HERD_TARGET_AGENT_VERSION` (env
+    wins). Advertising alone can't push an update: an offer is only attached when a
+    binary is actually published under `publish_dir` for the target version and the
+    agent's platform — promotion is the deliberate act of publishing, never a side
+    effect of restarting `serve`.
+17. **Gateway advertises, agent decides.** The response always carries `target_version`;
+    the gateway never rejects heartbeats from out-of-date agents (that would brick the
+    fleet during every update window). Version comparison happens agent-side (#6b).
+18. **sha256 verify before swap is mandatory** (#6b). Covers corrupt/MITM transfer; does
+    not pretend to solve a malicious gateway (out of scope on a self-hosted control
+    plane). A mismatch aborts the update; the agent keeps running and heartbeating.
+19. **Download URL derivation.** Gateway-served URLs are built from the heartbeat
+    request's Host header — the address the agent demonstrably reached. No Host header
+    (or TLS termination in front) → set `fleet.download_url_base` explicitly. Old
+    agents that don't report `os`/`arch` get the target advertised but never an offer.
+20. **'updating' registry state** (#6b). Before restarting for an update the agent flags
+    its final beat; the evictor grants a longer grace (`HERD_AGENT_UPDATE_GRACE_SECS`)
+    so the restart gap is never reported as node death, and the re-registered beat's
+    changed `agent_version` is persisted to SQLite.
 
 ---
 

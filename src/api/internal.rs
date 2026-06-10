@@ -16,7 +16,9 @@
 //! required by default. Local self-tests can opt into an unauthenticated mode by
 //! setting `HERD_ALLOW_UNAUTHENTICATED_AGENT_HEARTBEAT=true`.
 
-use crate::nodes::{AgentCapabilities, HeartbeatOutcome, NodeDb, NodeRegistry};
+use crate::nodes::{
+    binary_store, AgentCapabilities, BinaryStore, HeartbeatOutcome, NodeDb, NodeRegistry,
+};
 use crate::server::{constant_time_eq, AppState};
 use axum::{
     extract::State,
@@ -24,7 +26,9 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// Default cadence the gateway asks agents to heartbeat at, in seconds.
 const DEFAULT_HEARTBEAT_SECS: u64 = 2;
@@ -55,6 +59,82 @@ pub struct HeartbeatResponse {
     pub deployments_assigned: Vec<serde_json::Value>,
     /// Cadence the agent should heartbeat at next, in seconds.
     pub next_heartbeat_secs: u64,
+    /// Version the gateway wants agents to run (fleet version authority,
+    /// PR #6). Always advertised; the agent decides whether to act.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_version: Option<String>,
+    /// Where to download the `target_version` binary for this agent's
+    /// platform. Present only when a binary is actually published for the
+    /// agent's reported os/arch. Opaque to the agent — may point at the
+    /// gateway's own serve endpoint or any external host.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub download_url: Option<String>,
+    /// Hex sha256 of the published binary; the agent must verify before
+    /// swapping. Present iff `download_url` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+}
+
+/// Resolved fleet-update inputs for one heartbeat: the version authority's
+/// target plus where published binaries live. Built per-request from the
+/// config snapshot (so config hot-reload takes effect without restart);
+/// `None` in `process_heartbeat` means "no update advertising" (unit tests).
+pub struct UpdateContext {
+    pub target_version: String,
+    pub publish_dir: PathBuf,
+    pub download_url_base: Option<String>,
+    pub store: Arc<BinaryStore>,
+}
+
+impl UpdateContext {
+    pub fn from_config(fleet: &crate::config::FleetConfig, store: Arc<BinaryStore>) -> Self {
+        Self {
+            target_version: fleet.resolved_target_version(),
+            publish_dir: fleet.resolved_publish_dir(),
+            download_url_base: fleet
+                .download_url_base
+                .as_deref()
+                .map(|s| s.trim_end_matches('/').to_string())
+                .filter(|s| !s.is_empty()),
+            store,
+        }
+    }
+
+    /// Compute the (download_url, sha256) pair for an agent's platform, or
+    /// `None` when the agent didn't report os/arch or no binary is published
+    /// for the target version on that platform. The sha always comes from the
+    /// gateway's local publish dir — even with an external download base, the
+    /// local copy is the source of truth for what was promoted.
+    async fn offer_for(
+        &self,
+        caps: &AgentCapabilities,
+        host: Option<&str>,
+    ) -> Option<(String, String)> {
+        let os = caps.os.as_deref()?;
+        let arch = caps.arch.as_deref()?;
+        let path = binary_store::binary_path(&self.publish_dir, &self.target_version, os, arch)?;
+        let sha256 = self.store.sha256_async(path).await?;
+        let url = match &self.download_url_base {
+            // External base mirrors the publish-dir layout (static host, S3
+            // sync, ...). Model B (e.g. GitHub release assets) swaps this for
+            // a templated base later — agents treat the URL as opaque.
+            Some(base) => {
+                let file = if os == "windows" { "herd.exe" } else { "herd" };
+                format!("{base}/{}/{os}-{arch}/{file}", self.target_version)
+            }
+            // Default: this gateway serves the binary itself. Built from the
+            // Host header — the address the agent demonstrably reached. With
+            // TLS termination in front, set fleet.download_url_base instead.
+            None => {
+                let host = host?;
+                format!(
+                    "http://{host}/api/internal/nodes/binary/{}/{os}-{arch}",
+                    self.target_version
+                )
+            }
+        };
+        Some((url, sha256))
+    }
 }
 
 /// Validate the agent bearer token. Accepts `Authorization: Bearer <token>` or
@@ -176,6 +256,7 @@ fn validate_capabilities(caps: &AgentCapabilities) -> Result<(), String> {
 async fn process_heartbeat(
     registry: &NodeRegistry,
     node_db: Option<&NodeDb>,
+    update_ctx: Option<&UpdateContext>,
     expected_token: Option<&str>,
     allow_unauthenticated: bool,
     headers: &HeaderMap,
@@ -188,6 +269,24 @@ async fn process_heartbeat(
             Json(serde_json::json!({"error": e})),
         )
     })?;
+
+    // Fleet version authority (PR #6): always advertise the target; attach a
+    // download offer only when a binary is published for this agent's
+    // platform. Computed before the registry write so a slow first-time hash
+    // can't hold state any longer than necessary.
+    let mut target_version = None;
+    let mut download_url = None;
+    let mut sha256 = None;
+    if let Some(ctx) = update_ctx {
+        target_version = Some(ctx.target_version.clone());
+        let host = headers
+            .get(axum::http::header::HOST)
+            .and_then(|v| v.to_str().ok());
+        if let Some((url, sha)) = ctx.offer_for(&req.capabilities, host).await {
+            download_url = Some(url);
+            sha256 = Some(sha);
+        }
+    }
 
     let node_id = req.capabilities.node_id.clone();
     let caps_for_db = node_db.map(|_| req.capabilities.clone());
@@ -221,6 +320,9 @@ async fn process_heartbeat(
         registered,
         deployments_assigned: Vec::new(),
         next_heartbeat_secs: DEFAULT_HEARTBEAT_SECS,
+        target_version,
+        download_url,
+        sha256,
     })
 }
 
@@ -261,9 +363,13 @@ pub async fn heartbeat(
         )
     })?;
 
+    let fleet = state.config.read().await.fleet.clone();
+    let update_ctx = UpdateContext::from_config(&fleet, state.binary_store.clone());
+
     process_heartbeat(
         &state.node_registry,
         Some(&state.node_db),
+        Some(&update_ctx),
         expected.as_deref(),
         allow_unauthenticated,
         &headers,
@@ -271,6 +377,90 @@ pub async fn heartbeat(
     )
     .await
     .map(Json)
+}
+
+/// Core of the binary download endpoint, decoupled from axum extractors and
+/// `AppState` so path validation / 404 / streaming behavior is unit-testable
+/// (same split as `process_heartbeat`). Auth happens in the public handler.
+async fn serve_binary(
+    publish_dir: &std::path::Path,
+    store: &Arc<BinaryStore>,
+    version: &str,
+    platform: &str,
+) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
+    let (os, arch) = platform.split_once('-').ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "platform must be {os}-{arch}, e.g. linux-x86_64"})),
+        )
+    })?;
+
+    let path = binary_store::binary_path(publish_dir, version, os, arch).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "invalid version or platform component"})),
+        )
+    })?;
+
+    let not_found = || {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": format!("no published binary for version {version} on {platform}")
+            })),
+        )
+    };
+    let meta = tokio::fs::metadata(&path).await.map_err(|_| not_found())?;
+    if !meta.is_file() {
+        return Err(not_found());
+    }
+    let file = tokio::fs::File::open(&path)
+        .await
+        .map_err(|_| not_found())?;
+
+    // Best-effort integrity header for manual/curl consumers; agents use the
+    // sha from the heartbeat response.
+    let sha256 = store.sha256_async(path.clone()).await;
+
+    let body = axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(file));
+    let mut builder = axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, "application/octet-stream")
+        .header(axum::http::header::CONTENT_LENGTH, meta.len());
+    if let Some(sha) = sha256 {
+        builder = builder.header("X-Herd-Sha256", sha);
+    }
+    builder.body(body).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("failed to build response: {e}")})),
+        )
+    })
+}
+
+/// GET /api/internal/nodes/binary/:version/:platform — serves a published
+/// agent binary from the fleet publish dir (`herd agent` self-update
+/// download path). `:platform` is `{os}-{arch}`, e.g. `windows-x86_64`.
+/// Same bearer auth as the heartbeat.
+pub async fn download_binary(
+    State(state): State<AppState>,
+    axum::extract::Path((version, platform)): axum::extract::Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<axum::response::Response, (StatusCode, Json<serde_json::Value>)> {
+    let expected = std::env::var("HERD_AGENT_TOKEN")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let allow_unauthenticated = env_truthy("HERD_ALLOW_UNAUTHENTICATED_AGENT_HEARTBEAT");
+    check_agent_token(&headers, expected.as_deref(), allow_unauthenticated)?;
+
+    let fleet = state.config.read().await.fleet.clone();
+    serve_binary(
+        &fleet.resolved_publish_dir(),
+        &state.binary_store,
+        &version,
+        &platform,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -293,6 +483,8 @@ mod tests {
             rpc_capable: false,
             rpc_port: None,
             agent_version: version.to_string(),
+            os: Some(std::env::consts::OS.to_string()),
+            arch: Some(std::env::consts::ARCH.to_string()),
         }
     }
 
@@ -309,8 +501,16 @@ mod tests {
             capabilities: sample_caps("a", "1.2.0"),
             timestamp: None,
         };
-        let res =
-            process_heartbeat(&reg, None, Some("secret"), false, &HeaderMap::new(), req).await;
+        let res = process_heartbeat(
+            &reg,
+            None,
+            None,
+            Some("secret"),
+            false,
+            &HeaderMap::new(),
+            req,
+        )
+        .await;
         let err = res.unwrap_err();
         assert_eq!(err.0, StatusCode::UNAUTHORIZED);
         assert_eq!(reg.len().await, 0, "rejected heartbeat must not register");
@@ -323,7 +523,16 @@ mod tests {
             capabilities: sample_caps("a", "1.2.0"),
             timestamp: None,
         };
-        let res = process_heartbeat(&reg, None, Some("secret"), false, &bearer("wrong"), req).await;
+        let res = process_heartbeat(
+            &reg,
+            None,
+            None,
+            Some("secret"),
+            false,
+            &bearer("wrong"),
+            req,
+        )
+        .await;
         assert_eq!(res.unwrap_err().0, StatusCode::UNAUTHORIZED);
     }
 
@@ -334,7 +543,7 @@ mod tests {
             capabilities: sample_caps("a", "1.2.0"),
             timestamp: None,
         };
-        let res = process_heartbeat(&reg, None, None, false, &HeaderMap::new(), req).await;
+        let res = process_heartbeat(&reg, None, None, None, false, &HeaderMap::new(), req).await;
         assert_eq!(res.unwrap_err().0, StatusCode::UNAUTHORIZED);
         assert_eq!(reg.len().await, 0);
     }
@@ -346,9 +555,17 @@ mod tests {
             capabilities: sample_caps("citadel-5090", "1.2.0"),
             timestamp: None,
         };
-        let resp = process_heartbeat(&reg, None, Some("secret"), false, &bearer("secret"), req)
-            .await
-            .unwrap();
+        let resp = process_heartbeat(
+            &reg,
+            None,
+            None,
+            Some("secret"),
+            false,
+            &bearer("secret"),
+            req,
+        )
+        .await
+        .unwrap();
         assert!(resp.registered);
         assert_eq!(resp.next_heartbeat_secs, DEFAULT_HEARTBEAT_SECS);
         assert!(resp.deployments_assigned.is_empty());
@@ -364,7 +581,7 @@ mod tests {
             capabilities: sample_caps("a", "1.2.0"),
             timestamp: None,
         };
-        let resp = process_heartbeat(&reg, None, Some("secret"), false, &headers, req)
+        let resp = process_heartbeat(&reg, None, None, Some("secret"), false, &headers, req)
             .await
             .unwrap();
         assert!(resp.registered);
@@ -377,7 +594,7 @@ mod tests {
             capabilities: sample_caps("a", "1.2.0"),
             timestamp: None,
         };
-        let resp = process_heartbeat(&reg, None, None, true, &HeaderMap::new(), req)
+        let resp = process_heartbeat(&reg, None, None, None, true, &HeaderMap::new(), req)
             .await
             .unwrap();
         assert!(resp.registered);
@@ -392,11 +609,12 @@ mod tests {
                 capabilities: sample_caps("a", "1.2.0"),
                 timestamp: None,
             };
-            let _ = process_heartbeat(&reg, None, None, true, &HeaderMap::new(), req).await;
+            let _ = process_heartbeat(&reg, None, None, None, true, &HeaderMap::new(), req).await;
         }
         // First registers, second updates.
         let resp = process_heartbeat(
             &reg,
+            None,
             None,
             None,
             true,
@@ -422,7 +640,7 @@ mod tests {
             capabilities: sample_caps("bad/id", "1.2.0"),
             timestamp: None,
         };
-        let res = process_heartbeat(&reg, None, None, true, &HeaderMap::new(), req).await;
+        let res = process_heartbeat(&reg, None, None, None, true, &HeaderMap::new(), req).await;
         assert_eq!(res.unwrap_err().0, StatusCode::BAD_REQUEST);
         assert_eq!(reg.len().await, 0);
     }
@@ -436,7 +654,7 @@ mod tests {
             capabilities: caps,
             timestamp: None,
         };
-        let res = process_heartbeat(&reg, None, None, true, &HeaderMap::new(), req).await;
+        let res = process_heartbeat(&reg, None, None, None, true, &HeaderMap::new(), req).await;
         assert_eq!(res.unwrap_err().0, StatusCode::BAD_REQUEST);
         assert_eq!(reg.len().await, 0);
     }
@@ -448,7 +666,7 @@ mod tests {
             capabilities: sample_caps("a", "1.2.0"),
             timestamp: None,
         };
-        process_heartbeat(&reg, None, None, true, &HeaderMap::new(), first)
+        process_heartbeat(&reg, None, None, None, true, &HeaderMap::new(), first)
             .await
             .unwrap();
 
@@ -456,7 +674,7 @@ mod tests {
             capabilities: sample_caps("b", "1.2.0"),
             timestamp: None,
         };
-        let res = process_heartbeat(&reg, None, None, true, &HeaderMap::new(), second).await;
+        let res = process_heartbeat(&reg, None, None, None, true, &HeaderMap::new(), second).await;
         assert_eq!(res.unwrap_err().0, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(reg.len().await, 1);
     }
@@ -475,6 +693,7 @@ mod tests {
         let resp = process_heartbeat(
             &reg,
             Some(&db),
+            None,
             None,
             true,
             &HeaderMap::new(),
@@ -499,6 +718,7 @@ mod tests {
             &reg,
             Some(&db),
             None,
+            None,
             true,
             &HeaderMap::new(),
             beat(sample_caps("a", "1.2.0")),
@@ -513,9 +733,17 @@ mod tests {
         // Same capability snapshot — steady-state beat must not write.
         let mut caps = sample_caps("a", "1.2.0");
         caps.vram_free_mb = 1; // dynamic field churn is not material
-        process_heartbeat(&reg, Some(&db), None, true, &HeaderMap::new(), beat(caps))
-            .await
-            .unwrap();
+        process_heartbeat(
+            &reg,
+            Some(&db),
+            None,
+            None,
+            true,
+            &HeaderMap::new(),
+            beat(caps),
+        )
+        .await
+        .unwrap();
 
         let nodes = db.list_nodes().unwrap();
         assert_eq!(nodes.len(), 1);
@@ -533,6 +761,7 @@ mod tests {
             &reg,
             Some(&db),
             None,
+            None,
             true,
             &HeaderMap::new(),
             beat(sample_caps("a", "1.2.0")),
@@ -542,9 +771,17 @@ mod tests {
 
         let mut caps = sample_caps("a", "1.2.0");
         caps.models_loaded = vec!["llama-3-8b".to_string(), "qwen3-32b".to_string()];
-        process_heartbeat(&reg, Some(&db), None, true, &HeaderMap::new(), beat(caps))
-            .await
-            .unwrap();
+        process_heartbeat(
+            &reg,
+            Some(&db),
+            None,
+            None,
+            true,
+            &HeaderMap::new(),
+            beat(caps),
+        )
+        .await
+        .unwrap();
 
         let nodes = db.list_nodes().unwrap();
         assert_eq!(nodes.len(), 1);
@@ -561,6 +798,7 @@ mod tests {
         let res = process_heartbeat(
             &reg,
             Some(&db),
+            None,
             Some("secret"),
             false,
             &HeaderMap::new(),
@@ -569,6 +807,277 @@ mod tests {
         .await;
         assert!(res.is_err());
         assert!(db.list_nodes().unwrap().is_empty());
+    }
+
+    // ---- fleet version-authority response fields (PR #6) ----
+
+    fn temp_publish_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("herd-pub-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Drop a fake published binary into the store layout for this host's
+    /// platform; returns its path.
+    fn publish_binary(dir: &std::path::Path, version: &str, contents: &[u8]) -> PathBuf {
+        let path = crate::nodes::binary_store::binary_path(
+            dir,
+            version,
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+        )
+        .unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    fn update_ctx(target: &str, dir: PathBuf, base: Option<&str>) -> UpdateContext {
+        UpdateContext {
+            target_version: target.to_string(),
+            publish_dir: dir,
+            download_url_base: base.map(|s| s.trim_end_matches('/').to_string()),
+            store: Arc::new(BinaryStore::new()),
+        }
+    }
+
+    fn host(name: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(axum::http::header::HOST, name.parse().unwrap());
+        h
+    }
+
+    #[tokio::test]
+    async fn advertises_target_without_offer_when_nothing_published() {
+        let reg = NodeRegistry::new(Duration::from_secs(30));
+        let ctx = update_ctx("9.9.9", temp_publish_dir("empty"), None);
+        let resp = process_heartbeat(
+            &reg,
+            None,
+            Some(&ctx),
+            None,
+            true,
+            &host("gw.example:40114"),
+            beat(sample_caps("a", "1.2.0")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.target_version.as_deref(), Some("9.9.9"));
+        assert!(resp.download_url.is_none());
+        assert!(resp.sha256.is_none());
+    }
+
+    #[tokio::test]
+    async fn attaches_offer_with_gateway_url_and_sha_when_published() {
+        let reg = NodeRegistry::new(Duration::from_secs(30));
+        let dir = temp_publish_dir("offer");
+        publish_binary(&dir, "9.9.9", b"abc");
+        let ctx = update_ctx("9.9.9", dir, None);
+
+        let resp = process_heartbeat(
+            &reg,
+            None,
+            Some(&ctx),
+            None,
+            true,
+            &host("gw.example:40114"),
+            beat(sample_caps("a", "1.2.0")),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(resp.target_version.as_deref(), Some("9.9.9"));
+        assert_eq!(
+            resp.download_url.as_deref(),
+            Some(
+                format!(
+                    "http://gw.example:40114/api/internal/nodes/binary/9.9.9/{}-{}",
+                    std::env::consts::OS,
+                    std::env::consts::ARCH
+                )
+                .as_str()
+            )
+        );
+        // sha256("abc")
+        assert_eq!(
+            resp.sha256.as_deref(),
+            Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+    }
+
+    #[tokio::test]
+    async fn omits_offer_for_agent_without_os_arch() {
+        // Pre-PR#6 agents don't report os/arch — they must still get a normal
+        // response (with the target advertised) and never a download offer.
+        let reg = NodeRegistry::new(Duration::from_secs(30));
+        let dir = temp_publish_dir("noplatform");
+        publish_binary(&dir, "9.9.9", b"abc");
+        let ctx = update_ctx("9.9.9", dir, None);
+
+        let mut caps = sample_caps("legacy", "1.1.0");
+        caps.os = None;
+        caps.arch = None;
+        let resp = process_heartbeat(
+            &reg,
+            None,
+            Some(&ctx),
+            None,
+            true,
+            &host("gw.example:40114"),
+            beat(caps),
+        )
+        .await
+        .unwrap();
+        assert!(resp.registered);
+        assert_eq!(resp.target_version.as_deref(), Some("9.9.9"));
+        assert!(resp.download_url.is_none());
+        assert!(resp.sha256.is_none());
+    }
+
+    #[tokio::test]
+    async fn omits_offer_without_host_header_when_serving_locally() {
+        let reg = NodeRegistry::new(Duration::from_secs(30));
+        let dir = temp_publish_dir("nohost");
+        publish_binary(&dir, "9.9.9", b"abc");
+        let ctx = update_ctx("9.9.9", dir, None);
+
+        let resp = process_heartbeat(
+            &reg,
+            None,
+            Some(&ctx),
+            None,
+            true,
+            &HeaderMap::new(),
+            beat(sample_caps("a", "1.2.0")),
+        )
+        .await
+        .unwrap();
+        // No Host header means no usable gateway-served URL — advertise only.
+        assert_eq!(resp.target_version.as_deref(), Some("9.9.9"));
+        assert!(resp.download_url.is_none());
+    }
+
+    #[tokio::test]
+    async fn uses_external_download_base_when_configured() {
+        let reg = NodeRegistry::new(Duration::from_secs(30));
+        let dir = temp_publish_dir("extbase");
+        publish_binary(&dir, "9.9.9", b"abc");
+        let ctx = update_ctx("9.9.9", dir, Some("https://cdn.example/herd/"));
+
+        let resp = process_heartbeat(
+            &reg,
+            None,
+            Some(&ctx),
+            None,
+            true,
+            &HeaderMap::new(), // external base needs no Host header
+            beat(sample_caps("a", "1.2.0")),
+        )
+        .await
+        .unwrap();
+
+        let file = if std::env::consts::OS == "windows" {
+            "herd.exe"
+        } else {
+            "herd"
+        };
+        assert_eq!(
+            resp.download_url.as_deref(),
+            Some(
+                format!(
+                    "https://cdn.example/herd/9.9.9/{}-{}/{file}",
+                    std::env::consts::OS,
+                    std::env::consts::ARCH
+                )
+                .as_str()
+            )
+        );
+        // The sha still comes from the local publish dir — source of truth.
+        assert_eq!(
+            resp.sha256.as_deref(),
+            Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_response_shape_without_update_context() {
+        // With no UpdateContext (pre-PR#6 shape) the new fields must not
+        // appear on the wire at all.
+        let reg = NodeRegistry::new(Duration::from_secs(30));
+        let resp = process_heartbeat(
+            &reg,
+            None,
+            None,
+            None,
+            true,
+            &HeaderMap::new(),
+            beat(sample_caps("a", "1.2.0")),
+        )
+        .await
+        .unwrap();
+        let wire = serde_json::to_value(&resp).unwrap();
+        assert!(wire.get("target_version").is_none());
+        assert!(wire.get("download_url").is_none());
+        assert!(wire.get("sha256").is_none());
+        assert!(wire.get("registered").is_some());
+    }
+
+    // ---- binary download endpoint core (PR #6) ----
+
+    #[tokio::test]
+    async fn serve_binary_streams_published_file_with_integrity_headers() {
+        let dir = temp_publish_dir("serve");
+        publish_binary(&dir, "9.9.9", b"abc");
+        let store = Arc::new(BinaryStore::new());
+        let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+
+        let resp = serve_binary(&dir, &store, "9.9.9", &platform)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/octet-stream"
+        );
+        assert_eq!(resp.headers().get("content-length").unwrap(), "3");
+        assert_eq!(
+            resp.headers().get("X-Herd-Sha256").unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(&body[..], b"abc");
+    }
+
+    #[tokio::test]
+    async fn serve_binary_rejects_malformed_platform_and_traversal() {
+        let dir = temp_publish_dir("serve-bad");
+        let store = Arc::new(BinaryStore::new());
+
+        let err = serve_binary(&dir, &store, "9.9.9", "noseparator")
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+
+        let err = serve_binary(&dir, &store, "../../etc", "linux-x86_64")
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+
+        let err = serve_binary(&dir, &store, "9.9.9", "linux-x86_64/..")
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn serve_binary_404s_when_nothing_published() {
+        let dir = temp_publish_dir("serve-missing");
+        let store = Arc::new(BinaryStore::new());
+        let err = serve_binary(&dir, &store, "9.9.9", "linux-x86_64")
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
     }
 
     #[test]

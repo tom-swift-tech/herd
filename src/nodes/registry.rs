@@ -27,6 +27,14 @@ pub struct AgentCapabilities {
     #[serde(default)]
     pub rpc_port: Option<u16>,
     pub agent_version: String,
+    /// Agent platform (`std::env::consts::OS`, e.g. "windows" | "linux" |
+    /// "macos"). Optional for wire-compat with pre-PR#6 agents; the gateway
+    /// only offers binary downloads when both `os` and `arch` are reported.
+    #[serde(default)]
+    pub os: Option<String>,
+    /// Agent CPU architecture (`std::env::consts::ARCH`, e.g. "x86_64").
+    #[serde(default)]
+    pub arch: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -216,6 +224,8 @@ mod tests {
             rpc_capable: false,
             rpc_port: None,
             agent_version: "1.2.0".to_string(),
+            os: Some("linux".to_string()),
+            arch: Some("x86_64".to_string()),
         }
     }
 

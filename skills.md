@@ -405,7 +405,8 @@ every 4 minutes with `keep_alive: "-1"` to pre-load on startup and recover from 
 | Update check | GET | `/update` | |
 | Dashboard | GET | `/dashboard` | |
 | Skills (this data as JSON) | GET | `/skills` | |
-| Agent node heartbeat | POST | `/api/internal/nodes/heartbeat` | Internal `herd agent` daemon endpoint. Requires `Authorization: Bearer <HERD_AGENT_TOKEN>`; client chat agents should not call it. |
+| Agent node heartbeat | POST | `/api/internal/nodes/heartbeat` | Internal `herd agent` daemon endpoint. Requires `Authorization: Bearer <HERD_AGENT_TOKEN>`; client chat agents should not call it. Response advertises `target_version` (fleet version authority) plus `download_url`/`sha256` when a binary is published for the agent's platform. |
+| Agent binary download | GET | `/api/internal/nodes/binary/{version}/{os}-{arch}` | Internal `herd agent` self-update endpoint serving published binaries from the fleet publish dir. Same `HERD_AGENT_TOKEN` bearer auth as the heartbeat; responds with `X-Herd-Sha256` for integrity checks. Client chat agents should not call it. |
 
 ## Self-Onboarding
 

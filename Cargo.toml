@@ -31,6 +31,8 @@ uuid = { version = "1", features = ["v4"] }
 self_update = { version = "0.42", features = ["archive-zip", "archive-tar", "compression-flate2", "compression-zip-deflate"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 futures-util = "0.3"
+sha2 = "0.10"
+tokio-util = { version = "0.7", features = ["io"] }
 hostname = "0.4"
 axum-server = { version = "0.7", features = ["tls-rustls"], optional = true }
 

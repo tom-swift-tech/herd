@@ -450,6 +450,7 @@
         .badge-backend.ollama { background: rgba(96, 165, 250, 0.15); color: #60a5fa; }
         .badge-backend.llama-server { background: rgba(74, 222, 128, 0.15); color: #4ade80; }
         .badge-backend.unknown { background: rgba(100, 116, 139, 0.15); color: #94a3b8; }
+        .badge-backend.agent { background: rgba(167, 139, 250, 0.15); color: #a78bfa; }
 
         /* GPU Info Tags */
         .gpu-info-row { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
@@ -2187,9 +2188,9 @@ Content-Type: application/json
             }
 
             tbody.innerHTML = fleetNodes.map(node => {
-                const statusClass = node.status === 'healthy' ? 'status-healthy' :
+                const statusClass = (node.status === 'healthy' || node.status === 'online') ? 'status-healthy' :
                                    node.status === 'degraded' ? 'status-degraded' :
-                                   node.status === 'disabled' ? 'status-disabled' : 'status-unreachable';
+                                   (node.status === 'disabled' || node.status === 'offline') ? 'status-disabled' : 'status-unreachable';
                 const statusDot = `<span class="status-dot ${statusClass}"></span>`;
                 const vramGB = node.vram_mb ? (node.vram_mb / 1024).toFixed(1) + ' GB' : '\u2014';
                 const ramGB = node.ram_mb ? (node.ram_mb / 1024).toFixed(1) + ' GB' : '\u2014';
@@ -2203,6 +2204,13 @@ Content-Type: application/json
                 const btClass = bt === 'llama-server' ? 'llama-server' : bt === 'ollama' ? 'ollama' : 'unknown';
                 const btLabel = bt === 'llama-server' ? 'llama-server' : 'Ollama';
                 const backendBadge = `<span class="badge-backend ${btClass}">${btLabel}</span>`;
+
+                // Source badge: 'agent' rows come from herd agent heartbeats
+                // (live state in the gateway registry); enrolled rows from herd-tune.
+                const agentVer = node.agent_version ? ' v' + node.agent_version : '';
+                const sourceBadge = node.source === 'agent'
+                    ? ` <span class="badge-backend agent" title="Registered via herd agent heartbeat${escapeHtml(agentVer)}">agent</span>`
+                    : '';
                 const backendVer = node.backend_version ? `<br><small style="color:#64748b;">${escapeHtml(node.backend_version)}</small>` : '';
 
                 // GPU info
@@ -2243,7 +2251,7 @@ Content-Type: application/json
                 }
 
                 return `<tr class="${!node.enabled ? 'row-disabled' : ''}">
-                    <td><strong>${escapeHtml(node.hostname || '')}</strong><br><small style="color:#64748b;">${escapeHtml(node.ollama_url || '')}</small></td>
+                    <td><strong>${escapeHtml(node.hostname || '')}</strong>${sourceBadge}<br><small style="color:#64748b;">${escapeHtml(node.ollama_url || node.backend_url || '')}</small></td>
                     <td>${backendBadge}${backendVer}</td>
                     <td>${gpuInfoHtml}</td>
                     <td>${vramGB}</td>

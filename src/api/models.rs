@@ -820,6 +820,8 @@ mod tests {
             last_health_check: None,
             registered_at: "2026-04-08T00:00:00Z".to_string(),
             updated_at: "2026-04-08T00:00:00Z".to_string(),
+            source: "enrolled".to_string(),
+            agent_version: None,
         }
     }
 

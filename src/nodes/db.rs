@@ -613,6 +613,26 @@ impl NodeDb {
         }
     }
 
+    /// Flip an agent row to status='updating' when the agent announces a
+    /// self-update restart (PR #6b), so the Fleet tab shows the restart gap
+    /// as deliberate. Cleared by the next persisted upsert (the restarted
+    /// agent's version-change beat sets 'online'). Returns true if a row was
+    /// updated. Same `source='agent'` scoping as `mark_agent_offline` —
+    /// enrolled rows are never touched.
+    pub fn mark_agent_updating(&self, node_id: &str) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("DB lock: {}", e))?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let rows = conn.execute(
+            "UPDATE nodes SET status = 'updating', updated_at = ?1
+             WHERE node_id = ?2 AND source = 'agent'",
+            rusqlite::params![now, node_id],
+        )?;
+        Ok(rows > 0)
+    }
+
     /// Mark an agent row offline after in-memory TTL eviction. Soft eviction:
     /// the row stays for the Fleet tab until the reaper's grace window lapses.
     /// Returns true if a row was updated.
@@ -1211,6 +1231,42 @@ mod tests {
         let (eid, _) = db.upsert_node(&reg).unwrap();
         assert!(!db.mark_agent_offline("enrolled-nid").unwrap());
         assert_eq!(db.get_node(&eid).unwrap().unwrap().status, "healthy");
+    }
+
+    #[test]
+    fn mark_agent_updating_flips_status_and_scopes_to_agents() {
+        let db = test_db();
+        db.upsert_agent_node(&sample_agent_caps("node-a")).unwrap();
+        assert!(db.mark_agent_updating("node-a").unwrap());
+        assert_eq!(db.list_nodes().unwrap()[0].status, "updating");
+
+        // Unknown node: no-op.
+        assert!(!db.mark_agent_updating("ghost").unwrap());
+
+        // The restarted agent's upsert (version-change beat) clears it.
+        let mut caps = sample_agent_caps("node-a");
+        caps.agent_version = "1.3.0".to_string();
+        db.upsert_agent_node(&caps).unwrap();
+        let nodes = db.list_nodes().unwrap();
+        assert_eq!(nodes[0].status, "online");
+        assert_eq!(nodes[0].agent_version.as_deref(), Some("1.3.0"));
+    }
+
+    #[test]
+    fn reaper_ignores_updating_rows() {
+        // A node that dies mid-update is first soft-evicted to 'offline' by
+        // the registry path; 'updating' itself must never be reap-eligible.
+        let db = test_db();
+        db.upsert_agent_node(&sample_agent_caps("mid-update"))
+            .unwrap();
+        db.mark_agent_updating("mid-update").unwrap();
+        backdate_agent(&db, "mid-update", 7200);
+
+        let reaped = db
+            .reap_offline_agents(std::time::Duration::from_secs(3600))
+            .unwrap();
+        assert_eq!(reaped, 0);
+        assert_eq!(db.list_nodes().unwrap().len(), 1);
     }
 
     #[test]

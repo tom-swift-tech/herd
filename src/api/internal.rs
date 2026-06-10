@@ -48,6 +48,11 @@ pub struct HeartbeatRequest {
     /// agents cannot cause premature eviction.
     #[serde(default)]
     pub timestamp: Option<String>,
+    /// The agent's announcement that it is about to restart for a self-update
+    /// (PR #6b). Grants the node an eviction grace window and flips its Fleet
+    /// row to status='updating'. Omitted by normal beats.
+    #[serde(default)]
+    pub updating: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -63,14 +68,16 @@ pub struct HeartbeatResponse {
     /// PR #6). Always advertised; the agent decides whether to act.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_version: Option<String>,
-    /// Where to download the `target_version` binary for this agent's
-    /// platform. Present only when a binary is actually published for the
-    /// agent's reported os/arch. Opaque to the agent — may point at the
-    /// gateway's own serve endpoint or any external host.
+    /// External download override: present ONLY when fleet.download_url_base
+    /// is configured. In the default local case the gateway sends no URL at
+    /// all — the agent constructs one from its own --gateway address, so it
+    /// never fetches a URL derived from this request's Host header. Presence
+    /// ⇔ external override.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub download_url: Option<String>,
     /// Hex sha256 of the published binary; the agent must verify before
-    /// swapping. Present iff `download_url` is.
+    /// swapping. Present iff a binary is published for the agent's reported
+    /// os/arch at the target version — this is what makes an offer actionable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
 }
@@ -100,39 +107,28 @@ impl UpdateContext {
         }
     }
 
-    /// Compute the (download_url, sha256) pair for an agent's platform, or
-    /// `None` when the agent didn't report os/arch or no binary is published
-    /// for the target version on that platform. The sha always comes from the
-    /// gateway's local publish dir — even with an external download base, the
-    /// local copy is the source of truth for what was promoted.
-    async fn offer_for(
-        &self,
-        caps: &AgentCapabilities,
-        host: Option<&str>,
-    ) -> Option<(String, String)> {
+    /// Compute the offer attachment for an agent's platform: the sha256 of
+    /// the published binary, plus a download URL ONLY when an external
+    /// download_url_base is configured. In the default local case no URL is
+    /// sent — the agent constructs one from its own --gateway address
+    /// (presence of download_url ⇔ external override; agents never fetch a
+    /// URL derived from this request's Host header). Returns `None` when the
+    /// agent didn't report os/arch or nothing is published for the target
+    /// version on that platform. The sha always comes from the gateway's
+    /// local publish dir — even with an external download base, the local
+    /// copy is the source of truth for what was promoted.
+    async fn offer_for(&self, caps: &AgentCapabilities) -> Option<(Option<String>, String)> {
         let os = caps.os.as_deref()?;
         let arch = caps.arch.as_deref()?;
         let path = binary_store::binary_path(&self.publish_dir, &self.target_version, os, arch)?;
         let sha256 = self.store.sha256_async(path).await?;
-        let url = match &self.download_url_base {
-            // External base mirrors the publish-dir layout (static host, S3
-            // sync, ...). Model B (e.g. GitHub release assets) swaps this for
-            // a templated base later — agents treat the URL as opaque.
-            Some(base) => {
-                let file = if os == "windows" { "herd.exe" } else { "herd" };
-                format!("{base}/{}/{os}-{arch}/{file}", self.target_version)
-            }
-            // Default: this gateway serves the binary itself. Built from the
-            // Host header — the address the agent demonstrably reached. With
-            // TLS termination in front, set fleet.download_url_base instead.
-            None => {
-                let host = host?;
-                format!(
-                    "http://{host}/api/internal/nodes/binary/{}/{os}-{arch}",
-                    self.target_version
-                )
-            }
-        };
+        // External base mirrors the publish-dir layout (static host, S3
+        // sync, ...). Model B (e.g. GitHub release assets) swaps this for a
+        // templated base later — agents treat the URL as opaque.
+        let url = self.download_url_base.as_ref().map(|base| {
+            let file = if os == "windows" { "herd.exe" } else { "herd" };
+            format!("{base}/{}/{os}-{arch}/{file}", self.target_version)
+        });
         Some((url, sha256))
     }
 }
@@ -271,47 +267,66 @@ async fn process_heartbeat(
     })?;
 
     // Fleet version authority (PR #6): always advertise the target; attach a
-    // download offer only when a binary is published for this agent's
-    // platform. Computed before the registry write so a slow first-time hash
-    // can't hold state any longer than necessary.
+    // sha (and, for an external base, a URL) only when a binary is published
+    // for this agent's platform. Computed before the registry write so a slow
+    // first-time hash can't hold state any longer than necessary.
     let mut target_version = None;
     let mut download_url = None;
     let mut sha256 = None;
     if let Some(ctx) = update_ctx {
         target_version = Some(ctx.target_version.clone());
-        let host = headers
-            .get(axum::http::header::HOST)
-            .and_then(|v| v.to_str().ok());
-        if let Some((url, sha)) = ctx.offer_for(&req.capabilities, host).await {
-            download_url = Some(url);
+        if let Some((url, sha)) = ctx.offer_for(&req.capabilities).await {
+            download_url = url;
             sha256 = Some(sha);
         }
     }
 
     let node_id = req.capabilities.node_id.clone();
     let caps_for_db = node_db.map(|_| req.capabilities.clone());
-    let outcome = registry.heartbeat(req.capabilities).await.map_err(|e| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-    })?;
+    let outcome = registry
+        .heartbeat_with(req.capabilities, req.updating)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+        })?;
     let registered = matches!(outcome, HeartbeatOutcome::Registered);
     if registered {
         tracing::info!("Agent node registered via heartbeat: {}", node_id);
     }
 
+    // Persist on registration and on material change. version_changed is the
+    // restarted agent's first beat after a self-update: without it the row
+    // would stay stuck at status='updating' with the old agent_version
+    // (models usually haven't changed, so nothing else would write).
     let persist = registered
         || matches!(
             outcome,
             HeartbeatOutcome::Updated {
-                models_changed: true
+                models_changed: true,
+                ..
+            } | HeartbeatOutcome::Updated {
+                version_changed: true,
+                ..
             }
         );
     if persist {
         if let (Some(db), Some(caps)) = (node_db, caps_for_db) {
             if let Err(e) = db.upsert_agent_node(&caps) {
                 tracing::error!("Failed to persist agent node {}: {}", node_id, e);
+            }
+        }
+    }
+
+    // An updating beat flips the Fleet row to 'updating' so the restart gap
+    // reads as a deliberate update, not an outage. After the upsert above so
+    // the final state of a (rare) updating+material-change beat is 'updating'.
+    if req.updating {
+        if let Some(db) = node_db {
+            if let Err(e) = db.mark_agent_updating(&node_id) {
+                tracing::error!("Failed to mark agent node {} updating: {}", node_id, e);
             }
         }
     }
@@ -500,6 +515,7 @@ mod tests {
         let req = HeartbeatRequest {
             capabilities: sample_caps("a", "1.2.0"),
             timestamp: None,
+            updating: false,
         };
         let res = process_heartbeat(
             &reg,
@@ -522,6 +538,7 @@ mod tests {
         let req = HeartbeatRequest {
             capabilities: sample_caps("a", "1.2.0"),
             timestamp: None,
+            updating: false,
         };
         let res = process_heartbeat(
             &reg,
@@ -542,6 +559,7 @@ mod tests {
         let req = HeartbeatRequest {
             capabilities: sample_caps("a", "1.2.0"),
             timestamp: None,
+            updating: false,
         };
         let res = process_heartbeat(&reg, None, None, None, false, &HeaderMap::new(), req).await;
         assert_eq!(res.unwrap_err().0, StatusCode::UNAUTHORIZED);
@@ -554,6 +572,7 @@ mod tests {
         let req = HeartbeatRequest {
             capabilities: sample_caps("citadel-5090", "1.2.0"),
             timestamp: None,
+            updating: false,
         };
         let resp = process_heartbeat(
             &reg,
@@ -580,6 +599,7 @@ mod tests {
         let req = HeartbeatRequest {
             capabilities: sample_caps("a", "1.2.0"),
             timestamp: None,
+            updating: false,
         };
         let resp = process_heartbeat(&reg, None, None, Some("secret"), false, &headers, req)
             .await
@@ -593,6 +613,7 @@ mod tests {
         let req = HeartbeatRequest {
             capabilities: sample_caps("a", "1.2.0"),
             timestamp: None,
+            updating: false,
         };
         let resp = process_heartbeat(&reg, None, None, None, true, &HeaderMap::new(), req)
             .await
@@ -608,6 +629,7 @@ mod tests {
             let req = HeartbeatRequest {
                 capabilities: sample_caps("a", "1.2.0"),
                 timestamp: None,
+                updating: false,
             };
             let _ = process_heartbeat(&reg, None, None, None, true, &HeaderMap::new(), req).await;
         }
@@ -622,6 +644,7 @@ mod tests {
             HeartbeatRequest {
                 capabilities: sample_caps("a", "1.2.0"),
                 timestamp: None,
+                updating: false,
             },
         )
         .await
@@ -639,6 +662,7 @@ mod tests {
         let req = HeartbeatRequest {
             capabilities: sample_caps("bad/id", "1.2.0"),
             timestamp: None,
+            updating: false,
         };
         let res = process_heartbeat(&reg, None, None, None, true, &HeaderMap::new(), req).await;
         assert_eq!(res.unwrap_err().0, StatusCode::BAD_REQUEST);
@@ -653,6 +677,7 @@ mod tests {
         let req = HeartbeatRequest {
             capabilities: caps,
             timestamp: None,
+            updating: false,
         };
         let res = process_heartbeat(&reg, None, None, None, true, &HeaderMap::new(), req).await;
         assert_eq!(res.unwrap_err().0, StatusCode::BAD_REQUEST);
@@ -665,6 +690,7 @@ mod tests {
         let first = HeartbeatRequest {
             capabilities: sample_caps("a", "1.2.0"),
             timestamp: None,
+            updating: false,
         };
         process_heartbeat(&reg, None, None, None, true, &HeaderMap::new(), first)
             .await
@@ -673,6 +699,7 @@ mod tests {
         let second = HeartbeatRequest {
             capabilities: sample_caps("b", "1.2.0"),
             timestamp: None,
+            updating: false,
         };
         let res = process_heartbeat(&reg, None, None, None, true, &HeaderMap::new(), second).await;
         assert_eq!(res.unwrap_err().0, StatusCode::SERVICE_UNAVAILABLE);
@@ -683,6 +710,7 @@ mod tests {
         HeartbeatRequest {
             capabilities: caps,
             timestamp: None,
+            updating: false,
         }
     }
 
@@ -809,6 +837,130 @@ mod tests {
         assert!(db.list_nodes().unwrap().is_empty());
     }
 
+    // ---- self-update beats and version-change persistence (PR #6b) ----
+
+    fn beat_updating(caps: AgentCapabilities) -> HeartbeatRequest {
+        HeartbeatRequest {
+            capabilities: caps,
+            timestamp: None,
+            updating: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn updating_beat_marks_row_updating() {
+        let reg = NodeRegistry::new(Duration::from_secs(30));
+        let db = NodeDb::open_in_memory().unwrap();
+        process_heartbeat(
+            &reg,
+            Some(&db),
+            None,
+            None,
+            true,
+            &HeaderMap::new(),
+            beat(sample_caps("a", "1.2.0")),
+        )
+        .await
+        .unwrap();
+
+        process_heartbeat(
+            &reg,
+            Some(&db),
+            None,
+            None,
+            true,
+            &HeaderMap::new(),
+            beat_updating(sample_caps("a", "1.2.0")),
+        )
+        .await
+        .unwrap();
+
+        let nodes = db.list_nodes().unwrap();
+        assert_eq!(nodes[0].status, "updating");
+        assert!(
+            reg.get("a").await.unwrap().updating_since.is_some(),
+            "registry must arm the eviction grace window"
+        );
+    }
+
+    #[tokio::test]
+    async fn version_change_beat_persists_and_clears_updating() {
+        // The full restart round-trip: updating beat, then the restarted
+        // agent's first beat with the new version. models_loaded is unchanged,
+        // so only version_changed can trigger the persist — without it the
+        // row would stay stuck at 'updating' with the old agent_version.
+        let reg = NodeRegistry::new(Duration::from_secs(30));
+        let db = NodeDb::open_in_memory().unwrap();
+        for req in [
+            beat(sample_caps("a", "1.2.0")),
+            beat_updating(sample_caps("a", "1.2.0")),
+        ] {
+            process_heartbeat(&reg, Some(&db), None, None, true, &HeaderMap::new(), req)
+                .await
+                .unwrap();
+        }
+        assert_eq!(db.list_nodes().unwrap()[0].status, "updating");
+
+        process_heartbeat(
+            &reg,
+            Some(&db),
+            None,
+            None,
+            true,
+            &HeaderMap::new(),
+            beat(sample_caps("a", "1.3.0")),
+        )
+        .await
+        .unwrap();
+
+        let nodes = db.list_nodes().unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(
+            nodes[0].status, "online",
+            "version beat must clear 'updating'"
+        );
+        assert_eq!(nodes[0].agent_version.as_deref(), Some("1.3.0"));
+        assert!(
+            reg.get("a").await.unwrap().updating_since.is_none(),
+            "normal beat must disarm the grace window"
+        );
+    }
+
+    #[tokio::test]
+    async fn updating_beat_with_unchanged_caps_does_not_upsert() {
+        // The updating flag flips status only — it must not count as a
+        // material change that rewrites the whole row.
+        let reg = NodeRegistry::new(Duration::from_secs(30));
+        let db = NodeDb::open_in_memory().unwrap();
+        process_heartbeat(
+            &reg,
+            Some(&db),
+            None,
+            None,
+            true,
+            &HeaderMap::new(),
+            beat(sample_caps("a", "1.2.0")),
+        )
+        .await
+        .unwrap();
+
+        // Sentinel: an upsert would flip status back to 'online'; the
+        // mark_agent_updating path must set 'updating' instead.
+        db.mark_agent_offline("a").unwrap();
+        process_heartbeat(
+            &reg,
+            Some(&db),
+            None,
+            None,
+            true,
+            &HeaderMap::new(),
+            beat_updating(sample_caps("a", "1.2.0")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(db.list_nodes().unwrap()[0].status, "updating");
+    }
+
     // ---- fleet version-authority response fields (PR #6) ----
 
     fn temp_publish_dir(tag: &str) -> std::path::PathBuf {
@@ -868,7 +1020,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attaches_offer_with_gateway_url_and_sha_when_published() {
+    async fn local_offer_sends_sha_only_and_ignores_host_header() {
+        // PR #6b presence-as-signal: in the local case the gateway attaches
+        // the sha but NO download_url — even with a Host header available.
+        // The agent constructs the URL from its own --gateway address;
+        // download_url presence is reserved for the external override.
         let reg = NodeRegistry::new(Duration::from_secs(30));
         let dir = temp_publish_dir("offer");
         publish_binary(&dir, "9.9.9", b"abc");
@@ -887,16 +1043,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(resp.target_version.as_deref(), Some("9.9.9"));
-        assert_eq!(
-            resp.download_url.as_deref(),
-            Some(
-                format!(
-                    "http://gw.example:40114/api/internal/nodes/binary/9.9.9/{}-{}",
-                    std::env::consts::OS,
-                    std::env::consts::ARCH
-                )
-                .as_str()
-            )
+        assert!(
+            resp.download_url.is_none(),
+            "local case must never send a download_url, Host header or not"
         );
         // sha256("abc")
         assert_eq!(
@@ -935,7 +1084,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn omits_offer_without_host_header_when_serving_locally() {
+    async fn local_offer_works_without_host_header() {
+        // The local case no longer depends on the Host header at all: the
+        // sha is attached regardless, and the agent supplies its own URL.
         let reg = NodeRegistry::new(Duration::from_secs(30));
         let dir = temp_publish_dir("nohost");
         publish_binary(&dir, "9.9.9", b"abc");
@@ -952,9 +1103,9 @@ mod tests {
         )
         .await
         .unwrap();
-        // No Host header means no usable gateway-served URL — advertise only.
         assert_eq!(resp.target_version.as_deref(), Some("9.9.9"));
         assert!(resp.download_url.is_none());
+        assert!(resp.sha256.is_some(), "sha must not require a Host header");
     }
 
     #[tokio::test]

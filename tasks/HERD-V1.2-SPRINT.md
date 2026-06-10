@@ -2,7 +2,7 @@
 
 **Spec:** `docs/specs/v2-distributed-inference-spec.md`
 **Target:** v1.2 (foundation) — `herd agent` ships, single-node deployments only. No speculative, no pipeline.
-**Status:** PRs #1–#5.1 and #6a landed; #6b/#6c next (last reconciled with implementation: 2026-06-10)
+**Status:** PRs #1–#5.1, #6a, and #6b landed; #6c next (last reconciled with implementation: 2026-06-10)
 
 > This doc tracks the PR breakdown and acceptance checklist for the v1.2 milestone.
 > The architecture, data structures, and rationale live in the spec — this is the
@@ -21,7 +21,7 @@
 | #5 | Agent node persistence + Fleet | Migration v5 (`source`, `agent_version`); write-through on transition; soft-evict (mark offline) + reaper for stale agent rows; Fleet tab reads unified SQLite store | ✅ |
 | #5.1 | Hard-exclude agent rows from poller + SQLite routing | Live-test fix: `get_pollable_nodes` and `get_routable_nodes` now filter `source != 'agent'` explicitly. Previously the health poller picked up agent rows (`enabled=1`), `update_health` flipped them 'online'→'healthy', and they entered the routable pool — decision 12 was implied by status convention, never enforced. Also closes the `update_node(enabled=true)` side door that sets `status='healthy'` on any row. | ✅ |
 | #6a | Gateway version authority | Reshaped scope (supersedes "heartbeat protocol hardening" — the old "deployments-assigned plumbing" line is folded into this response-channel work). `fleet:` config (`target_agent_version`, `publish_dir`, `download_url_base`); agents report `os`/`arch`; `BinaryStore` (sha256 cache over `{publish_dir}/{version}/{os}-{arch}/herd[.exe]`); heartbeat response gains `target_version` + `download_url`/`sha256` when a binary is published for the agent's platform; authed `GET /api/internal/nodes/binary/:version/:platform`. | ✅ |
-| #6b | Agent self-update | Agent acts on the heartbeat offer: download → verify sha256 (abort + keep running on mismatch) → self-replace → restart (Windows-safe swap via `self_replace`); `updating` registry state with eviction grace so the restart gap never looks like node death; persist `agent_version` change on re-register. | ⬜ |
+| #6b | Agent self-update | Agent acts on the heartbeat offer: download → verify sha256 (abort + keep running on mismatch) → self-replace → restart (Windows-safe swap via `self_replace`); URL source is presence-as-signal (decision 19, revised); respawn modes `self`/`supervised`; failed-offer memo (~5min suppression); `updating` registry state with eviction grace so the restart gap never looks like node death; `version_changed` beat persists the new `agent_version` and clears 'updating'. | ✅ |
 | #6c | `herd publish` helper | Thin promote step: copy a binary into the publish-dir layout for an os/arch, print its sha256 and a reminder to bump `fleet.target_agent_version` (config hot-reload picks it up). Docs for the manual drop-in flow. | ⬜ |
 | #7 | `BackendPool` integration | Agent-registered nodes route identically to static backends; `NodeRegistry::find_for_model()`; conflict resolution (agent overrides static only on exact node-identity match). **Note (PR #5.1):** agents are now hard-excluded from `get_routable_nodes` by `source`; PR #7 must source agent routability from the in-memory registry's heartbeat freshness, not by falling through the SQLite pool path. | ⬜ |
 | #8 | Integration test + smoke | Gateway + 1 agent in same process; request routes through agent's (stub) llama-server end-to-end | ⬜ |
@@ -131,14 +131,38 @@ Locked decisions (extend the list above):
 18. **sha256 verify before swap is mandatory** (#6b). Covers corrupt/MITM transfer; does
     not pretend to solve a malicious gateway (out of scope on a self-hosted control
     plane). A mismatch aborts the update; the agent keeps running and heartbeating.
-19. **Download URL derivation.** Gateway-served URLs are built from the heartbeat
-    request's Host header — the address the agent demonstrably reached. No Host header
-    (or TLS termination in front) → set `fleet.download_url_base` explicitly. Old
-    agents that don't report `os`/`arch` get the target advertised but never an offer.
+19. **Download URL derivation — presence-as-signal** *(revised in #6b; replaces the
+    Host-header derivation shipped in #6a)*. In the local case the gateway sends
+    `target_version` + `sha256` ONLY — no `download_url`. The agent constructs the
+    binary URL itself from its own `--gateway` value
+    (`{gateway}/api/internal/nodes/binary/{ver}/{os}-{arch}`), so it never fetches a
+    URL derived from what the gateway saw in request headers. `download_url` is
+    attached ONLY when `fleet.download_url_base` is configured (the external/Model-B
+    override), and the agent then uses it verbatim. Presence ⇔ external override — a
+    null check, not URL archaeology. Old agents that don't report `os`/`arch` get the
+    target advertised but never an offer.
 20. **'updating' registry state** (#6b). Before restarting for an update the agent flags
-    its final beat; the evictor grants a longer grace (`HERD_AGENT_UPDATE_GRACE_SECS`)
-    so the restart gap is never reported as node death, and the re-registered beat's
-    changed `agent_version` is persisted to SQLite.
+    its final beat (`updating: true`); the evictor grants a longer grace
+    (`HERD_AGENT_UPDATE_GRACE_SECS`, default 180s) so the restart gap is never reported
+    as node death, and the SQLite row flips to status='updating'. The re-registered
+    beat's changed `agent_version` triggers a persist (`HeartbeatOutcome::Updated`
+    gained `version_changed`) — without it the row would stay stuck at 'updating' with
+    the old version, since models usually haven't changed.
+21. **Final updating beat is fire-and-forget** (#6b). The restart proceeds even if that
+    POST fails — the beat only suppresses eviction. Worst case the node cosmetically
+    shows offline for under the grace window and re-registers on its first beat after
+    restart.
+22. **Respawn modes** (#6b). `self` (default): after `self_replace`, spawn
+    `current_exe()` with inherited argv+env and exit(0) — for bare `herd agent` in a
+    terminal. `supervised`: exit(0) only, letting the supervisor's Restart=always bring
+    up the new binary (self-spawning under NSSM/systemd would double-run the agent).
+    Agents read `--respawn-mode` / `HERD_RESPAWN_MODE`; `fleet.respawn_mode` in config
+    documents the fleet-wide intent (reserved for heartbeat relay later). Respawn logic
+    sits behind a `Respawner` trait so the loop is testable.
+23. **Failed-offer memo** (#6b). A failed (version, sha256) download/verify pair is not
+    retried for ~5min — a bad offer re-advertised every 2s must not hammer the
+    download endpoint. A republished binary (same version, new sha) is eligible
+    immediately.
 
 ---
 

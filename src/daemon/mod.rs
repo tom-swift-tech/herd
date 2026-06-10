@@ -9,8 +9,9 @@
 pub mod capabilities;
 pub mod client;
 pub mod lifecycle;
+pub mod update;
 
-use crate::config::BackendType;
+use crate::config::{BackendType, RespawnMode};
 use anyhow::Context;
 use std::time::Duration;
 
@@ -45,6 +46,12 @@ pub struct AgentArgs {
     /// Auto-detected by probing when omitted.
     #[arg(long, value_parser = parse_backend_type)]
     pub backend: Option<BackendType>,
+
+    /// How to restart after a self-update: 'self' spawns the new binary then
+    /// exits (bare terminal runs); 'supervised' exits only and lets the
+    /// service manager (NSSM, systemd Restart=always) bring the new binary up.
+    #[arg(long, default_value = "self", env = "HERD_RESPAWN_MODE")]
+    pub respawn_mode: RespawnMode,
 }
 
 fn parse_backend_type(s: &str) -> Result<BackendType, String> {
@@ -110,6 +117,8 @@ pub async fn run(args: AgentArgs) -> anyhow::Result<()> {
     let mut last_vram_free_mb = gpu.vram_total_mb;
     let mut gateway_up = false;
     let mut backend_reachable = true;
+    let mut failed_offers = update::FailureMemo::new();
+    let respawner = update::ProcessRespawner;
 
     loop {
         let vendor = gpu.vendor;
@@ -143,7 +152,7 @@ pub async fn run(args: AgentArgs) -> anyhow::Result<()> {
             local.models_loaded,
         );
 
-        let outcome = heartbeat.send(&caps).await;
+        let outcome = heartbeat.send(&caps, false).await;
         match &outcome {
             client::BeatOutcome::Success { registered, .. } => {
                 if *registered {
@@ -165,6 +174,27 @@ pub async fn run(args: AgentArgs) -> anyhow::Result<()> {
             }
         }
 
+        // Fleet self-update (PR #6b): act on a complete offer for a strictly
+        // newer version, unless the same (version, sha) pair recently failed.
+        // On success this never returns — the process restarts.
+        if let client::BeatOutcome::Success {
+            update_offer: Some(offer),
+            ..
+        } = &outcome
+        {
+            if update::should_apply(capabilities::AGENT_VERSION, offer, &failed_offers) {
+                apply_update(
+                    offer,
+                    &caps,
+                    &heartbeat,
+                    &mut failed_offers,
+                    &respawner,
+                    args.respawn_mode,
+                )
+                .await;
+            }
+        }
+
         let delay = schedule.record(&outcome);
         if !gateway_up && schedule.consecutive_failures() > 1 {
             tracing::debug!(
@@ -174,5 +204,75 @@ pub async fn run(args: AgentArgs) -> anyhow::Result<()> {
             );
         }
         tokio::time::sleep(delay).await;
+    }
+}
+
+/// Download, verify, and apply an update offer, then restart per
+/// `respawn_mode`. On success this only returns if the respawn itself failed;
+/// on any earlier failure it logs, memoizes the offer, and returns so the
+/// loop keeps heartbeating on the current binary.
+async fn apply_update(
+    offer: &client::UpdateOffer,
+    caps: &crate::nodes::AgentCapabilities,
+    heartbeat: &client::HeartbeatClient,
+    failed_offers: &mut update::FailureMemo,
+    respawner: &dyn update::Respawner,
+    respawn_mode: RespawnMode,
+) {
+    // Local case (no download_url): the agent constructs the URL from its own
+    // --gateway address. A gateway-sent URL is only ever the explicit
+    // external override (fleet.download_url_base).
+    let url = offer
+        .download_url
+        .clone()
+        .unwrap_or_else(|| heartbeat.binary_url(&offer.target_version));
+    tracing::info!(
+        "fleet update offered: {} -> {} from {}",
+        capabilities::AGENT_VERSION,
+        offer.target_version,
+        url
+    );
+
+    let sha256 = offer.sha256.clone();
+    let token = heartbeat.token().map(str::to_string);
+    let download_url = url.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        crate::updater::update_from_url(&download_url, &sha256, token.as_deref())
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => {
+            // Best-effort: announce the restart so the gateway grants an
+            // eviction grace window. The restart proceeds even if this beat
+            // fails — worst case the node briefly shows offline and
+            // re-registers on its first beat after the restart.
+            if let client::BeatOutcome::Rejected { .. } | client::BeatOutcome::Unreachable(_) =
+                heartbeat.send(caps, true).await
+            {
+                tracing::warn!("final updating heartbeat failed; restarting anyway");
+            }
+            tracing::info!(
+                "updated to {} — restarting ({:?})",
+                offer.target_version,
+                respawn_mode
+            );
+            if let Err(e) = respawner.restart(respawn_mode) {
+                // The binary on disk is already the new version; keep serving
+                // heartbeats on the old in-memory code rather than dying.
+                tracing::error!("respawn failed after update: {e:#}");
+            }
+        }
+        Ok(Err(e)) => {
+            tracing::error!(
+                "self-update to {} failed: {e:#} — will not retry this offer for a while",
+                offer.target_version
+            );
+            failed_offers.record_failure(&offer.target_version, &offer.sha256);
+        }
+        Err(e) => {
+            tracing::error!("self-update task panicked: {e}");
+            failed_offers.record_failure(&offer.target_version, &offer.sha256);
+        }
     }
 }

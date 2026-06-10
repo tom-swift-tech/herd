@@ -125,13 +125,13 @@ No cloud dependency. No API keys exposed. Full local control.
 - ~~Multi-node discovery (static fleet config with auto-probe)~~ ✅
 - ~~**Auto Mode classifier** — LLM-based request classification when `"model": "auto"` or model omitted; classifies tier (light/standard/heavy/frontier) and capability (general/code/reasoning/creative/vision/extraction), routes to best model from configurable map; results cached by message hash; off by default~~ ✅
 
-### v1.2.0+ — Distributed Inference (In Spec)
+### v1.2.0+ — Distributed Inference (In Progress)
 
 > **See `docs/specs/v2-distributed-inference-spec.md`** for the full architecture.
 
 Three-phase delivery introduces self-registering node agents and deployment-aware routing:
 
-- **v1.2** — Agent/Gateway foundation. `herd agent` subcommand, `NodeRegistry`, single-node deployments. Sprint plan: `tasks/HERD-V1.2-SPRINT.md`.
+- **v1.2** — Agent/Gateway foundation. `herd agent` subcommand, `NodeRegistry`, single-node deployments. Sprint plan: `tasks/HERD-V1.2-SPRINT.md`. *Status: PRs #1–#4 of 8 landed — `Deployment` module, `NodeRegistry` with TTL eviction, gateway heartbeat endpoint (`HERD_AGENT_TOKEN` auth), and the node-side `herd agent` daemon (GPU/VRAM detection, local backend probe, 2s heartbeat with backoff). Remaining: dashboard Fleet integration, protocol hardening, `BackendPool` routing integration, end-to-end test.*
 - **v1.3** — Speculative decoding deployments. Draft/verifier pairs across nodes via llama.cpp's `--model-draft` for 2-3x throughput on daily-driver models.
 - **v1.4** — Pipeline parallel deployments. llama.cpp RPC integration to serve models that don't fit on any single GPU (Qwen2.5-72B-class).
 

@@ -1,4 +1,52 @@
 use crate::config::Backend;
+use crate::daemon::AgentArgs;
+use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+
+/// Top-level CLI. The serve flags are flattened at the top level so the
+/// pre-v1.2 flat invocations (`herd -c herd.yaml`, `herd -p 8080 -b a=...`)
+/// keep parsing unchanged; `serve` and `agent` are explicit subcommands.
+#[derive(Parser)]
+#[command(name = "herd")]
+#[command(about = "Intelligent Ollama router with GPU awareness", long_about = None)]
+pub struct Cli {
+    #[command(flatten)]
+    pub serve: ServeArgs,
+
+    /// Check for updates and install if available
+    #[arg(long)]
+    pub update: bool,
+
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+pub enum Command {
+    /// Run the gateway (default when no subcommand is given)
+    Serve(ServeArgs),
+    /// Run the node-side agent daemon that heartbeats a gateway
+    Agent(AgentArgs),
+}
+
+#[derive(clap::Args)]
+pub struct ServeArgs {
+    /// Path to config file
+    #[arg(short, long, value_name = "FILE")]
+    pub config: Option<PathBuf>,
+
+    /// Port to listen on
+    #[arg(short, long, default_value = "40114")]
+    pub port: u16,
+
+    /// Host to bind to
+    #[arg(long, default_value = "0.0.0.0")]
+    pub host: String,
+
+    /// Backend URLs (format: name=url:priority)
+    #[arg(short, long)]
+    pub backend: Vec<String>,
+}
 
 pub fn parse_backend_spec(spec: &str) -> Option<Backend> {
     let (name, raw_target) = spec.split_once('=')?;
@@ -52,6 +100,122 @@ fn has_explicit_priority(raw_target: &str) -> bool {
     }
 
     remainder.matches(':').count() >= 2
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::{Cli, Command};
+    use clap::Parser;
+
+    #[test]
+    fn legacy_flat_invocation_parses_unchanged() {
+        let cli = Cli::try_parse_from(["herd", "-c", "foo.yaml"]).unwrap();
+        assert!(cli.command.is_none());
+        assert!(!cli.update);
+        assert_eq!(
+            cli.serve.config.as_deref().unwrap().to_str(),
+            Some("foo.yaml")
+        );
+        assert_eq!(cli.serve.port, 40114);
+        assert_eq!(cli.serve.host, "0.0.0.0");
+        assert!(cli.serve.backend.is_empty());
+    }
+
+    #[test]
+    fn legacy_port_host_backend_flags_parse_unchanged() {
+        let cli = Cli::try_parse_from([
+            "herd",
+            "-p",
+            "8080",
+            "--host",
+            "127.0.0.1",
+            "-b",
+            "citadel=http://citadel:11434:100",
+        ])
+        .unwrap();
+        assert!(cli.command.is_none());
+        assert_eq!(cli.serve.port, 8080);
+        assert_eq!(cli.serve.host, "127.0.0.1");
+        assert_eq!(cli.serve.backend, vec!["citadel=http://citadel:11434:100"]);
+    }
+
+    #[test]
+    fn legacy_update_flag_parses_unchanged() {
+        let cli = Cli::try_parse_from(["herd", "--update"]).unwrap();
+        assert!(cli.update);
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn explicit_serve_subcommand_accepts_same_flags() {
+        let cli = Cli::try_parse_from(["herd", "serve", "-c", "x.yaml", "-p", "9000"]).unwrap();
+        match cli.command {
+            Some(Command::Serve(args)) => {
+                assert_eq!(args.config.as_deref().unwrap().to_str(), Some("x.yaml"));
+                assert_eq!(args.port, 9000);
+            }
+            _ => panic!("expected serve subcommand"),
+        }
+    }
+
+    #[test]
+    fn agent_subcommand_parses_with_defaults() {
+        let cli = Cli::try_parse_from(["herd", "agent", "--gateway", "http://gw:40114"]).unwrap();
+        match cli.command {
+            Some(Command::Agent(args)) => {
+                assert_eq!(args.gateway, "http://gw:40114");
+                assert!(args.node_id.is_none());
+                assert_eq!(args.heartbeat_secs, 2);
+                assert_eq!(args.backend_url, "http://127.0.0.1:11434");
+                assert!(args.advertise_url.is_none());
+                assert!(args.backend.is_none());
+            }
+            _ => panic!("expected agent subcommand"),
+        }
+    }
+
+    #[test]
+    fn agent_subcommand_accepts_overrides() {
+        let cli = Cli::try_parse_from([
+            "herd",
+            "agent",
+            "--gateway",
+            "http://gw:40114",
+            "--node-id",
+            "citadel-5090",
+            "--heartbeat-secs",
+            "5",
+            "--backend",
+            "llama-server",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Agent(args)) => {
+                assert_eq!(args.node_id.as_deref(), Some("citadel-5090"));
+                assert_eq!(args.heartbeat_secs, 5);
+                assert_eq!(args.backend, Some(crate::config::BackendType::LlamaServer));
+            }
+            _ => panic!("expected agent subcommand"),
+        }
+    }
+
+    #[test]
+    fn agent_requires_gateway() {
+        assert!(Cli::try_parse_from(["herd", "agent"]).is_err());
+    }
+
+    #[test]
+    fn agent_rejects_unknown_backend_type() {
+        assert!(Cli::try_parse_from([
+            "herd",
+            "agent",
+            "--gateway",
+            "http://gw:40114",
+            "--backend",
+            "vllm"
+        ])
+        .is_err());
+    }
 }
 
 #[cfg(test)]

@@ -22,9 +22,9 @@ pub trait ProviderAdapter: Send + Sync {
 
 /// Check if a model name belongs to any configured frontier provider
 pub fn is_frontier_model(model: &str, providers: &[ProviderConfig]) -> bool {
-    providers.iter().any(|p| {
-        p.models.iter().any(|m| m == model) || (p.models.is_empty() && !model.is_empty())
-    })
+    providers
+        .iter()
+        .any(|p| p.models.iter().any(|m| m == model) || (p.models.is_empty() && !model.is_empty()))
 }
 
 /// Find the provider that serves a given model (highest priority wins)

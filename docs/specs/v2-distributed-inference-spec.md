@@ -1,8 +1,8 @@
 # Herd v2 — Distributed Inference Spec
 
-**Status:** v1.2 in progress (PRs #1–#3 landed of 8; see `tasks/HERD-V1.2-SPRINT.md`)
+**Status:** v1.2 in progress (PRs #1–#6c landed of 8; #7 BackendPool integration and #8 integration test pending; see `tasks/HERD-V1.2-SPRINT.md`)
 **Author:** Tom Swift (Director) + Gage
-**Date:** 2026-04-17 (last reconciled with implementation: 2026-06-05)
+**Date:** 2026-04-17 (last reconciled with implementation: 2026-06-12)
 **Targets:** v1.2 (foundation) → v1.3 (speculative) → v1.4 (pipeline)
 **Supersedes:** N/A — extends `ROADMAP.md` v1.2.0+ "llama.cpp RPC integration for tensor-parallel sharding"
 
@@ -375,23 +375,25 @@ src/
 
 ## Open Questions for Tom
 
-These should be decided before v1.2 implementation lands. PR descriptions should reference whichever ones the PR touches.
+**All questions below are resolved and locked for v1.2.** See `tasks/HERD-V1.2-SPRINT.md` → "Decisions (locked for v1.2)" for the full record, including the fleet-authority decisions added during the PR #6 series (questions 15–25 in that doc).
 
-1. **Module naming.** `src/daemon/` proposed to avoid colliding with existing `src/agent/` (sessions). Alternative: `src/node_agent/`. Preference?
+For reference, the original questions and their outcomes:
 
-2. **Auth mechanism.** Shared bearer token in `HERD_AGENT_TOKEN` env var for v1.2 (simple, fine on Tailscale). Document mTLS as future hardening. OK with that, or want mTLS day one?
+1. **Module naming.** RESOLVED: `src/daemon/` — avoids collision with existing `src/agent/` (sessions). User-facing CLI term remains `herd agent`.
 
-3. **Node ID assignment.** Recommend: human-readable, hostname-derived (`hostname-gpu` like `citadel-5090`), with `--node-id` override. Sound right?
+2. **Auth mechanism.** RESOLVED: Shared bearer token via `HERD_AGENT_TOKEN` env var. Unset = warn+allow; set = required. mTLS documented as future hardening.
 
-4. **Heartbeat cadence.** 2s default. Configurable per-agent via flag or env. Reasonable?
+3. **Node ID assignment.** RESOLVED: Human-readable, hostname-derived (`hostname-gpu` format, e.g. `citadel-5090`), with `--node-id` override flag.
 
-5. **Deployment manifest source.** Option A: top-level `deployments:` section in `herd.yaml`. Option B: separate `deployments.yaml`. Option C: admin API only, persisted to SQLite. Recommend A for consistency with existing config patterns. This is deferred beyond v1.2; v1.2 ships single-node only and does not add new deployment config.
+4. **Heartbeat cadence.** RESOLVED: 2s default, configurable per-agent via flag or env. 30s TTL on the gateway.
 
-6. **Conflict resolution.** A node is both statically configured *and* registers as an agent. Decided for v1.2: agent registration overrides only on exact logical-node identity match (`node_id` + advertised inference address). Otherwise both remain and a duplication warning is logged.
+5. **Deployment manifest source.** RESOLVED: Deferred beyond v1.2. v1.2 ships single-node only and adds no new deployment config. When it lands, top-level `deployments:` in `herd.yaml` (Option A) is the target.
 
-7. **Gateway address discovery.** Require explicit `--gateway <url>` on the agent. Document `herd.starbase` (Tailscale DNS) as the recommended value but don't auto-discover. Agreed?
+6. **Conflict resolution.** RESOLVED: Agent registration overrides a static backend only on exact logical-node identity match (`node_id` + advertised inference address). Otherwise both remain and the gateway logs a duplication warning.
 
-8. **Speculative decoding model pairing.** Configured per-deployment in the manifest, or auto-suggested by Herd based on model family? Recommend: manual for v1.3, auto-suggestion is a v1.5 nice-to-have.
+7. **Gateway address discovery.** RESOLVED: Explicit `--gateway <url>` required on the agent. No auto-discovery; `herd.starbase` (Tailscale DNS) documented as the recommended value.
+
+8. **Speculative decoding model pairing.** RESOLVED: Manual per-deployment config for v1.3. Auto-suggestion is a v1.5 nice-to-have.
 
 ---
 

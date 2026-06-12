@@ -297,21 +297,19 @@ async fn process_heartbeat(
         tracing::info!("Agent node registered via heartbeat: {}", node_id);
     }
 
-    // Persist on registration and on material change. version_changed is the
-    // restarted agent's first beat after a self-update: without it the row
-    // would stay stuck at status='updating' with the old agent_version
-    // (models usually haven't changed, so nothing else would write).
-    let persist = registered
-        || matches!(
-            outcome,
-            HeartbeatOutcome::Updated {
-                models_changed: true,
-                ..
-            } | HeartbeatOutcome::Updated {
-                version_changed: true,
-                ..
-            }
-        );
+    // Persist on registration and on material change. version_changed covers
+    // the restarted agent's first beat after a self-update with a new binary.
+    // update_cleared covers a failed respawn: the agent keeps running the old
+    // binary (same version, no model change) but the Fleet row must still
+    // un-stick from 'updating' → 'online'.
+    let persist = match outcome {
+        HeartbeatOutcome::Registered => true,
+        HeartbeatOutcome::Updated {
+            models_changed,
+            version_changed,
+            update_cleared,
+        } => models_changed || version_changed || update_cleared,
+    };
     if persist {
         if let (Some(db), Some(caps)) = (node_db, caps_for_db) {
             if let Err(e) = db.upsert_agent_node(&caps) {
@@ -959,6 +957,54 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(db.list_nodes().unwrap()[0].status, "updating");
+    }
+
+    #[tokio::test]
+    async fn normal_beat_with_same_version_clears_stuck_updating_row() {
+        // Failed-respawn scenario: the agent sent an updating beat, then
+        // restart failed and the OLD binary kept running. The agent resumes
+        // normal beats with the same version — no version_changed, no
+        // models_changed. The Fleet row must still flip from 'updating' back
+        // to 'online' (update_cleared trigger).
+        let reg = NodeRegistry::new(Duration::from_secs(30));
+        let db = NodeDb::open_in_memory().unwrap();
+        for req in [
+            beat(sample_caps("a", "1.2.0")),
+            beat_updating(sample_caps("a", "1.2.0")),
+        ] {
+            process_heartbeat(&reg, Some(&db), None, None, true, &HeaderMap::new(), req)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            db.list_nodes().unwrap()[0].status,
+            "updating",
+            "sanity: row must be 'updating' before the fix beats"
+        );
+
+        // Same version as before the update attempt — failed respawn kept old binary.
+        process_heartbeat(
+            &reg,
+            Some(&db),
+            None,
+            None,
+            true,
+            &HeaderMap::new(),
+            beat(sample_caps("a", "1.2.0")),
+        )
+        .await
+        .unwrap();
+
+        let nodes = db.list_nodes().unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(
+            nodes[0].status, "online",
+            "normal beat with same version must clear 'updating' (failed-respawn fix)"
+        );
+        assert!(
+            reg.get("a").await.unwrap().updating_since.is_none(),
+            "registry grace window must also be cleared"
+        );
     }
 
     // ---- fleet version-authority response fields (PR #6) ----

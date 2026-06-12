@@ -162,7 +162,23 @@ Locked decisions (extend the list above):
 23. **Failed-offer memo** (#6b). A failed (version, sha256) download/verify pair is not
     retried for ~5min — a bad offer re-advertised every 2s must not hammer the
     download endpoint. A republished binary (same version, new sha) is eligible
-    immediately.
+    immediately. *(Hardened in #6b review-fix — see decision 24: a failed **respawn**
+    after a successful swap now arms this memo too.)*
+24. **Failed-respawn recovery** (#6b review-fix). Two coupled gaps in the
+    self-respawn path are closed:
+    (a) If `respawner.restart()` returns `Err` *after* a successful binary swap, the
+    failure memo (decision 23) is now armed before logging — otherwise `should_apply()`
+    stayed true and the agent re-downloaded + re-swapped the identical offer every ~2s
+    (a download storm on the very node whose respawn is wedged). The post-swap step is
+    factored into a synchronous `finish_update` fn so a mock `Respawner` returning `Err`
+    drives it without exiting the test process.
+    (b) The fire-and-forget `updating: true` beat (decision 21) already flipped the
+    SQLite row to 'updating'. After a wedged respawn the agent keeps beating the SAME
+    version, so the `version_changed` trigger from decision 20 never fires and the row
+    stuck at 'updating' forever. `HeartbeatOutcome::Updated` gains a third field
+    `update_cleared` (true exactly when a normal beat disarms a prior `updating_since`),
+    and the gateway persists on it — clearing the row back to 'online' independent of any
+    version change. Verified by `normal_beat_with_same_version_clears_stuck_updating_row`.
 
 ---
 

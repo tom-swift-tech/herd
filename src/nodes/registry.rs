@@ -76,6 +76,12 @@ pub enum HeartbeatOutcome {
         /// Callers must persist on this too, or the Fleet row stays stuck at
         /// 'updating' with the old version.
         version_changed: bool,
+        /// True exactly when this beat cleared a previously-armed
+        /// `updating_since` — i.e. the agent resumed normal beats after
+        /// announcing a restart. Callers must persist on this so the Fleet
+        /// row un-sticks from `'updating'` even when the version didn't
+        /// change (e.g. a failed respawn that kept the old binary running).
+        update_cleared: bool,
     },
 }
 
@@ -175,6 +181,11 @@ impl NodeRegistry {
                 let models_changed =
                     !same_model_set(&existing.capabilities.models_loaded, &caps.models_loaded);
                 let version_changed = existing.capabilities.agent_version != caps.agent_version;
+                // True when this normal beat clears a previously-armed
+                // updating_since (agent resumed after restart announcement).
+                // Computed BEFORE mutating updating_since so the check sees
+                // the previous state.
+                let update_cleared = !updating && existing.updating_since.is_some();
                 existing.capabilities = caps;
                 existing.last_heartbeat = now;
                 if updating {
@@ -188,6 +199,7 @@ impl NodeRegistry {
                 Ok(HeartbeatOutcome::Updated {
                     models_changed,
                     version_changed,
+                    update_cleared,
                 })
             }
             None => {
@@ -342,7 +354,8 @@ mod tests {
             outcome,
             HeartbeatOutcome::Updated {
                 models_changed: false,
-                version_changed: false
+                version_changed: false,
+                update_cleared: false,
             }
         );
         assert_eq!(reg.len().await, 1);
@@ -360,7 +373,8 @@ mod tests {
             outcome,
             HeartbeatOutcome::Updated {
                 models_changed: true,
-                version_changed: false
+                version_changed: false,
+                update_cleared: false,
             }
         );
     }
@@ -382,7 +396,8 @@ mod tests {
             outcome,
             HeartbeatOutcome::Updated {
                 models_changed: false,
-                version_changed: false
+                version_changed: false,
+                update_cleared: false,
             }
         );
     }
@@ -492,7 +507,8 @@ mod tests {
             outcome,
             HeartbeatOutcome::Updated {
                 models_changed: false,
-                version_changed: false
+                version_changed: false,
+                update_cleared: false,
             }
         );
         assert_eq!(reg.len().await, 1);
@@ -520,7 +536,8 @@ mod tests {
             outcome,
             HeartbeatOutcome::Updated {
                 models_changed: false,
-                version_changed: true
+                version_changed: true,
+                update_cleared: false,
             }
         );
     }
@@ -596,5 +613,62 @@ mod tests {
         clock.advance(Duration::from_secs(31));
         assert!(reg.fresh_nodes().await.is_empty());
         assert_eq!(reg.list().await.len(), 1);
+    }
+
+    // ---- update_cleared field (PR #6b failed-respawn fix) ----
+
+    #[tokio::test]
+    async fn update_cleared_is_false_on_updating_beat() {
+        let (reg, _clock) = registry_with_clock(Duration::from_secs(30));
+        reg.heartbeat(sample_caps("a")).await.unwrap();
+        let outcome = reg.heartbeat_with(sample_caps("a"), true).await.unwrap();
+        assert_eq!(
+            outcome,
+            HeartbeatOutcome::Updated {
+                models_changed: false,
+                version_changed: false,
+                update_cleared: false,
+            },
+            "an updating beat must not report update_cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_cleared_is_true_on_first_normal_beat_after_updating() {
+        let (reg, _clock) = registry_with_clock(Duration::from_secs(30));
+        reg.heartbeat(sample_caps("a")).await.unwrap();
+        reg.heartbeat_with(sample_caps("a"), true).await.unwrap();
+
+        // First normal beat after an updating beat must clear the flag.
+        let outcome = reg.heartbeat(sample_caps("a")).await.unwrap();
+        assert_eq!(
+            outcome,
+            HeartbeatOutcome::Updated {
+                models_changed: false,
+                version_changed: false,
+                update_cleared: true,
+            },
+            "first normal beat after updating must report update_cleared=true"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_cleared_is_false_on_subsequent_normal_beats() {
+        let (reg, _clock) = registry_with_clock(Duration::from_secs(30));
+        reg.heartbeat(sample_caps("a")).await.unwrap();
+        reg.heartbeat_with(sample_caps("a"), true).await.unwrap();
+        // Clear beat.
+        reg.heartbeat(sample_caps("a")).await.unwrap();
+        // Subsequent steady beat: updating_since is already None, nothing to clear.
+        let outcome = reg.heartbeat(sample_caps("a")).await.unwrap();
+        assert_eq!(
+            outcome,
+            HeartbeatOutcome::Updated {
+                models_changed: false,
+                version_changed: false,
+                update_cleared: false,
+            },
+            "steady-state beat after clearing must not report update_cleared"
+        );
     }
 }

@@ -207,6 +207,31 @@ pub async fn run(args: AgentArgs) -> anyhow::Result<()> {
     }
 }
 
+/// Bring the new binary up; if respawn fails, arm the failure memo so the
+/// agent doesn't re-download and re-swap the same offer every beat.
+///
+/// Synchronous and `Respawner`-parameterised so it can be unit-tested with a
+/// mock without any network or async runtime.
+fn finish_update(
+    offer: &client::UpdateOffer,
+    failed_offers: &mut update::FailureMemo,
+    respawner: &dyn update::Respawner,
+    respawn_mode: RespawnMode,
+) {
+    tracing::info!(
+        "updated to {} — restarting ({:?})",
+        offer.target_version,
+        respawn_mode
+    );
+    if let Err(e) = respawner.restart(respawn_mode) {
+        // The binary on disk is already the new version, but we failed to bring
+        // it up. Memoize so should_apply() stops firing on every beat; keep
+        // serving heartbeats on the old in-memory code rather than dying.
+        failed_offers.record_failure(&offer.target_version, &offer.sha256);
+        tracing::error!("respawn failed after update: {e:#}");
+    }
+}
+
 /// Download, verify, and apply an update offer, then restart per
 /// `respawn_mode`. On success this only returns if the respawn itself failed;
 /// on any earlier failure it logs, memoizes the offer, and returns so the
@@ -252,16 +277,7 @@ async fn apply_update(
             {
                 tracing::warn!("final updating heartbeat failed; restarting anyway");
             }
-            tracing::info!(
-                "updated to {} — restarting ({:?})",
-                offer.target_version,
-                respawn_mode
-            );
-            if let Err(e) = respawner.restart(respawn_mode) {
-                // The binary on disk is already the new version; keep serving
-                // heartbeats on the old in-memory code rather than dying.
-                tracing::error!("respawn failed after update: {e:#}");
-            }
+            finish_update(offer, failed_offers, respawner, respawn_mode);
         }
         Ok(Err(e)) => {
             tracing::error!(
@@ -274,5 +290,43 @@ async fn apply_update(
             tracing::error!("self-update task panicked: {e}");
             failed_offers.record_failure(&offer.target_version, &offer.sha256);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::daemon::update::{FailureMemo, Respawner};
+
+    struct FailingRespawner;
+
+    impl Respawner for FailingRespawner {
+        fn restart(&self, _mode: RespawnMode) -> anyhow::Result<()> {
+            Err(anyhow::anyhow!("exec failed: no such file"))
+        }
+    }
+
+    fn offer(version: &str, sha: &str) -> client::UpdateOffer {
+        client::UpdateOffer {
+            target_version: version.to_string(),
+            download_url: None,
+            sha256: sha.to_string(),
+        }
+    }
+
+    #[test]
+    fn finish_update_arms_memo_when_respawn_fails() {
+        let o = offer("1.3.0", "abc123");
+        let mut memo = FailureMemo::new();
+        // Before the call the offer is eligible.
+        assert!(update::should_apply("1.2.0", &o, &memo));
+
+        finish_update(&o, &mut memo, &FailingRespawner, RespawnMode::SelfSpawn);
+
+        // After the failed respawn the memo must suppress the same offer.
+        assert!(
+            !update::should_apply("1.2.0", &o, &memo),
+            "failed respawn must arm the memo so the offer is suppressed"
+        );
     }
 }

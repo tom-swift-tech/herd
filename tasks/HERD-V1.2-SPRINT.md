@@ -2,7 +2,7 @@
 
 **Spec:** `docs/specs/v2-distributed-inference-spec.md`
 **Target:** v1.2 (foundation) — `herd agent` ships, single-node deployments only. No speculative, no pipeline.
-**Status:** PRs #1–#5.1, #6a, and #6b landed; #6c next (last reconciled with implementation: 2026-06-10)
+**Status:** PRs #1–#5.1, #6a, #6b, and #6c landed; #7 next (last reconciled with implementation: 2026-06-12)
 
 > This doc tracks the PR breakdown and acceptance checklist for the v1.2 milestone.
 > The architecture, data structures, and rationale live in the spec — this is the
@@ -22,7 +22,7 @@
 | #5.1 | Hard-exclude agent rows from poller + SQLite routing | Live-test fix: `get_pollable_nodes` and `get_routable_nodes` now filter `source != 'agent'` explicitly. Previously the health poller picked up agent rows (`enabled=1`), `update_health` flipped them 'online'→'healthy', and they entered the routable pool — decision 12 was implied by status convention, never enforced. Also closes the `update_node(enabled=true)` side door that sets `status='healthy'` on any row. | ✅ |
 | #6a | Gateway version authority | Reshaped scope (supersedes "heartbeat protocol hardening" — the old "deployments-assigned plumbing" line is folded into this response-channel work). `fleet:` config (`target_agent_version`, `publish_dir`, `download_url_base`); agents report `os`/`arch`; `BinaryStore` (sha256 cache over `{publish_dir}/{version}/{os}-{arch}/herd[.exe]`); heartbeat response gains `target_version` + `download_url`/`sha256` when a binary is published for the agent's platform; authed `GET /api/internal/nodes/binary/:version/:platform`. | ✅ |
 | #6b | Agent self-update | Agent acts on the heartbeat offer: download → verify sha256 (abort + keep running on mismatch) → self-replace → restart (Windows-safe swap via `self_replace`); URL source is presence-as-signal (decision 19, revised); respawn modes `self`/`supervised`; failed-offer memo (~5min suppression); `updating` registry state with eviction grace so the restart gap never looks like node death; `version_changed` beat persists the new `agent_version` and clears 'updating'. | ✅ |
-| #6c | `herd publish` helper | Thin promote step: copy a binary into the publish-dir layout for an os/arch, print its sha256 and a reminder to bump `fleet.target_agent_version` (config hot-reload picks it up). Docs for the manual drop-in flow. | ⬜ |
+| #6c | `herd publish` helper | Thin promote step: `herd publish [BINARY] --version <V> [--os --arch --publish-dir --config --force]` copies a binary into `{publish_dir}/{version}/{os}-{arch}/herd[.exe]` (the write side of `BinaryStore`), prints its sha256 (via `BinaryStore::sha256_of`, so it matches the gateway's advertised hash by construction) and a reminder to bump `fleet.target_agent_version`. Refuses to overwrite differing bytes without `--force`; identical bytes are idempotent. sha→stdout, narration→stderr. | ✅ |
 | #7 | `BackendPool` integration | Agent-registered nodes route identically to static backends; `NodeRegistry::find_for_model()`; conflict resolution (agent overrides static only on exact node-identity match). **Note (PR #5.1):** agents are now hard-excluded from `get_routable_nodes` by `source`; PR #7 must source agent routability from the in-memory registry's heartbeat freshness, not by falling through the SQLite pool path. | ⬜ |
 | #8 | Integration test + smoke | Gateway + 1 agent in same process; request routes through agent's (stub) llama-server end-to-end | ⬜ |
 
@@ -179,6 +179,20 @@ Locked decisions (extend the list above):
     `update_cleared` (true exactly when a normal beat disarms a prior `updating_since`),
     and the gateway persists on it — clearing the row back to 'online' independent of any
     version change. Verified by `normal_beat_with_same_version_clears_stuck_updating_row`.
+25. **`herd publish` is the write side of `BinaryStore`** (#6c). The promote subcommand
+    copies a binary into the exact layout the gateway serves and prints the sha256 via
+    `BinaryStore::sha256_of`, so the published hash matches the gateway's advertised hash
+    by construction (no second hashing implementation to drift). Design choices:
+    source defaults to `current_exe()` (publish the build you just made), positional
+    `[BINARY]` overrides for cross-publishing; `--version` is **required** — publishing
+    under the wrong version is the one silent mis-serve, so it is never defaulted from
+    `CARGO_PKG_VERSION`. os/arch default to host `std::env::consts`. publish-dir reuses
+    `FleetConfig::publish_dir_from` (`--publish-dir` > `HERD_AGENT_PUBLISH_DIR` > `--config`'s
+    `fleet.publish_dir` > `~/.herd/binaries`). Overwriting differing bytes is **refused
+    without `--force`** (a mid-flight sha change would break decision-18 verify); identical
+    bytes are idempotent (`Outcome::Unchanged`). sha256→stdout (scriptable), narration→stderr.
+    Thin promote only — no auto-bump of `target_agent_version` (a separate deliberate act,
+    decision 16), no list/prune/GC, no remote upload, no config `validate()`, no async.
 
 ---
 

@@ -46,6 +46,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Some(Command::Agent(args)) => herd::daemon::run(args).await,
         Some(Command::Serve(args)) => serve(args).await,
+        Some(Command::Publish(args)) => herd::publish::run(args),
         None => serve(cli.serve).await,
     }
 }

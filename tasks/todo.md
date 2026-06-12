@@ -3,83 +3,51 @@
 > Scratchpad for in-flight work. Milestone tracking lives in `ROADMAP.md`;
 > the v1.2 PR breakdown + acceptance checklist live in `tasks/HERD-V1.2-SPRINT.md`.
 
-**Last updated:** 2026-06-05
+**Last updated:** 2026-06-12
 
 ---
 
-## ✅ Verification complete (2026-06-05, post-toolchain-install)
+## In flight — v1.2 PR #6c: `herd publish` (branch `feat/v1.2-pr6c-publish`)
 
-PR #3 (`feat/v1.2-pr3-heartbeat-ingestion`) is now **compiler-verified**. Toolchain note:
-the machine had Rust (msvc) but no C/C++ build tools — installed VS 2022 Build Tools
-(VCTools + Windows SDK 10.0.26100) so linking and `ring` compile.
+Thin promote subcommand: copy a binary into `{publish_dir}/{version}/{os}-{arch}/herd[.exe]`,
+print sha256 + reminder to bump `fleet.target_agent_version`. Design by architect-pr6c (locked).
 
-Results:
-```
-cargo build                 # ✓ clean
-cargo test internal         # ✓ 8/8 heartbeat protocol tests pass
-cargo test                  # ✓ full suite green — 323 lib + 15 + 10 integration, 0 failures
-cargo fmt --check           # ✓ clean (applied fmt to src/api/internal.rs)
-cargo clippy --all-targets  # ✓ new code clean; one PRE-EXISTING warning in
-                            #   src/agent/store.rs:136 (sort_by → sort_by_key), unrelated to PR #3
-```
+**Decisions:** source = positional `[BINARY]`, default `current_exe()`; `--version` REQUIRED
+(no default — wrong version is the one silent mis-serve); os/arch default to host consts,
+overridable; publish-dir = `--publish-dir` > `HERD_AGENT_PUBLISH_DIR` env > `--config`'s
+`fleet.publish_dir` > `~/.herd/binaries` (reuse `FleetConfig::publish_dir_from`); overwrite
+refused on differing bytes without `--force`, identical bytes = idempotent; sha→stdout,
+narration→stderr; logic in new `src/publish.rs` (sync `pub fn run`), `PublishArgs` in `cli.rs`.
 
-**One real fix was needed** (the kind only a compiler catches): the `#[cfg(test)]`
-`AppState` builder in `src/server.rs` (reload-config test, ~L2246) was missing the new
-`node_registry` field — added `node_registry: Arc::new(NodeRegistry::new(Duration::from_secs(30)))`.
-The `tests/frontier_escalation.rs` builder already had it.
+### Build steps
+- [ ] 1. `cli.rs`: add `PublishArgs` struct + `Command::Publish(PublishArgs)` variant.
+- [ ] 2. `lib.rs`: `pub mod publish;` (keep alpha order).
+- [ ] 3. `src/publish.rs`: `run()` (arg resolution + stdout/stderr) wrapping a testable
+       `publish_inner(source, publish_dir, version, os, arch, force) -> Result<Outcome>`
+       returning `Written(sha)` | `Unchanged(sha)`. Validate version/os/arch up front via
+       `version_shaped`/`platform_shaped`; reuse `binary_path` + `BinaryStore::sha256_of`.
+- [ ] 4. `publish.rs`: `publish_dir_from_config(&Path) -> Result<Option<String>>` (read-only
+       `Config::from_file(...).fleet.publish_dir`, no `validate()`), called only when `--config` given.
+- [ ] 5. `main.rs`: dispatch `Some(Command::Publish(args)) => herd::publish::run(args)` (SYNC, no await).
+- [ ] 6. Tests: 11 unit (publish.rs, tempdir via `temp_dir()+process::id()` pattern — NO new dep) +
+       4 CLI-parse (cli.rs `cli_tests`). Key: returned sha == `BinaryStore` sha (by-construction
+       parity), refuse-overwrite, idempotent rehash, force-overwrite, malformed version/os/arch,
+       missing source, create-parent-dirs, config resolution, `--version` required.
+- [ ] 7. Docs: sprint-doc Decision 25 + flip #6c to ✅ in PR table; one README/fleet-docs line for
+       the manual drop-in flow. NOT the dashboard Agent Guide tab (CLI cmd, not HTTP endpoint).
 
-Spot-checks from the original review all held up:
-- `axum::body::Bytes` extractor is last in the `heartbeat` handler ✓
-- `#[serde(default)]` on `HeartbeatRequest::timestamp` deserializes correctly ✓
-- `constant_time_eq` is reachable as `pub(crate)` from `src/api/internal.rs` ✓
+### Verification gate (operator, before PR)
+- [ ] `cargo build` + `cargo test` (count grows from 468) + `cargo clippy --all-targets -- -D warnings` + `cargo fmt --check`
 
-Ready to commit (`feat(nodes): wire NodeRegistry onto AppState + heartbeat endpoint`),
-push, open PR #3.
+### Scope guard (OUT of #6c)
+No auto-bump of target version; no list/prune/GC; no remote upload (local disk only);
+no cross-compile/build invocation; no `latest` symlink; no full config `validate()`; no async.
 
----
-
-## In flight
-
-### v1.2 PR #3 — Gateway heartbeat ingestion ✅ (written, unverified)
-- [x] `NodeRegistry` on `AppState` (30s TTL)
-- [x] 10s stale-eviction background task in `server::run`
-- [x] `POST /api/internal/nodes/heartbeat` (`src/api/internal.rs`) + `HERD_AGENT_TOKEN` auth
-- [x] 8 heartbeat protocol unit tests
-- [x] Docs: sprint doc created, v2 spec reconciled
-- [x] **Compile + test verification** — green; fixed missing `node_registry` in test `AppState` builder
+### Done = green gate + reviewer CLEAN → commit + push → open PR vs `main`. Do NOT auto-merge.
 
 ---
 
-## Next — v1.2 PR #4: `herd agent` CLI + daemon
-
-The big structural one. Scope from `tasks/HERD-V1.2-SPRINT.md`:
-
-1. **CLI restructure** — `src/main.rs` is currently a flat `clap::Parser` (flags only).
-   Convert to subcommands: `serve` (default, today's behavior) + `agent`. Keep existing
-   flags (`--config`, `--port`, `--host`, `--backend`, `--update`) working under `serve`.
-   ⚠️ The v2 spec wrongly claims "cli.rs already dispatches subcommands" — it does not.
-   `src/cli.rs` is only `parse_backend_spec`. This restructure is real, unplanned-in-spec work.
-2. **`src/daemon/` module** (named `daemon`, not `agent`, to avoid colliding with the
-   existing agent-sessions `src/agent/`):
-   - `client.rs` — heartbeat client: POST capability snapshot to `--gateway` every 2s
-     (configurable), `HERD_AGENT_TOKEN` bearer. Reuse the `TestClock` pattern for timers.
-   - `capabilities.rs` — GPU/VRAM/model detection. Reuse herd-tune logic where possible.
-   - `lifecycle.rs` — spawn/supervise local `llama-server` (rpc-server deferred to v1.4).
-3. **Node ID** — hostname-derived default (`hostname-gpu`, e.g. `citadel-5090`), `--node-id` override.
-4. Tests: capability snapshot serialization round-trips against `AgentCapabilities`;
-   heartbeat client retries/backoff on gateway-down.
-
-## Then — remaining v1.2 PRs
-- **#5** — Dashboard Fleet tab projects `NodeRegistry` live state alongside SQLite operator nodes.
-- **#7** — `BackendPool` integration: agent nodes route like static backends; `NodeRegistry::find_for_model()`;
-  conflict resolution (agent overrides static only on exact `node_id` + address match); 503 when all gone.
-- **#8** — Integration test: gateway + 1 agent in-process, request routes through agent's stub llama-server.
-
----
-
-## Backlog / loose ends noticed during review
-- `tasks/HERD-V1.2-SPRINT.md` was missing entirely (referenced by ROADMAP + spec) — recreated 2026-06-05.
-- v1.1.1 and v1.1.2 are in `Cargo.toml`/commits but **not git-tagged** (tags stop at `v1.1.0`).
-  Consider `git tag v1.1.1 v1.1.2` retroactively, or tag at next release.
-- New endpoint not in `skills.md`/dashboard per CLAUDE.md rule — intentional: it's an internal
-  agent-protocol endpoint, not a client API. Dashboard surfacing is PR #5.
+## Backlog
+- #7 — `BackendPool` integration (agent nodes route via in-memory registry freshness, not SQLite pool).
+- #8 — Integration test: gateway + 1 agent in-process, request routes through agent's stub llama-server.
+- v1.1.1 / v1.1.2 not git-tagged (tags stop at v1.1.0) — tag retroactively or at next release.

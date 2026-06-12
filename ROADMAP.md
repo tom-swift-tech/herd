@@ -1,6 +1,6 @@
 # Herd Roadmap
 
-**Updated:** April 17, 2026
+**Updated:** June 12, 2026
 
 ## Vision
 
@@ -131,16 +131,16 @@ No cloud dependency. No API keys exposed. Full local control.
 
 Three-phase delivery introduces self-registering node agents and deployment-aware routing:
 
-- **v1.2** — Agent/Gateway foundation. `herd agent` subcommand, `NodeRegistry`, single-node deployments. Sprint plan: `tasks/HERD-V1.2-SPRINT.md`. *Status: PRs #1–#5.1 of 8 landed — `Deployment` module, `NodeRegistry` with TTL eviction, gateway heartbeat endpoint (`HERD_AGENT_TOKEN` auth), the node-side `herd agent` daemon (GPU/VRAM detection, local backend probe, 2s heartbeat with backoff), and agent node persistence (migration v5 `source`/`agent_version`, write-through on transitions, soft-evict + reaper, Fleet tab reads unified SQLite store). PR #6 (three stacked PRs) makes the gateway the fleet version authority: heartbeat responses advertise `target_agent_version` + a sha256-verified download offer served from a publish dir (#6a, landed), agents act on the offer — download from their own `--gateway` address (or the explicit `download_url` external override), verify sha256 before swap, self-replace, restart per respawn mode (`self`/`supervised`) — with an `updating` registry state + eviction grace so the restart gap never reads as node death (#6b, landed). Still to come: a `herd publish` promote helper (#6c). Remaining after that: `BackendPool` routing integration, end-to-end test.*
+- **v1.2** — Agent/Gateway foundation. `herd agent` subcommand, `NodeRegistry`, single-node deployments. Sprint plan: `tasks/HERD-V1.2-SPRINT.md`. *Status: PRs #1–#6c landed (fleet foundation: `Deployment` module, `NodeRegistry` with TTL eviction, gateway heartbeat endpoint (`HERD_AGENT_TOKEN` auth), `herd agent` daemon (GPU/VRAM detection, local backend probe, 2s heartbeat with backoff), agent node persistence (migration v5 `source`/`agent_version`, write-through on transitions, soft-evict + reaper, Fleet tab reads unified SQLite store), gateway version authority with sha256-verified download offers (#6a), agent self-update with verify-before-swap and eviction grace (#6b), and `herd publish` promote helper (#6c — `herd publish [BINARY] --version <V> [--os --arch --publish-dir --config --force]`, copies binary into `{publish_dir}/{version}/{os}-{arch}/herd[.exe]`, prints sha256, refuses overwrite of differing bytes without `--force`)). Remaining: `BackendPool` routing integration (#7) and end-to-end integration test (#8).*
 - **v1.3** — Speculative decoding deployments. Draft/verifier pairs across nodes via llama.cpp's `--model-draft` for 2-3x throughput on daily-driver models.
 - **v1.4** — Pipeline parallel deployments. llama.cpp RPC integration to serve models that don't fit on any single GPU (Qwen2.5-72B-class).
 
-Other v1.2.0+ items still on the list:
+The following items were originally listed alongside v1.2 but are **not part of the v1.2 foundation scope** — they target v1.3 and later:
 
-- Multi-node discovery (mDNS — full implementation)
-- Plugin system for custom routing strategies
-- Distributed health consensus
-- Multi-model consensus routing
+- Multi-node discovery (mDNS — full implementation) *(v1.3+)*
+- Plugin system for custom routing strategies *(v1.3+)*
+- Distributed health consensus *(v1.4+)*
+- Multi-model consensus routing *(v1.4+)*
 
 ## Get Involved
 

@@ -4,12 +4,14 @@
 [![GitHub stars](https://img.shields.io/github/stars/swift-innovate/herd?style=social)](https://github.com/swift-innovate/herd/stargazers)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.70+-orange.svg)](https://www.rust-lang.org)
-[![Roadmap](https://img.shields.io/badge/roadmap-v1.1-blue)](ROADMAP.md)
+[![Roadmap](https://img.shields.io/badge/roadmap-v1.2-blue)](ROADMAP.md)
 
 **Intelligent LLM fleet router with GPU awareness, multi-backend support, and real-time observability.**
 
 Route your llama herd with intelligence — Herd sits in front of your inference nodes (Ollama, llama-server, or any self-hosted OpenAI-compatible backend) and routes requests based on model availability, GPU load, and node health. One binary. One endpoint. Your entire fleet, unified.
 
+> **v1.2 (main):** `herd agent` node daemon, gateway version authority + agent self-update, `herd publish` promote step, and the `fleet:` config block. See [What's New in v1.2](#whats-new-in-v12).
+>
 > **New in v1.1:** TLS termination, per-client rate limiting, budget caps, routing profiles, Ollama blob extraction, multi-node discovery, **Frontier Gateway** (cloud-model routing with per-provider rate limits and live USD cost tracking), and auto-mode → frontier escalation. See [What's New in v1.1](#whats-new-in-v11).
 >
 > **v1.0:** llama-server (llama.cpp) as a first-class backend. Benchmarked at **44–80% faster TTFT** and **~4x throughput** vs Ollama on identical hardware. Herd is now vendor-agnostic across NVIDIA, AMD, and Intel GPUs. See [Backend Types](#backend-types) and the [benchmark data](docs/LLAMA_CPP_BACKEND.md).
@@ -22,6 +24,71 @@ Running multiple agents + parallel tool calls? Herd stops the GPU wars.
 Point your agents at `http://your-herd:40114` — model homing + live VRAM routing keeps every request on the fastest available node.
 
 Benchmarked on RTX 5090 with 4 concurrent agent requests: **41 seconds average TTFT via Ollama → 8 seconds via llama-server through Herd.** That's the difference between agents waiting and agents working.
+
+## What's New in v1.2
+
+These features are available on `main`. The released binary version remains 1.1.2; the v1.2 label tracks the roadmap milestone.
+
+### `herd agent` — Node Daemon
+
+Run `herd agent --gateway <url>` on each inference node. The daemon heartbeats its version, capabilities, and backend URL to the gateway every ~2 seconds. No manual registration step required — the node appears in `GET /api/nodes` as soon as the first heartbeat arrives.
+
+Key flags:
+
+| Flag | Default | Env override |
+|------|---------|-------------|
+| `--gateway <url>` | (required) | — |
+| `--node-id <id>` | hostname-gpu | — |
+| `--heartbeat-secs <n>` | `2` | `HERD_HEARTBEAT_SECS` |
+| `--backend-url <url>` | `http://127.0.0.1:11434` | — |
+| `--advertise-url <url>` | same as `--backend-url` | — |
+| `--backend <type>` | auto-detected | — |
+| `--respawn-mode <self\|supervised>` | `self` | `HERD_RESPAWN_MODE` |
+
+Auth: set `HERD_AGENT_TOKEN` on both the gateway and the agent node.
+
+### Gateway Version Authority + Agent Self-Update
+
+The gateway advertises `fleet.target_agent_version` on every heartbeat response. An agent whose version is older downloads the binary from the gateway, verifies the sha256, self-replaces, and restarts. An update offer is only attached when a binary is actually published under `publish_dir` for the target version and the agent's platform — no offer, no download.
+
+Operator flow:
+
+```bash
+# 1. Build
+cargo build --release
+
+# 2. Publish — defaults to the running binary and host os/arch
+herd publish ./target/release/herd --version 1.2.0
+# Prints sha256 to stdout; refuses to overwrite differing bytes without --force
+
+# 3. Set the target version in herd.yaml (hot-reloaded — no restart needed)
+#    fleet:
+#      target_agent_version: "1.2.0"
+# Agents pick it up on their next heartbeat.
+```
+
+### `herd publish` — Promote a Binary
+
+```
+herd publish [BINARY] --version <V> [--os <os>] [--arch <arch>]
+             [--publish-dir <dir>] [--config <file>] [--force]
+```
+
+`BINARY` defaults to the running binary (`current_exe()`). Writes `{publish_dir}/{version}/{os}-{arch}/herd[.exe]` and prints the sha256. `--force` is required to overwrite a file whose bytes differ from the source.
+
+### `fleet:` Config Block
+
+```yaml
+fleet:
+  target_agent_version: "1.2.0"          # version agents self-update to; env HERD_TARGET_AGENT_VERSION wins; defaults to gateway's own version
+  publish_dir: "~/.herd/binaries"        # where published agent binaries live; env HERD_AGENT_PUBLISH_DIR wins; default ~/.herd/binaries
+  download_url_base: "https://cdn.example.com/herd"  # OPTIONAL: external download source; unset = gateway serves binaries itself
+  respawn_mode: "self"                   # fleet-wide restart intent: self | supervised
+```
+
+All fields are optional with sensible defaults — an empty `fleet:` block or omitting it entirely is valid.
+
+---
 
 ## What's New in v1.1
 
@@ -295,7 +362,7 @@ Herd is a **smart stateless proxy with a stateful routing cache**. It is not HA 
 - **Blackwell detection** — Identifies RTX 5000-series GPUs requiring CUDA 13.x
 - **llama-server provisioning** — herd-tune downloads the correct llama-server binary per GPU vendor
 - **SQLite node registry** — Persistent fleet state with health polling
-- **Agent self-update** — The gateway is the fleet's version authority: agents (`herd agent`) heartbeat their version and self-update to the published target. Promote a build with `herd publish [BINARY] --version <V>` (defaults to the running binary and host os/arch), then set `fleet.target_agent_version: <V>` in `herd.yaml` (hot-reloaded). `publish` prints the sha256 the gateway will advertise and refuses to overwrite differing bytes without `--force`.
+- **Agent self-update** — The gateway is the fleet's version authority: agents (`herd agent`) heartbeat their version and self-update to the published target. Promote a build with `herd publish [BINARY] --version <V>` (defaults to the running binary and host os/arch), then set `fleet.target_agent_version: <V>` in the `fleet:` config block (hot-reloaded). `publish` prints the sha256 the gateway will advertise and refuses to overwrite differing bytes without `--force`. See [`fleet:` config block](#fleet-config-block) for all options.
 - **HuggingFace model search** — Search GGUF models with VRAM compatibility per-node
 - **Model download** — Pull models to Ollama nodes via API (llama-server download in roadmap)
 - **Ollama blob extraction** — Extract raw GGUF from Ollama blob storage for llama-server reuse
@@ -344,6 +411,25 @@ herd --port 40114 \
   --backend node-b=http://node-b:11434:80 \
   --backend node-c=http://node-c:11434:50
 ```
+
+### Running a fleet agent
+
+On each inference node, run the `herd agent` daemon alongside the backend. It self-registers with the gateway and keeps the node's health record live:
+
+```bash
+# Minimal — auto-detects backend type and node ID
+HERD_AGENT_TOKEN=your-token herd agent --gateway http://herd-host:40114
+
+# Explicit flags
+HERD_AGENT_TOKEN=your-token herd agent \
+  --gateway http://herd-host:40114 \
+  --node-id my-gpu-node \
+  --backend-url http://127.0.0.1:8090 \
+  --backend llama-server \
+  --heartbeat-secs 2
+```
+
+The node appears in `GET /api/nodes` as soon as the first heartbeat arrives. The gateway will offer a binary update if `fleet.target_agent_version` is set and a matching binary is published — the agent downloads, verifies, and self-replaces automatically.
 
 ## Using Herd with any LLM client
 
@@ -482,6 +568,12 @@ observability:
 agent:
   enabled: false             # Agent sessions, tool calling, permissions
 
+fleet:
+  target_agent_version: "1.2.0"    # version to push to all agents; defaults to gateway's own version
+  publish_dir: "~/.herd/binaries"  # where herd publish writes binaries
+  # download_url_base: "https://cdn.example.com/herd"  # omit to serve binaries from the gateway
+  respawn_mode: "self"             # self | supervised
+
 routing:
   auto:
     enabled: false           # Auto Mode: off by default
@@ -587,6 +679,8 @@ Request IDs are included in JSONL analytics logs for correlation across systems.
 | `GET /api/ollama/models` | List extractable Ollama models |
 | `POST /api/ollama/extract` | Extract GGUF from Ollama blob storage |
 | `GET /api/frontier/costs` | Per-provider monthly spend and token totals |
+| `POST /api/internal/nodes/heartbeat` | Agent capability + version heartbeat — `herd agent` protocol only (`HERD_AGENT_TOKEN` bearer) |
+| `GET /api/internal/nodes/binary/{version}/{os}-{arch}` | Serve published agent binary for self-update — `herd agent` protocol only (`HERD_AGENT_TOKEN` bearer) |
 
 ## Telemetry & Prometheus Metrics
 

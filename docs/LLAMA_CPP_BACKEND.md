@@ -79,6 +79,25 @@ Herd doesn't care about GPU vendor — it talks OpenAI-compatible HTTP to each n
 
 **Fleet mode** (new): One Herd instance is the host. Each additional node runs llama-server with the appropriate GPU backend. herd-tune detects hardware, downloads the correct llama-server binary, and registers with the host.
 
+### Fleet Architecture (v1.2): the `herd agent` daemon
+
+v1.2 adds a lightweight node daemon — `herd agent` — that can run alongside any node backend (Ollama or llama-server). This is an evolution of fleet mode, not a replacement for the static herd-tune enrollment flow: both coexist and the gateway routes to all of them identically.
+
+**How it works:** A node starts `herd agent --gateway <gateway-url>`. The daemon registers with the gateway on startup and sends periodic heartbeats. The gateway is the fleet version authority: it holds a `fleet:` config block specifying `target_agent_version`, `publish_dir`, `download_url_base`, and `respawn_mode`. On each heartbeat response the gateway can include an update offer when the agent's reported version is behind target.
+
+**Self-update flow:** On receiving an update offer the agent downloads the new binary from `{download_url_base}/{version}/{os}-{arch}/herd[.exe]`, verifies the sha256 digest, atomically replaces itself, then restarts via the configured respawn mode (`self` — re-exec in place, or `supervised` — signal the parent supervisor and exit). A `herd publish [BINARY] --version <V>` command promotes a built binary into the publish directory.
+
+**What this adds to the fleet picture:**
+
+```
+[Herd Gateway]  --HTTP/OpenAI-->  [llama-server node 1]  <-- herd agent (heartbeat + self-update)
+                --HTTP/OpenAI-->  [llama-server node 2]  <-- herd agent
+                --HTTP/OpenAI-->  [Ollama node 3]         <-- herd agent (or static, both work)
+                --HTTP/OpenAI-->  [llama-server node 4]  <-- herd-tune enrolled (static)
+```
+
+Nodes without a running agent daemon still work — heartbeat-enrolled nodes and statically registered nodes coexist in the same registry and are routed identically.
+
 ### Node Setup (herd-tune changes)
 
 herd-tune currently assumes Ollama. For llama-server backends, herd-tune needs to:
@@ -153,4 +172,4 @@ Prefix caching (available in llama-server) is directly relevant to VALOR operati
 - [x] Add `herd search` API endpoint (inspired by Fox's model search UX) -- available at `GET /api/models/search`
 - [ ] Test ROCm backend on an AMD node (minipc candidate if swapped to AMD GPU)
 - [ ] Fix streaming token counter in benchmark harness for complete throughput data
-- [ ] Investigate llama.cpp RPC for tensor-parallel sharding across fleet nodes (v2.0+)
+- [ ] Investigate llama.cpp RPC for tensor-parallel sharding across fleet nodes (v1.4+)

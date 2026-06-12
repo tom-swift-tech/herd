@@ -334,3 +334,29 @@ observability:
 #     rate_limit: 100
 #     monthly_budget: 50.00
 #     priority: 20
+
+# === FLEET MANAGEMENT ===
+# Agent self-update: herd agent daemons running on each node heartbeat the gateway
+# every ~2s and self-update when the gateway advertises a newer published binary.
+# All fields optional — defaults work out of the box (gateway serves its own version).
+#
+# Operator promote workflow:
+#   1. cargo build --release
+#   2. herd publish ./target/release/herd --version 1.2.0
+#      (prints the sha256 the gateway will advertise)
+#   3. Set fleet.target_agent_version: "1.2.0" in herd.yaml (supports hot-reload —
+#      POST /admin/reload or wait for the 30s file-watcher cycle; no restart needed)
+#   4. Agents self-update on their next heartbeat (~2s); old binary is evicted after
+#      the grace period
+
+# fleet:
+#   target_agent_version: "1.2.0"          # version agents self-update to;
+#                                           # env HERD_TARGET_AGENT_VERSION wins;
+#                                           # defaults to the gateway's own version
+#   publish_dir: "~/.herd/binaries"        # where published agent binaries live;
+#                                           # env HERD_AGENT_PUBLISH_DIR wins;
+#                                           # default: ~/.herd/binaries
+#   download_url_base: "https://cdn.example.com/herd"
+#                                           # OPTIONAL external download source;
+#                                           # unset = gateway serves binaries itself
+#   respawn_mode: "self"                   # fleet-wide restart intent: self | supervised

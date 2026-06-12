@@ -387,6 +387,51 @@ clients like Open WebUI from accidentally evicting models.
 **Hot models warmer:** Backends can declare `hot_models` — Herd pings each one
 every 4 minutes with `keep_alive: "-1"` to pre-load on startup and recover from OOM.
 
+## Fleet Self-Update (agent heartbeat protocol)
+
+`herd agent` is a daemon that runs on each node alongside the backend (Ollama, llama-server, etc.).
+It does two things:
+
+1. **Heartbeat** — calls `POST /api/internal/nodes/heartbeat` every ~2 seconds. The gateway
+   responds with the current `target_version`, and when a newer published binary is available for
+   the agent's platform, also returns `download_url` and `sha256`.
+2. **Self-update** — when the heartbeat response advertises a version newer than the running binary,
+   the agent downloads, verifies (sha256), and hot-swaps itself. The old process gets a grace period
+   to drain in-flight work before eviction.
+
+**Auth:** Both internal endpoints require `Authorization: Bearer <HERD_AGENT_TOKEN>`. This token
+is never shared with client chat agents.
+
+### Promoting a new agent binary
+
+```bash
+# 1. Build
+cargo build --release
+
+# 2. Publish — prints the sha256 the gateway will advertise
+herd publish ./target/release/herd --version 1.2.0
+
+# 3. Point the fleet at the new version (hot-reload — no gateway restart needed)
+#    Edit herd.yaml:
+#      fleet:
+#        target_agent_version: "1.2.0"
+#    Then: POST /admin/reload  (or wait up to 30s for the file-watcher)
+
+# 4. Agents self-update on their next heartbeat (~2s)
+```
+
+### `fleet:` config knobs (all optional)
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `target_agent_version` | gateway's own version | Version agents self-update to. Env `HERD_TARGET_AGENT_VERSION` wins. |
+| `publish_dir` | `~/.herd/binaries` | Directory where `herd publish` drops binaries. Env `HERD_AGENT_PUBLISH_DIR` wins. |
+| `download_url_base` | _(unset)_ | External CDN base URL for binary downloads. Unset = gateway serves binaries itself. |
+| `respawn_mode` | `self` | Fleet-wide restart intent: `self` (agent re-execs itself) or `supervised` (hands off to the process supervisor). |
+
+An empty or absent `fleet:` block is valid — agents will not self-update unless binaries are
+actually published.
+
 ## Quick Reference
 
 | Action | Method | Endpoint | Notes |
@@ -492,4 +537,10 @@ circuit_breaker:
   failure_threshold: 3
   timeout: 120s
   recovery_time: 60s
+
+fleet:                    # agent self-update (all optional)
+  target_agent_version: "1.2.0"
+  publish_dir: "~/.herd/binaries"
+  # download_url_base: "https://cdn.example.com/herd"
+  # respawn_mode: "self"
 ```

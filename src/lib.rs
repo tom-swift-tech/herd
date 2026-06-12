@@ -14,6 +14,7 @@ pub mod metrics;
 pub mod nodes;
 pub mod profiles;
 pub mod providers;
+pub mod publish;
 pub mod rate_limit;
 pub mod router;
 pub mod server;

@@ -295,6 +295,7 @@ Herd is a **smart stateless proxy with a stateful routing cache**. It is not HA 
 - **Blackwell detection** — Identifies RTX 5000-series GPUs requiring CUDA 13.x
 - **llama-server provisioning** — herd-tune downloads the correct llama-server binary per GPU vendor
 - **SQLite node registry** — Persistent fleet state with health polling
+- **Agent self-update** — The gateway is the fleet's version authority: agents (`herd agent`) heartbeat their version and self-update to the published target. Promote a build with `herd publish [BINARY] --version <V>` (defaults to the running binary and host os/arch), then set `fleet.target_agent_version: <V>` in `herd.yaml` (hot-reloaded). `publish` prints the sha256 the gateway will advertise and refuses to overwrite differing bytes without `--force`.
 - **HuggingFace model search** — Search GGUF models with VRAM compatibility per-node
 - **Model download** — Pull models to Ollama nodes via API (llama-server download in roadmap)
 - **Ollama blob extraction** — Extract raw GGUF from Ollama blob storage for llama-server reuse

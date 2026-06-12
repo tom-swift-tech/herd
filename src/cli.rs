@@ -27,6 +27,39 @@ pub enum Command {
     Serve(ServeArgs),
     /// Run the node-side agent daemon that heartbeats a gateway
     Agent(AgentArgs),
+    /// Promote a binary into the fleet publish-dir for an os/arch
+    Publish(PublishArgs),
+}
+
+#[derive(clap::Args)]
+pub struct PublishArgs {
+    /// Binary to publish (default: the currently running herd executable)
+    #[arg(value_name = "BINARY")]
+    pub binary: Option<PathBuf>,
+
+    /// Version to publish under (path component: fleet.target_agent_version)
+    #[arg(long, value_name = "VERSION")]
+    pub version: String,
+
+    /// Target OS (default: host OS, e.g. linux/windows/macos)
+    #[arg(long, value_name = "OS")]
+    pub os: Option<String>,
+
+    /// Target arch (default: host arch, e.g. x86_64/aarch64)
+    #[arg(long, value_name = "ARCH")]
+    pub arch: Option<String>,
+
+    /// Publish directory root (overrides HERD_AGENT_PUBLISH_DIR and config)
+    #[arg(long, value_name = "DIR")]
+    pub publish_dir: Option<PathBuf>,
+
+    /// Read fleet.publish_dir from this config file when --publish-dir is unset
+    #[arg(short, long, value_name = "FILE")]
+    pub config: Option<PathBuf>,
+
+    /// Overwrite an existing binary even if its bytes (sha256) differ
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(clap::Args)]
@@ -215,6 +248,72 @@ mod cli_tests {
             "vllm"
         ])
         .is_err());
+    }
+
+    #[test]
+    fn publish_subcommand_parses_with_defaults() {
+        let cli = Cli::try_parse_from(["herd", "publish", "--version", "1.2.0"]).unwrap();
+        match cli.command {
+            Some(Command::Publish(args)) => {
+                assert!(args.binary.is_none());
+                assert_eq!(args.version, "1.2.0");
+                assert!(args.os.is_none());
+                assert!(args.arch.is_none());
+                assert!(args.publish_dir.is_none());
+                assert!(args.config.is_none());
+                assert!(!args.force);
+            }
+            _ => panic!("expected publish subcommand"),
+        }
+    }
+
+    #[test]
+    fn publish_accepts_positional_and_overrides() {
+        let cli = Cli::try_parse_from([
+            "herd",
+            "publish",
+            "./herd-arm",
+            "--version",
+            "1.2.0",
+            "--os",
+            "linux",
+            "--arch",
+            "aarch64",
+            "--publish-dir",
+            "/srv/bin",
+            "--force",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Publish(args)) => {
+                use std::path::Path;
+                assert_eq!(args.binary.as_deref().unwrap(), Path::new("./herd-arm"));
+                assert_eq!(args.version, "1.2.0");
+                assert_eq!(args.os.as_deref(), Some("linux"));
+                assert_eq!(args.arch.as_deref(), Some("aarch64"));
+                assert_eq!(args.publish_dir.as_deref().unwrap(), Path::new("/srv/bin"));
+                assert!(args.force);
+            }
+            _ => panic!("expected publish subcommand"),
+        }
+    }
+
+    #[test]
+    fn publish_requires_version() {
+        assert!(Cli::try_parse_from(["herd", "publish"]).is_err());
+    }
+
+    #[test]
+    fn publish_config_short_flag() {
+        let cli = Cli::try_parse_from(["herd", "publish", "--version", "1.2.0", "-c", "herd.yaml"])
+            .unwrap();
+        match cli.command {
+            Some(Command::Publish(args)) => {
+                use std::path::Path;
+                assert_eq!(args.config.as_deref().unwrap(), Path::new("herd.yaml"));
+            }
+            _ => panic!("expected publish subcommand"),
+        }
     }
 }
 

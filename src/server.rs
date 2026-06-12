@@ -459,7 +459,16 @@ impl Server {
 
         // In-memory registry for agent-heartbeat nodes (v1.2). 30s TTL — an agent
         // heartbeats every ~2s, so 30s tolerates ~15 missed beats before eviction.
-        let node_registry = Arc::new(crate::nodes::NodeRegistry::new(Duration::from_secs(30)));
+        // Nodes mid-self-update get a longer grace (default 180s) so the
+        // download+swap+restart gap doesn't read as an outage.
+        let update_grace_secs = std::env::var("HERD_AGENT_UPDATE_GRACE_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(crate::nodes::registry::DEFAULT_UPDATE_GRACE.as_secs());
+        let node_registry = Arc::new(
+            crate::nodes::NodeRegistry::new(Duration::from_secs(30))
+                .with_update_grace(Duration::from_secs(update_grace_secs)),
+        );
 
         let budget = crate::budget::BudgetTracker::new(self.config.budget.clone());
 

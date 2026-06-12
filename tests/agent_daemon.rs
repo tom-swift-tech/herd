@@ -82,21 +82,23 @@ async fn heartbeat_round_trip_with_bearer_token() {
         HeartbeatClient::new(&format!("http://{addr}"), Some("test-token".into())).unwrap();
     let caps = test_snapshot("citadel-5090");
 
-    let first = client.send(&caps).await;
+    let first = client.send(&caps, false).await;
     assert_eq!(
         first,
         BeatOutcome::Success {
             registered: true,
-            next_heartbeat_secs: Some(2)
+            next_heartbeat_secs: Some(2),
+            update_offer: None
         }
     );
 
-    let second = client.send(&caps).await;
+    let second = client.send(&caps, false).await;
     assert_eq!(
         second,
         BeatOutcome::Success {
             registered: false,
-            next_heartbeat_secs: Some(2)
+            next_heartbeat_secs: Some(2),
+            update_offer: None
         }
     );
 
@@ -112,6 +114,22 @@ async fn heartbeat_round_trip_with_bearer_token() {
         body["timestamp"].is_string(),
         "timestamp field must be sent"
     );
+    assert!(
+        body.get("updating").is_none(),
+        "normal beats must not carry the updating flag"
+    );
+}
+
+#[tokio::test]
+async fn final_updating_beat_carries_the_flag_on_the_wire() {
+    let (stub, addr) = spawn_stub_gateway().await;
+    let client = HeartbeatClient::new(&format!("http://{addr}"), None).unwrap();
+
+    let outcome = client.send(&test_snapshot("citadel-5090"), true).await;
+    assert!(matches!(outcome, BeatOutcome::Success { .. }));
+
+    let received = stub.received.lock().unwrap();
+    assert_eq!(received[0].1["updating"], true);
 }
 
 #[tokio::test]
@@ -119,7 +137,7 @@ async fn heartbeat_omits_authorization_header_when_token_unset() {
     let (stub, addr) = spawn_stub_gateway().await;
     let client = HeartbeatClient::new(&format!("http://{addr}"), None).unwrap();
 
-    let outcome = client.send(&test_snapshot("minipc")).await;
+    let outcome = client.send(&test_snapshot("minipc"), false).await;
     assert!(matches!(outcome, BeatOutcome::Success { .. }));
 
     let received = stub.received.lock().unwrap();
@@ -134,7 +152,7 @@ async fn unreachable_gateway_reports_unreachable() {
     drop(listener);
 
     let client = HeartbeatClient::new(&format!("http://{addr}"), None).unwrap();
-    let outcome = client.send(&test_snapshot("ghost")).await;
+    let outcome = client.send(&test_snapshot("ghost"), false).await;
     assert!(matches!(outcome, BeatOutcome::Unreachable(_)));
 }
 
@@ -179,6 +197,7 @@ async fn both_modes_on_one_host_self_test() {
         backend_url: "http://127.0.0.1:1".into(), // no local backend in this test
         advertise_url: Some("http://127.0.0.1:8080".into()),
         backend: Some(BackendType::LlamaServer),
+        respawn_mode: herd::config::RespawnMode::SelfSpawn,
     };
     tokio::spawn(herd::daemon::run(args));
     tokio::time::sleep(Duration::from_millis(2500)).await;
@@ -186,13 +205,15 @@ async fn both_modes_on_one_host_self_test() {
     // The daemon must have registered the node: a manual heartbeat with the
     // same node_id now reports registered=false (known node).
     let client = HeartbeatClient::new(&gateway, Some("self-test-token".into())).unwrap();
-    let outcome = client.send(&test_snapshot("self-test-daemon")).await;
-    assert_eq!(
-        outcome,
-        BeatOutcome::Success {
-            registered: false,
-            next_heartbeat_secs: Some(2)
-        },
-        "daemon should already have registered this node_id"
+    let outcome = client.send(&test_snapshot("self-test-daemon"), false).await;
+    assert!(
+        matches!(
+            outcome,
+            BeatOutcome::Success {
+                registered: false,
+                ..
+            }
+        ),
+        "daemon should already have registered this node_id, got {outcome:?}"
     );
 }

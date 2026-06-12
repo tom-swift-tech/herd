@@ -6,6 +6,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 const DEFAULT_MAX_AGENT_NODES: usize = 1024;
+/// Default extra time an agent that announced a self-update restart is
+/// protected from eviction (override via HERD_AGENT_UPDATE_GRACE_SECS,
+/// applied where the registry is constructed).
+pub const DEFAULT_UPDATE_GRACE: Duration = Duration::from_secs(180);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentCapabilities {
@@ -41,6 +45,11 @@ pub struct AgentCapabilities {
 pub struct AgentState {
     pub capabilities: AgentCapabilities,
     pub last_heartbeat: Instant,
+    /// Set when the agent's latest beat announced a self-update restart
+    /// (`updating: true`); cleared by the next normal beat. While set,
+    /// `evict_stale` grants the node a grace window beyond the TTL so the
+    /// restart gap doesn't read as an outage.
+    pub updating_since: Option<Instant>,
 }
 
 impl AgentState {
@@ -62,6 +71,17 @@ pub enum HeartbeatOutcome {
         /// themselves (the registry already holds both snapshots under the
         /// write lock).
         models_changed: bool,
+        /// True when this beat's `agent_version` differs from the previous
+        /// one — the restarted agent's first beat after a self-update.
+        /// Callers must persist on this too, or the Fleet row stays stuck at
+        /// 'updating' with the old version.
+        version_changed: bool,
+        /// True exactly when this beat cleared a previously-armed
+        /// `updating_since` — i.e. the agent resumed normal beats after
+        /// announcing a restart. Callers must persist on this so the Fleet
+        /// row un-sticks from `'updating'` even when the version didn't
+        /// change (e.g. a failed respawn that kept the old binary running).
+        update_cleared: bool,
     },
 }
 
@@ -102,6 +122,7 @@ pub struct NodeRegistry {
     nodes: Arc<RwLock<HashMap<String, AgentState>>>,
     ttl: Duration,
     max_nodes: usize,
+    update_grace: Duration,
     clock: Clock,
 }
 
@@ -123,13 +144,34 @@ impl NodeRegistry {
             nodes: Arc::new(RwLock::new(HashMap::new())),
             ttl,
             max_nodes: max_nodes.max(1),
+            update_grace: DEFAULT_UPDATE_GRACE,
             clock,
         }
     }
 
+    /// Override the self-update eviction grace (HERD_AGENT_UPDATE_GRACE_SECS
+    /// is resolved by the caller — the registry never reads env itself).
+    pub fn with_update_grace(mut self, grace: Duration) -> Self {
+        self.update_grace = grace;
+        self
+    }
+
+    /// Record a normal heartbeat (no self-update restart announced).
     pub async fn heartbeat(
         &self,
         caps: AgentCapabilities,
+    ) -> Result<HeartbeatOutcome, RegistryError> {
+        self.heartbeat_with(caps, false).await
+    }
+
+    /// Record a heartbeat. `updating: true` is the agent's announcement that
+    /// it is about to restart for a self-update — it stamps `updating_since`
+    /// so `evict_stale` grants the node a grace window; any normal beat
+    /// clears it.
+    pub async fn heartbeat_with(
+        &self,
+        caps: AgentCapabilities,
+        updating: bool,
     ) -> Result<HeartbeatOutcome, RegistryError> {
         let now = (self.clock)();
         let mut nodes = self.nodes.write().await;
@@ -138,9 +180,27 @@ impl NodeRegistry {
             Some(existing) => {
                 let models_changed =
                     !same_model_set(&existing.capabilities.models_loaded, &caps.models_loaded);
+                let version_changed = existing.capabilities.agent_version != caps.agent_version;
+                // True when this normal beat clears a previously-armed
+                // updating_since (agent resumed after restart announcement).
+                // Computed BEFORE mutating updating_since so the check sees
+                // the previous state.
+                let update_cleared = !updating && existing.updating_since.is_some();
                 existing.capabilities = caps;
                 existing.last_heartbeat = now;
-                Ok(HeartbeatOutcome::Updated { models_changed })
+                if updating {
+                    // Keep the first announcement's timestamp: a stuck agent
+                    // re-sending updating beats must not extend its grace
+                    // window indefinitely.
+                    existing.updating_since.get_or_insert(now);
+                } else {
+                    existing.updating_since = None;
+                }
+                Ok(HeartbeatOutcome::Updated {
+                    models_changed,
+                    version_changed,
+                    update_cleared,
+                })
             }
             None => {
                 if nodes.len() >= self.max_nodes {
@@ -153,6 +213,7 @@ impl NodeRegistry {
                     AgentState {
                         capabilities: caps,
                         last_heartbeat: now,
+                        updating_since: updating.then_some(now),
                     },
                 );
                 Ok(HeartbeatOutcome::Registered)
@@ -163,10 +224,19 @@ impl NodeRegistry {
     pub async fn evict_stale(&self) -> Vec<String> {
         let now = (self.clock)();
         let ttl = self.ttl;
+        let grace = self.update_grace;
         let mut nodes = self.nodes.write().await;
         let mut evicted: Vec<String> = nodes
             .iter()
-            .filter(|(_, state)| now.duration_since(state.last_heartbeat) > ttl)
+            .filter(|(_, state)| {
+                let stale = now.duration_since(state.last_heartbeat) > ttl;
+                // A node mid-self-update gets `update_grace` from its
+                // announcement before normal TTL eviction resumes.
+                let in_update_grace = state
+                    .updating_since
+                    .is_some_and(|since| now.duration_since(since) <= grace);
+                stale && !in_update_grace
+            })
             .map(|(id, _)| id.clone())
             .collect();
         evicted.sort();
@@ -283,7 +353,9 @@ mod tests {
         assert_eq!(
             outcome,
             HeartbeatOutcome::Updated {
-                models_changed: false
+                models_changed: false,
+                version_changed: false,
+                update_cleared: false,
             }
         );
         assert_eq!(reg.len().await, 1);
@@ -300,7 +372,9 @@ mod tests {
         assert_eq!(
             outcome,
             HeartbeatOutcome::Updated {
-                models_changed: true
+                models_changed: true,
+                version_changed: false,
+                update_cleared: false,
             }
         );
     }
@@ -321,7 +395,9 @@ mod tests {
         assert_eq!(
             outcome,
             HeartbeatOutcome::Updated {
-                models_changed: false
+                models_changed: false,
+                version_changed: false,
+                update_cleared: false,
             }
         );
     }
@@ -371,12 +447,14 @@ mod tests {
         let fresh = AgentState {
             capabilities: sample_caps("a"),
             last_heartbeat: Instant::now(),
+            updating_since: None,
         };
         assert!(fresh.is_fresh(Duration::from_secs(30)));
 
         let stale = AgentState {
             capabilities: sample_caps("a"),
             last_heartbeat: Instant::now() - Duration::from_secs(31),
+            updating_since: None,
         };
         assert!(!stale.is_fresh(Duration::from_secs(30)));
     }
@@ -428,9 +506,169 @@ mod tests {
         assert_eq!(
             outcome,
             HeartbeatOutcome::Updated {
-                models_changed: false
+                models_changed: false,
+                version_changed: false,
+                update_cleared: false,
             }
         );
         assert_eq!(reg.len().await, 1);
+    }
+
+    // ---- self-update grace and version-change reporting (PR #6b) ----
+
+    fn caps_with_version(node_id: &str, version: &str) -> AgentCapabilities {
+        let mut caps = sample_caps(node_id);
+        caps.agent_version = version.to_string();
+        caps
+    }
+
+    #[tokio::test]
+    async fn heartbeat_reports_version_changed_after_update() {
+        let (reg, _clock) = registry_with_clock(Duration::from_secs(30));
+        reg.heartbeat(caps_with_version("a", "1.2.0"))
+            .await
+            .unwrap();
+        let outcome = reg
+            .heartbeat(caps_with_version("a", "1.3.0"))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            HeartbeatOutcome::Updated {
+                models_changed: false,
+                version_changed: true,
+                update_cleared: false,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn updating_beat_sets_and_normal_beat_clears_updating_since() {
+        let (reg, _clock) = registry_with_clock(Duration::from_secs(30));
+        reg.heartbeat(sample_caps("a")).await.unwrap();
+        assert!(reg.get("a").await.unwrap().updating_since.is_none());
+
+        reg.heartbeat_with(sample_caps("a"), true).await.unwrap();
+        assert!(reg.get("a").await.unwrap().updating_since.is_some());
+
+        reg.heartbeat(sample_caps("a")).await.unwrap();
+        assert!(reg.get("a").await.unwrap().updating_since.is_none());
+    }
+
+    #[tokio::test]
+    async fn repeated_updating_beats_keep_the_first_announcement_instant() {
+        let (reg, clock) = registry_with_clock(Duration::from_secs(30));
+        reg.heartbeat_with(sample_caps("a"), true).await.unwrap();
+        let first = reg.get("a").await.unwrap().updating_since.unwrap();
+        clock.advance(Duration::from_secs(10));
+        reg.heartbeat_with(sample_caps("a"), true).await.unwrap();
+        assert_eq!(
+            reg.get("a").await.unwrap().updating_since,
+            Some(first),
+            "a stuck agent must not extend its own grace window"
+        );
+    }
+
+    #[tokio::test]
+    async fn evict_stale_spares_updating_node_within_grace() {
+        let (reg, clock) = registry_with_clock(Duration::from_secs(30));
+        reg.heartbeat_with(sample_caps("a"), true).await.unwrap();
+
+        // Well past the 30s TTL but inside the default 180s update grace.
+        clock.advance(Duration::from_secs(120));
+        assert!(reg.evict_stale().await.is_empty());
+        assert_eq!(reg.len().await, 1);
+    }
+
+    #[tokio::test]
+    async fn evict_stale_evicts_updating_node_after_grace_expires() {
+        let (reg, clock) = registry_with_clock(Duration::from_secs(30));
+        let reg = reg.with_update_grace(Duration::from_secs(60));
+        reg.heartbeat_with(sample_caps("a"), true).await.unwrap();
+
+        clock.advance(Duration::from_secs(61));
+        assert_eq!(reg.evict_stale().await, vec!["a".to_string()]);
+        assert_eq!(reg.len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn normal_beat_after_update_restores_ttl_eviction() {
+        let (reg, clock) = registry_with_clock(Duration::from_secs(30));
+        reg.heartbeat_with(sample_caps("a"), true).await.unwrap();
+        clock.advance(Duration::from_secs(10));
+        // Restarted agent beats normally — grace is gone, plain TTL applies.
+        reg.heartbeat(caps_with_version("a", "1.3.0"))
+            .await
+            .unwrap();
+        clock.advance(Duration::from_secs(31));
+        assert_eq!(reg.evict_stale().await, vec!["a".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn updating_node_within_grace_is_not_fresh_for_routing() {
+        // Grace protects against *eviction* only — a restarting node must
+        // still drop out of the routable set as soon as its TTL lapses.
+        let (reg, clock) = registry_with_clock(Duration::from_secs(30));
+        reg.heartbeat_with(sample_caps("a"), true).await.unwrap();
+        clock.advance(Duration::from_secs(31));
+        assert!(reg.fresh_nodes().await.is_empty());
+        assert_eq!(reg.list().await.len(), 1);
+    }
+
+    // ---- update_cleared field (PR #6b failed-respawn fix) ----
+
+    #[tokio::test]
+    async fn update_cleared_is_false_on_updating_beat() {
+        let (reg, _clock) = registry_with_clock(Duration::from_secs(30));
+        reg.heartbeat(sample_caps("a")).await.unwrap();
+        let outcome = reg.heartbeat_with(sample_caps("a"), true).await.unwrap();
+        assert_eq!(
+            outcome,
+            HeartbeatOutcome::Updated {
+                models_changed: false,
+                version_changed: false,
+                update_cleared: false,
+            },
+            "an updating beat must not report update_cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_cleared_is_true_on_first_normal_beat_after_updating() {
+        let (reg, _clock) = registry_with_clock(Duration::from_secs(30));
+        reg.heartbeat(sample_caps("a")).await.unwrap();
+        reg.heartbeat_with(sample_caps("a"), true).await.unwrap();
+
+        // First normal beat after an updating beat must clear the flag.
+        let outcome = reg.heartbeat(sample_caps("a")).await.unwrap();
+        assert_eq!(
+            outcome,
+            HeartbeatOutcome::Updated {
+                models_changed: false,
+                version_changed: false,
+                update_cleared: true,
+            },
+            "first normal beat after updating must report update_cleared=true"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_cleared_is_false_on_subsequent_normal_beats() {
+        let (reg, _clock) = registry_with_clock(Duration::from_secs(30));
+        reg.heartbeat(sample_caps("a")).await.unwrap();
+        reg.heartbeat_with(sample_caps("a"), true).await.unwrap();
+        // Clear beat.
+        reg.heartbeat(sample_caps("a")).await.unwrap();
+        // Subsequent steady beat: updating_since is already None, nothing to clear.
+        let outcome = reg.heartbeat(sample_caps("a")).await.unwrap();
+        assert_eq!(
+            outcome,
+            HeartbeatOutcome::Updated {
+                models_changed: false,
+                version_changed: false,
+                update_cleared: false,
+            },
+            "steady-state beat after clearing must not report update_cleared"
+        );
     }
 }

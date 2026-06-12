@@ -658,12 +658,49 @@ pub struct FleetConfig {
     pub publish_dir: Option<String>,
 
     /// Base URL agents download binaries from. Unset (default) means the
-    /// gateway serves them itself and builds the URL from the heartbeat
-    /// request's Host header. Point this at an external host (e.g. GitHub
-    /// release assets) to hand off downloads with no agent-side change —
-    /// agents treat the URL as opaque.
+    /// gateway serves them itself and sends no download_url at all — agents
+    /// construct the URL from their own --gateway address (presence of
+    /// download_url in a heartbeat reply ⇔ external override). Point this at
+    /// an external host (e.g. GitHub release assets) to hand off downloads
+    /// with no agent-side change — agents treat the URL as opaque.
     #[serde(default)]
     pub download_url_base: Option<String>,
+
+    /// How agents restart themselves after applying a self-update. Agents
+    /// read this via the HERD_RESPAWN_MODE env var or `herd agent
+    /// --respawn-mode` (they don't load herd.yaml); this field documents the
+    /// fleet-wide intent and is reserved for heartbeat relay in a later PR.
+    #[serde(default)]
+    pub respawn_mode: RespawnMode,
+}
+
+/// How `herd agent` brings the new binary up after a self-update swap.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RespawnMode {
+    /// Spawn the (now-replaced) executable with the same argv and env, then
+    /// exit. For `herd agent` run bare in a terminal.
+    #[default]
+    #[serde(rename = "self")]
+    SelfSpawn,
+    /// Exit(0) only — the supervisor (NSSM, systemd Restart=always, ...)
+    /// brings up the new binary. Self-spawning here would double-run the
+    /// agent under the service manager.
+    Supervised,
+}
+
+impl std::str::FromStr for RespawnMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim() {
+            "self" => Ok(Self::SelfSpawn),
+            "supervised" => Ok(Self::Supervised),
+            other => Err(format!(
+                "unknown respawn mode '{other}' (expected 'self' or 'supervised')"
+            )),
+        }
+    }
 }
 
 impl FleetConfig {
@@ -1081,6 +1118,29 @@ mod tests {
         let mut config: Config = serde_yaml::from_str(yaml).unwrap();
         config.validate().unwrap();
         assert!(config.fleet.target_agent_version.is_none());
+    }
+
+    #[test]
+    fn respawn_mode_defaults_to_self_and_parses_both_values() {
+        let config = Config::default();
+        assert_eq!(config.fleet.respawn_mode, super::RespawnMode::SelfSpawn);
+
+        assert_eq!(
+            "self".parse::<super::RespawnMode>().unwrap(),
+            super::RespawnMode::SelfSpawn
+        );
+        assert_eq!(
+            "supervised".parse::<super::RespawnMode>().unwrap(),
+            super::RespawnMode::Supervised
+        );
+        assert!("nssm".parse::<super::RespawnMode>().is_err());
+    }
+
+    #[test]
+    fn respawn_mode_deserializes_from_fleet_yaml() {
+        let yaml = "fleet:\n  respawn_mode: supervised\n";
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.fleet.respawn_mode, super::RespawnMode::Supervised);
     }
 
     #[test]

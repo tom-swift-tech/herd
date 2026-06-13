@@ -30,7 +30,7 @@ Branch `feat/v1.2-scorer-pr-a-telemetry` off `main`.
       static/enrolled stay `None`. Anti-trivial (distinctive values: queue_depth 3/7, ttft 42/99, vram_free 30000/20000).
 - [x] OPERATOR: gates green — build ✓, clippy `-D warnings` ✓, fmt ✓; lib 459→**462** (+3), total 491→**494** (+3).
 - [x] REVIEWER: independent trace — CLEAN on all 7 hunt-list items, traced to file:line; router diff empty.
-- [ ] LEAD: commit + open PR A vs main. **STOP — no auto-merge; PR A gets an INDEPENDENT outside review before merge.**
+- [x] LEAD: committed (`46277b4`) + opened **PR #17** vs main. **STOPPED — no auto-merge; PR A awaits an INDEPENDENT outside review before merge. Phase 1 branches off main only AFTER #17 lands.**
 
 ### Phase 1 (PR B, off updated main AFTER PR A merges) — the Scored router
 - [ ] `RouterEnum::Scored(ScoredRouter)` + `RoutingStrategy::Scored` ("scored") + `create_router` arm.

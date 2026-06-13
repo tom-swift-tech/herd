@@ -555,6 +555,17 @@ impl Server {
             });
         }
 
+        // Mirror fresh agent nodes from the registry into the BackendPool so the
+        // routers treat them like static/enrolled backends. Owns the "agent:" prefix.
+        {
+            let sync_secs = std::env::var("HERD_AGENT_POOL_SYNC_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(2);
+            crate::nodes::AgentPoolSync::new(sync_secs)
+                .spawn(Arc::clone(&state.node_registry), Arc::clone(&state.pool));
+        }
+
         // Start agent-row reaper (hourly). Hard-deletes source='agent' rows that
         // have sat offline past the grace window (default 24h, override via
         // HERD_AGENT_REAP_GRACE_SECS). Enrolled rows are never reaped.

@@ -3,51 +3,52 @@
 > Scratchpad for in-flight work. Milestone tracking lives in `ROADMAP.md`;
 > the v1.2 PR breakdown + acceptance checklist live in `tasks/HERD-V1.2-SPRINT.md`.
 
-**Last updated:** 2026-06-12
+**Last updated:** 2026-06-13
 
 ---
 
-## In flight — v1.2 PR #6c: `herd publish` (branch `feat/v1.2-pr6c-publish`)
+## PLANNED (awaiting go-ahead) — v1.2 PR #7: agent nodes routable via BackendPool
 
-Thin promote subcommand: copy a binary into `{publish_dir}/{version}/{os}-{arch}/herd[.exe]`,
-print sha256 + reminder to bump `fleet.target_agent_version`. Design by architect-pr6c (locked).
+Branch `feat/v1.2-pr7-backendpool-integration` off `main` (`31f9203`, has 6c). The keystone:
+agent nodes (in-memory `NodeRegistry`) appear in `BackendPool` and route identically to
+static/enrolled backends. Source = registry heartbeat freshness, NOT SQLite (5.1 exclusions stay).
 
-**Decisions:** source = positional `[BINARY]`, default `current_exe()`; `--version` REQUIRED
-(no default — wrong version is the one silent mis-serve); os/arch default to host consts,
-overridable; publish-dir = `--publish-dir` > `HERD_AGENT_PUBLISH_DIR` env > `--config`'s
-`fleet.publish_dir` > `~/.herd/binaries` (reuse `FleetConfig::publish_dir_from`); overwrite
-refused on differing bytes without `--force`, identical bytes = idempotent; sha→stdout,
-narration→stderr; logic in new `src/publish.rs` (sync `pub fn run`), `PublishArgs` in `cli.rs`.
+### Plan (~12 steps)
+1. New module `src/nodes/pool_sync.rs`: `AgentPoolSync` struct + `reconcile(registry, pool)` —
+   mirror of `health.rs::sync_to_pool` but agent-sourced.
+2. Source = `registry.fresh_nodes()` (strict TTL, NO grace). Build the fresh-key set
+   `{"agent:{node_id}"}` from `AgentState.capabilities.node_id`.
+3. Map each `AgentCapabilities` → `Backend { name:"agent:{node_id}", url:address, backend, priority:50,
+   tags:vec![], ..Default }`; on add: `update_models(models_loaded)`, `set_vram(vram_total_mb)` when >0.
+   `healthy = true` (in fresh_nodes() ⇒ alive by definition).
+4. PREFIX OWNERSHIP (load-bearing): removal guard = `name.starts_with("agent:") && !fresh.contains(name)`.
+   Never touch `node:` or static entries. Add new / update existing (mirror sync_to_pool's get→mutate→update).
+5. Driver: `AgentPoolSync::spawn(registry, pool, interval)` — dedicated bg task, default 2s,
+   env override `HERD_AGENT_POOL_SYNC_SECS` (mirrors `HERD_AGENT_UPDATE_GRACE_SECS` resolution).
+6. Wire in `server.rs` beside the eviction task (~L530, where `state.node_registry`+`state.pool` exist).
+   Register `pub mod pool_sync;` in `src/nodes/mod.rs`; re-export `AgentPoolSync` if siblings are.
+7. Drain→503: TTL lapse ⇒ leaves fresh_nodes() ⇒ reconciler removes `agent:` entry ⇒ empty pool ⇒
+   existing routers already return "No healthy backends" ⇒ 503. No new fallback.
+8. Do NOT factor a shared helper with sync_to_pool unless the static path stays provably byte-identical;
+   default = keep the agent reconciler self-contained (disjoint prefix ownership). Note the decision.
+9. Do NOT change: `get_routable_nodes`/`get_pollable_nodes` (5.1), `sync_to_pool`, any router strategy.
+10. Tests (pool_sync.rs unit + model_aware where natural):
+    (a) fresh agent → `agent:{id}` in pool w/ models, routable via ModelAwareRouter like a static backend;
+    (b) agent stale (TTL lapse) → entry removed, pool empty → `route()` Errs (503 path);
+    (c) run BOTH reconcilers → agent reconcile never removes a `node:`/static entry (static set survives);
+    (d) same host as enrolled `node:` AND agent `agent:` → two distinct entries (decision 14, coexist).
+11. Sprint doc: PR #7 → ✅ + tick the two acceptance items ("agent nodes in BackendPool route identically",
+    "503 when backends gone"); note the known limitation (enrolled+agent = 2 entries; dedup is v1.3).
+    Update ROADMAP. No Cargo.toml bump.
+12. Done = `cargo build` + `cargo test` (count grown from 484) + `clippy --all-targets -- -D warnings`
+    + `fmt --check`. Then commit + push + open PR vs main (do NOT auto-merge). #8 branches off main after #7.
 
-### Build steps
-- [ ] 1. `cli.rs`: add `PublishArgs` struct + `Command::Publish(PublishArgs)` variant.
-- [ ] 2. `lib.rs`: `pub mod publish;` (keep alpha order).
-- [ ] 3. `src/publish.rs`: `run()` (arg resolution + stdout/stderr) wrapping a testable
-       `publish_inner(source, publish_dir, version, os, arch, force) -> Result<Outcome>`
-       returning `Written(sha)` | `Unchanged(sha)`. Validate version/os/arch up front via
-       `version_shaped`/`platform_shaped`; reuse `binary_path` + `BinaryStore::sha256_of`.
-- [ ] 4. `publish.rs`: `publish_dir_from_config(&Path) -> Result<Option<String>>` (read-only
-       `Config::from_file(...).fleet.publish_dir`, no `validate()`), called only when `--config` given.
-- [ ] 5. `main.rs`: dispatch `Some(Command::Publish(args)) => herd::publish::run(args)` (SYNC, no await).
-- [ ] 6. Tests: 11 unit (publish.rs, tempdir via `temp_dir()+process::id()` pattern — NO new dep) +
-       4 CLI-parse (cli.rs `cli_tests`). Key: returned sha == `BinaryStore` sha (by-construction
-       parity), refuse-overwrite, idempotent rehash, force-overwrite, malformed version/os/arch,
-       missing source, create-parent-dirs, config resolution, `--version` required.
-- [ ] 7. Docs: sprint-doc Decision 25 + flip #6c to ✅ in PR table; one README/fleet-docs line for
-       the manual drop-in flow. NOT the dashboard Agent Guide tab (CLI cmd, not HTTP endpoint).
-
-### Verification gate (operator, before PR)
-- [ ] `cargo build` + `cargo test` (count grows from 468) + `cargo clippy --all-targets -- -D warnings` + `cargo fmt --check`
-
-### Scope guard (OUT of #6c)
-No auto-bump of target version; no list/prune/GC; no remote upload (local disk only);
-no cross-compile/build invocation; no `latest` symlink; no full config `validate()`; no async.
-
-### Done = green gate + reviewer CLEAN → commit + push → open PR vs `main`. Do NOT auto-merge.
+### Rules
+no unwrap/expect in lib code; conventional commits; commit trailer
+`Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`.
 
 ---
 
 ## Backlog
-- #7 — `BackendPool` integration (agent nodes route via in-memory registry freshness, not SQLite pool).
 - #8 — Integration test: gateway + 1 agent in-process, request routes through agent's stub llama-server.
-- v1.1.1 / v1.1.2 not git-tagged (tags stop at v1.1.0) — tag retroactively or at next release.
+- v1.1.1 / v1.1.2 not git-tagged (tags stop at v1.1.0); consider 1.2.0 bump + tags once #7/#8 land.

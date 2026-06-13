@@ -2,7 +2,7 @@
 
 **Spec:** `docs/specs/v2-distributed-inference-spec.md`
 **Target:** v1.2 (foundation) — `herd agent` ships, single-node deployments only. No speculative, no pipeline.
-**Status:** PRs #1–#5.1, #6a, #6b, and #6c landed; #7 next (last reconciled with implementation: 2026-06-12)
+**Status:** PRs #1–#5.1, #6a, #6b, #6c, and #7 landed; #8 next (last reconciled with implementation: 2026-06-13)
 
 > This doc tracks the PR breakdown and acceptance checklist for the v1.2 milestone.
 > The architecture, data structures, and rationale live in the spec — this is the
@@ -23,7 +23,7 @@
 | #6a | Gateway version authority | Reshaped scope (supersedes "heartbeat protocol hardening" — the old "deployments-assigned plumbing" line is folded into this response-channel work). `fleet:` config (`target_agent_version`, `publish_dir`, `download_url_base`); agents report `os`/`arch`; `BinaryStore` (sha256 cache over `{publish_dir}/{version}/{os}-{arch}/herd[.exe]`); heartbeat response gains `target_version` + `download_url`/`sha256` when a binary is published for the agent's platform; authed `GET /api/internal/nodes/binary/:version/:platform`. | ✅ |
 | #6b | Agent self-update | Agent acts on the heartbeat offer: download → verify sha256 (abort + keep running on mismatch) → self-replace → restart (Windows-safe swap via `self_replace`); URL source is presence-as-signal (decision 19, revised); respawn modes `self`/`supervised`; failed-offer memo (~5min suppression); `updating` registry state with eviction grace so the restart gap never looks like node death; `version_changed` beat persists the new `agent_version` and clears 'updating'. | ✅ |
 | #6c | `herd publish` helper | Thin promote step: `herd publish [BINARY] --version <V> [--os --arch --publish-dir --config --force]` copies a binary into `{publish_dir}/{version}/{os}-{arch}/herd[.exe]` (the write side of `BinaryStore`), prints its sha256 (via `BinaryStore::sha256_of`, so it matches the gateway's advertised hash by construction) and a reminder to bump `fleet.target_agent_version`. Refuses to overwrite differing bytes without `--force`; identical bytes are idempotent. sha→stdout, narration→stderr. | ✅ |
-| #7 | `BackendPool` integration | Agent-registered nodes route identically to static backends; `NodeRegistry::find_for_model()`; conflict resolution (agent overrides static only on exact node-identity match). **Note (PR #5.1):** agents are now hard-excluded from `get_routable_nodes` by `source`; PR #7 must source agent routability from the in-memory registry's heartbeat freshness, not by falling through the SQLite pool path. | ⬜ |
+| #7 | `BackendPool` integration | `AgentPoolSync` reconciler mirrors `registry.fresh_nodes()` (strict TTL, **no** grace) into the `BackendPool` under the `agent:{node_id}` key prefix every ~2s (`HERD_AGENT_POOL_SYNC_SECS`); agent nodes route identically to static/enrolled backends through the unchanged routers. Owns the `agent:` prefix only — never touches `node:`/static entries; the static `sync_to_pool` path and the 5.1 `get_routable_nodes`/`get_pollable_nodes` exclusions are byte-unchanged. Source = in-memory registry heartbeat freshness, never SQLite. `find_for_model()` was not needed — the existing model-aware router already selects from the pool. **Deferred to v1.3:** identity-match conflict-resolution dedup (see decision 6 / 14). | ✅ |
 | #8 | Integration test + smoke | Gateway + 1 agent in same process; request routes through agent's (stub) llama-server end-to-end | ⬜ |
 
 ---
@@ -36,13 +36,17 @@ From the spec's "v1.2 — Agent/Gateway Foundation" acceptance block, annotated 
 - [x] Agent sends heartbeat every 2s with full capability snapshot *(PR #4 — exponential backoff capped at 30s while gateway unreachable)*
 - [x] `POST /api/internal/nodes/heartbeat` is the only v1.2 agent-control endpoint; unknown `node_id` values are implicitly registered on first heartbeat *(PR #3)*
 - [x] Gateway maintains in-memory `NodeRegistry` keyed by `node_id` with TTL eviction (default 30s) *(struct in PR #2; on `AppState` + eviction task in PR #3)*
-- [ ] Agent-registered nodes appear in `BackendPool` and route identically to static backends *(PR #7)*
+- [x] Agent-registered nodes appear in `BackendPool` and route identically to static backends *(PR #7 — `AgentPoolSync` mirrors fresh agents under the `agent:` prefix; routable via the unchanged model-aware router exactly like a static backend)*
 - [x] Existing static-backend config path is unchanged *(maintained; verified PR #3)*
 - [x] Dashboard Fleet tab shows agent-registered nodes with live state *(PR #5 — agent rows persisted to SQLite with `source='agent'`, online/offline status + source badge in the Fleet table; written on register/model-change/eviction, steady beats stay in-memory)*
 - [~] Both modes can run on the same host (CITADEL self-test scenario) *(PR #4: guarded self-test in `tests/agent_daemon.rs` + manual smoke verified 2026-06-09; PR #8 extends to routed end-to-end)*
 - [x] Auth: shared bearer token via env var (`HERD_AGENT_TOKEN`) *(PR #3)*
-- [ ] Gateway returns 503 with clear error if all healthy backends — agent and static — are gone (no hidden fallback) *(PR #7)*
-- [~] Tests: `NodeRegistry` unit tests *(PR #2: 10 tests)*, heartbeat protocol tests *(PR #3: 8 tests, verified green 2026-06-05)*, daemon unit + heartbeat-client integration tests *(PR #4: 39 unit tests + `tests/agent_daemon.rs`)*, integration test with gateway + 1 agent in same process *(PR #8)*
+- [x] Gateway returns 503 with clear error if all healthy backends — agent and static — are gone (no hidden fallback) *(PR #7 — a stale agent leaves `fresh_nodes()`, the reconciler removes its `agent:` entry, and an empty pool makes the existing routers return the "No healthy backends" error → 503; no fallback to a removed entry)*
+- [~] Tests: `NodeRegistry` unit tests *(PR #2: 10 tests)*, heartbeat protocol tests *(PR #3: 8 tests, verified green 2026-06-05)*, daemon unit + heartbeat-client integration tests *(PR #4: 39 unit tests + `tests/agent_daemon.rs`)*, `AgentPoolSync` reconciler tests *(PR #7: 4 tests — fresh→routable, drain→503, prefix-ownership, enrolled+agent coexist)*, integration test with gateway + 1 agent in same process *(PR #8)*
+
+### Known limitations (v1.2)
+
+- **Enrolled + agent on one host = two pool entries.** If a physical host is both operator-enrolled (`node:{hostname}`) and running `herd agent` (`agent:{node_id}`), it appears as two distinct, independently-routable `BackendPool` entries (decision 14 — coexist, no dedup in v1.2). Identity-match convergence (decision 6) is a v1.3 item. Not a bug: the two reconcilers own disjoint key prefixes by design.
 
 ---
 
@@ -55,7 +59,7 @@ These resolve the spec's "Open Questions for Tom":
 3. **Node ID** — human-readable, hostname-derived (`hostname-gpu`, e.g. `citadel-5090`), with `--node-id` override.
 4. **Heartbeat cadence** — 2s default, configurable per-agent. Gateway TTL eviction default 30s.
 5. **Deployment manifest source** — deferred beyond v1.2 (single-node only ships here). Recommended: top-level `deployments:` in `herd.yaml` when it lands (v1.3).
-6. **Conflict resolution** — agent registration overrides a static backend only on exact logical-node identity match (`node_id` + advertised inference address); otherwise both remain visible and a duplication warning is logged *(enforced in PR #7)*.
+6. **Conflict resolution** — agent registration overrides a static backend only on exact logical-node identity match (`node_id` + advertised inference address); otherwise both remain visible and a duplication warning is logged *(**deferred to v1.3**: PR #7 ships the coexist half per decision 14 — an enrolled `node:{hostname}` entry and an agent `agent:{node_id}` entry for the same physical host are two distinct pool entries; identity-match dedup + the duplication warning land with v1.3 convergence)*.
 7. **Gateway discovery** — explicit `--gateway <url>` required on the agent. `herd.starbase` (Tailscale DNS) documented as recommended value; no auto-discovery.
 
 ---

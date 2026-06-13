@@ -109,11 +109,21 @@ fn test_state(config: Config) -> AppState {
         client: Arc::new(reqwest::Client::new()),
         mgmt_client: Arc::new(reqwest::Client::new()),
         config: Arc::new(tokio::sync::RwLock::new(config.clone())),
-        analytics: Arc::new(Analytics::new().unwrap()),
+        analytics: Arc::new(
+            Analytics::new(
+                &std::env::temp_dir().join(format!("herd-fe-analytics-{}", std::process::id())),
+            )
+            .unwrap(),
+        ),
         metrics: Arc::new(Metrics::new()),
         session_store: Arc::new(SessionStore::new(10)),
-        agent_audit: Arc::new(AgentAudit::new().unwrap()),
-        node_db: Arc::new(NodeDb::open().unwrap()),
+        agent_audit: Arc::new(
+            AgentAudit::new(
+                &std::env::temp_dir().join(format!("herd-fe-audit-{}", std::process::id())),
+            )
+            .unwrap(),
+        ),
+        node_db: Arc::new(NodeDb::open_in_memory().unwrap()),
         node_registry: Arc::new(NodeRegistry::new(std::time::Duration::from_secs(30))),
         binary_store: Arc::new(herd::nodes::BinaryStore::new()),
         budget: BudgetTracker::new(config.budget.clone()),

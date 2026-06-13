@@ -835,6 +835,49 @@ Herd + herd-tune support multi-vendor GPU fleets:
 | Intel Arc (A/B-series) | SYCL | Beta | Community-maintained |
 | Any (fallback) | Vulkan | Functional | ~25% slower, zero vendor-specific setup |
 
+## Running in Docker
+
+A containerised gateway needs a persistent volume for its data stores (node registry, analytics, audit log, sessions, frontier costs, and published agent binaries). Mount one at `/var/lib/herd` — the official image sets `HERD_DATA_DIR=/var/lib/herd` automatically.
+
+Outside containers `HERD_DATA_DIR` defaults to `~/.herd`, so existing bare-metal deployments are unaffected.
+
+**`docker run`:**
+
+```bash
+docker run -d \
+  --name herd \
+  -p 40114:40114 \
+  -v herd-data:/var/lib/herd \
+  -v /path/to/herd.yaml:/etc/herd/herd.yaml:ro \
+  ghcr.io/swift-innovate/herd:latest
+```
+
+**Docker Compose:**
+
+```yaml
+services:
+  herd:
+    image: ghcr.io/swift-innovate/herd:latest
+    ports:
+      - "40114:40114"
+    volumes:
+      - herd-data:/var/lib/herd
+      - ./herd.yaml:/etc/herd/herd.yaml:ro
+    restart: unless-stopped
+
+volumes:
+  herd-data:
+```
+
+To override the data directory (e.g. bind-mount a host path instead of a named volume), set `HERD_DATA_DIR`:
+
+```bash
+docker run -d \
+  -e HERD_DATA_DIR=/data \
+  -v /mnt/persistent/herd:/data \
+  ...
+```
+
 ## Auto-Update
 
 Herd can update itself from GitHub Releases:

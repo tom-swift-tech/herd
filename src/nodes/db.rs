@@ -57,13 +57,13 @@ pub struct NodeDb {
 }
 
 impl NodeDb {
-    /// Open (or create) the database at ~/.herd/herd.db and run migrations.
-    pub fn open() -> Result<Self> {
-        let herd_dir = dirs::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?
-            .join(".herd");
-        std::fs::create_dir_all(&herd_dir)?;
-        let db_path = herd_dir.join("herd.db");
+    /// Open (or create) the database at `{data_dir}/herd.db` and run
+    /// migrations. The caller is responsible for ensuring `data_dir` exists
+    /// (server::run calls `create_dir_all` on the resolved data root before
+    /// opening any store), but this function also creates it as a safety net.
+    pub fn open(data_dir: &std::path::Path) -> Result<Self> {
+        std::fs::create_dir_all(data_dir)?;
+        let db_path = data_dir.join("herd.db");
         let conn = Connection::open(&db_path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         let db = Self {
@@ -1355,5 +1355,33 @@ mod tests {
         );
         assert_eq!(DownloadStatus::from_str("failed"), DownloadStatus::Failed);
         assert_eq!(DownloadStatus::from_str("unknown"), DownloadStatus::Pending);
+    }
+
+    #[test]
+    fn open_creates_missing_nested_directory() {
+        let tmp = std::env::temp_dir().join(format!(
+            "herd-db-open-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+        // Ensure it does not exist before the test.
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(!tmp.exists(), "pre-condition: temp dir should not exist");
+
+        let nested = tmp.join("sub").join("dir");
+        let db = NodeDb::open(&nested).unwrap();
+        assert!(nested.exists(), "open() must create the data directory");
+        assert!(
+            nested.join("herd.db").exists(),
+            "herd.db must exist after open()"
+        );
+        // Basic smoke: confirm the DB is operable.
+        let nodes = db.list_nodes().unwrap();
+        assert!(nodes.is_empty());
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

@@ -54,6 +54,13 @@ pub struct Config {
 
     #[serde(default)]
     pub providers: Vec<ProviderConfig>,
+
+    /// Root directory for all gateway data stores (node DB, analytics, audit,
+    /// sessions, costs, published binaries). Env `HERD_DATA_DIR` wins over this
+    /// field. Defaults to `~/.herd` when neither is set — byte-identical to the
+    /// pre-v1.2 behaviour, so existing deployments are unaffected.
+    #[serde(default)]
+    pub data_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -724,16 +731,25 @@ impl FleetConfig {
     }
 
     /// Effective publish directory: env (HERD_AGENT_PUBLISH_DIR) wins over
-    /// config, which wins over `~/.herd/binaries`.
-    pub fn resolved_publish_dir(&self) -> std::path::PathBuf {
+    /// config, which wins over `{data_root}/binaries`.
+    pub fn resolved_publish_dir(&self, data_root: &std::path::Path) -> std::path::PathBuf {
         Self::publish_dir_from(
             std::env::var("HERD_AGENT_PUBLISH_DIR").ok().as_deref(),
             self.publish_dir.as_deref(),
+            data_root,
         )
     }
 
-    /// Env-injectable core of [`resolved_publish_dir`].
-    pub fn publish_dir_from(env: Option<&str>, config: Option<&str>) -> std::path::PathBuf {
+    /// Env-injectable core of [`resolved_publish_dir`]. The default branch
+    /// roots under `data_root` rather than hard-coding `~/.herd` so a
+    /// containerised gateway that sets `HERD_DATA_DIR=/var/lib/herd` gets
+    /// `{data_root}/binaries` as its publish dir automatically. env >
+    /// config > default order is unchanged.
+    pub fn publish_dir_from(
+        env: Option<&str>,
+        config: Option<&str>,
+        data_root: &std::path::Path,
+    ) -> std::path::PathBuf {
         if let Some(dir) = env
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -741,10 +757,7 @@ impl FleetConfig {
         {
             return std::path::PathBuf::from(dir);
         }
-        dirs::home_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join(".herd")
-            .join("binaries")
+        data_root.join("binaries")
     }
 }
 
@@ -893,6 +906,33 @@ fn default_provider_priority() -> u32 {
 }
 
 impl Config {
+    /// Env-injectable core for the data-root resolver. Mirrors the idiom used
+    /// by `FleetConfig::publish_dir_from`: trim, filter non-empty, env over
+    /// config over fallback. Fallback is `~/.herd` (byte-identical to the
+    /// pre-v1.2 default so existing deployments see no change when neither
+    /// env nor config field is set).
+    pub fn data_dir_from(env: Option<&str>, config: Option<&str>) -> std::path::PathBuf {
+        if let Some(dir) = env
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or_else(|| config.map(str::trim).filter(|s| !s.is_empty()))
+        {
+            return std::path::PathBuf::from(dir);
+        }
+        dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".herd")
+    }
+
+    /// Effective data root: `HERD_DATA_DIR` env wins over the `data_dir`
+    /// config field, which wins over `~/.herd`.
+    pub fn resolved_data_dir(&self) -> std::path::PathBuf {
+        Self::data_dir_from(
+            std::env::var("HERD_DATA_DIR").ok().as_deref(),
+            self.data_dir.as_deref(),
+        )
+    }
+
     pub fn from_file(path: &Path) -> Result<Self> {
         let content = fs::read_to_string(path)?;
 
@@ -1100,16 +1140,59 @@ mod tests {
     #[test]
     fn fleet_publish_dir_resolution_order() {
         use super::FleetConfig;
+        let data_dir = super::Config::data_dir_from(None, None);
         assert_eq!(
-            FleetConfig::publish_dir_from(Some("/srv/bin"), Some("/cfg/bin")),
+            FleetConfig::publish_dir_from(Some("/srv/bin"), Some("/cfg/bin"), &data_dir),
             std::path::PathBuf::from("/srv/bin")
         );
         assert_eq!(
-            FleetConfig::publish_dir_from(None, Some("/cfg/bin")),
+            FleetConfig::publish_dir_from(None, Some("/cfg/bin"), &data_dir),
             std::path::PathBuf::from("/cfg/bin")
         );
-        let default = FleetConfig::publish_dir_from(None, None);
+        let default = FleetConfig::publish_dir_from(None, None, &data_dir);
         assert!(default.ends_with(std::path::Path::new(".herd/binaries")));
+    }
+
+    #[test]
+    fn data_dir_from_defaults_to_herd() {
+        let d = super::Config::data_dir_from(None, None);
+        assert!(
+            d.ends_with(std::path::Path::new(".herd")),
+            "default must end with .herd, got {}",
+            d.display()
+        );
+    }
+
+    #[test]
+    fn data_dir_from_env_wins() {
+        let d = super::Config::data_dir_from(Some("/var/lib/herd"), None);
+        assert_eq!(d, std::path::PathBuf::from("/var/lib/herd"));
+    }
+
+    #[test]
+    fn data_dir_from_config_used_when_env_absent() {
+        let d = super::Config::data_dir_from(None, Some("/cfg/data"));
+        assert_eq!(d, std::path::PathBuf::from("/cfg/data"));
+    }
+
+    #[test]
+    fn data_dir_from_env_beats_config() {
+        let d = super::Config::data_dir_from(Some("/env"), Some("/cfg"));
+        assert_eq!(d, std::path::PathBuf::from("/env"));
+    }
+
+    #[test]
+    fn publish_dir_from_env_still_wins_over_data_root() {
+        let data_dir = super::Config::data_dir_from(Some("/var/lib/herd"), None);
+        let p = super::FleetConfig::publish_dir_from(Some("/srv/bin"), None, &data_dir);
+        assert_eq!(p, std::path::PathBuf::from("/srv/bin"));
+    }
+
+    #[test]
+    fn publish_dir_from_default_re_roots_under_data_dir() {
+        let data_dir = std::path::PathBuf::from("/var/lib/herd");
+        let p = super::FleetConfig::publish_dir_from(None, None, &data_dir);
+        assert_eq!(p, std::path::PathBuf::from("/var/lib/herd/binaries"));
     }
 
     #[test]

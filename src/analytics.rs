@@ -51,13 +51,9 @@ pub struct Analytics {
 }
 
 impl Analytics {
-    pub fn new() -> Result<Self> {
-        let log_dir = dirs::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?
-            .join(".herd");
-
-        std::fs::create_dir_all(&log_dir)?;
-        let log_path = log_dir.join("requests.jsonl");
+    pub fn new(data_dir: &std::path::Path) -> Result<Self> {
+        std::fs::create_dir_all(data_dir)?;
+        let log_path = data_dir.join("requests.jsonl");
 
         // Touch the file to ensure it exists, then drop the handle
         let _file = OpenOptions::new()

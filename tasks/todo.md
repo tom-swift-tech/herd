@@ -7,48 +7,55 @@
 
 ---
 
-## PLANNED (awaiting go-ahead) — v1.2 PR #7: agent nodes routable via BackendPool
+## PLANNED (awaiting go-ahead) — v1.2 PR #8: in-process fleet routing integration test
 
-Branch `feat/v1.2-pr7-backendpool-integration` off `main` (`31f9203`, has 6c). The keystone:
-agent nodes (in-memory `NodeRegistry`) appear in `BackendPool` and route identically to
-static/enrolled backends. Source = registry heartbeat freshness, NOT SQLite (5.1 exclusions stay).
+Branch `feat/v1.2-pr8-integration-test` off `main` (`5a97eab`, PRs #1–#7 landed). Closes the
+v1.2 fleet foundation: proves the WHOLE chain in one process (heartbeat HTTP → registry →
+reconcile → pool → router → proxy → upstream) — the assertion no unit test makes today.
 
-### Plan (~12 steps)
-1. New module `src/nodes/pool_sync.rs`: `AgentPoolSync` struct + `reconcile(registry, pool)` —
-   mirror of `health.rs::sync_to_pool` but agent-sourced.
-2. Source = `registry.fresh_nodes()` (strict TTL, NO grace). Build the fresh-key set
-   `{"agent:{node_id}"}` from `AgentState.capabilities.node_id`.
-3. Map each `AgentCapabilities` → `Backend { name:"agent:{node_id}", url:address, backend, priority:50,
-   tags:vec![], ..Default }`; on add: `update_models(models_loaded)`, `set_vram(vram_total_mb)` when >0.
-   `healthy = true` (in fresh_nodes() ⇒ alive by definition).
-4. PREFIX OWNERSHIP (load-bearing): removal guard = `name.starts_with("agent:") && !fresh.contains(name)`.
-   Never touch `node:` or static entries. Add new / update existing (mirror sync_to_pool's get→mutate→update).
-5. Driver: `AgentPoolSync::spawn(registry, pool, interval)` — dedicated bg task, default 2s,
-   env override `HERD_AGENT_POOL_SYNC_SECS` (mirrors `HERD_AGENT_UPDATE_GRACE_SECS` resolution).
-6. Wire in `server.rs` beside the eviction task (~L530, where `state.node_registry`+`state.pool` exist).
-   Register `pub mod pool_sync;` in `src/nodes/mod.rs`; re-export `AgentPoolSync` if siblings are.
-7. Drain→503: TTL lapse ⇒ leaves fresh_nodes() ⇒ reconciler removes `agent:` entry ⇒ empty pool ⇒
-   existing routers already return "No healthy backends" ⇒ 503. No new fallback.
-8. Do NOT factor a shared helper with sync_to_pool unless the static path stays provably byte-identical;
-   default = keep the agent reconciler self-contained (disjoint prefix ownership). Note the decision.
-9. Do NOT change: `get_routable_nodes`/`get_pollable_nodes` (5.1), `sync_to_pool`, any router strategy.
-10. Tests (pool_sync.rs unit + model_aware where natural):
-    (a) fresh agent → `agent:{id}` in pool w/ models, routable via ModelAwareRouter like a static backend;
-    (b) agent stale (TTL lapse) → entry removed, pool empty → `route()` Errs (503 path);
-    (c) run BOTH reconcilers → agent reconcile never removes a `node:`/static entry (static set survives);
-    (d) same host as enrolled `node:` AND agent `agent:` → two distinct entries (decision 14, coexist).
-11. Sprint doc: PR #7 → ✅ + tick the two acceptance items ("agent nodes in BackendPool route identically",
-    "503 when backends gone"); note the known limitation (enrolled+agent = 2 entries; dedup is v1.3).
-    Update ROADMAP. No Cargo.toml bump.
-12. Done = `cargo build` + `cargo test` (count grown from 484) + `clippy --all-targets -- -D warnings`
-    + `fmt --check`. Then commit + push + open PR vs main (do NOT auto-merge). #8 branches off main after #7.
+### Plan (~10 lines)
+1. **Test seam (minimal, `#[doc(hidden)] pub`, no behavior change):** `tests/` is an external
+   crate and can only see `pub`. Expose: `NodeRegistry::with_clock`, the `test_clock` module
+   (`TestClock::new/advance/as_fn`) + the `Clock` alias, and `AgentPoolSync::reconcile`.
+   Prompt mandates "advance test_clock" + "one reconcile" — these are the seam.
+2. `tests/fleet_routing.rs`, mirroring `agent_daemon.rs` (stub server) + `frontier_escalation.rs`
+   (hand-built `AppState`). Helper builds: stub upstream (ephemeral port) recording received
+   `/v1/chat/completions` hits; `AppState` with in-memory `NodeDb`, ModelAware router, a shared
+   registry+pool; serves `heartbeat` + `chat_completions` on an ephemeral port = "the gateway".
+   No `server::run` (avoids real port/home-dir touch — that stays the `#[ignore]`d two-box test).
+3. **T1 happy path:** POST heartbeat advertising the stub → `reconcile` → POST chat to gateway →
+   assert 200 AND stub.received == 1 AND body round-trips (anti-trivial: stub MUST have been hit).
+4. **T2 drain→503:** register, reconcile (present), `clock.advance(TTL+1)`, reconcile (empty) →
+   POST chat → assert **503** status code (no hidden fallback, a real error).
+5. **T3 model routing:** two agents / two models, reconcile, request model X → only stub-X received.
+6. Determinism = `TestClock` + explicit `reconcile`, never sleep+margin. No `unwrap/expect` in any
+   lib code touched (test code may unwrap). Existing tests stay green.
+7. **Gates:** `cargo build` + `cargo test` (report lib subtotal vs all-binaries total separately —
+   they differ, not a drop) + `clippy --all-targets -- -D warnings` + `fmt --check`.
+8. **LEAD:** reconcile sprint doc (#8 ✅, v1.2 foundation complete) + ROADMAP; document the manual
+   two-box acceptance in the PR body; open PR vs main. **STOP at the open PR — no auto-merge.**
+
+### Roles
+BUILDER: seam + `tests/fleet_routing.rs`. REVIEWER: independent pass — hunt list (any hit blocks):
+(1) no wall-clock/margin timing; (2) anti-trivial — every test can FAIL (stub received assertion +
+real 503); (3) no unwrap/expect in lib code touched. OPERATOR: gates, separate lib/total counts.
+LEAD: docs + PR. Open PR then gets an INDEPENDENT review before merge.
 
 ### Rules
-no unwrap/expect in lib code; conventional commits; commit trailer
+conventional commits; commit trailer
 `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`.
+
+### Status
+- [x] STOP for go-ahead → approved
+- [x] Test seam (`#[doc(hidden)] pub`: `with_clock`/`Clock`, `reconcile`, `open_in_memory`)
+- [x] tests/fleet_routing.rs (T1/T2/T3) — 3 tests green
+- [x] Internal reviewer pass (hunt list) — CLEAN, no blocking findings, each test's failure mode traced
+- [x] Gates green — build ✓, test 491 pass / 0 fail / 1 ignored (lib subtotal 459), clippy `-D warnings` ✓, fmt ✓
+- [x] Docs reconciled (sprint #8 ✅ + v1.2 foundation complete; ROADMAP) + PR opened (no merge)
+  - Open PR still gets an INDEPENDENT review before merge — internal pass is necessary, not sufficient.
 
 ---
 
 ## Backlog
-- #8 — Integration test: gateway + 1 agent in-process, request routes through agent's stub llama-server.
-- v1.1.1 / v1.1.2 not git-tagged (tags stop at v1.1.0); consider 1.2.0 bump + tags once #7/#8 land.
+- v1.1.1 / v1.1.2 not git-tagged (tags stop at v1.1.0); consider 1.2.0 bump + tags once #8 lands
+  and the v1.2 foundation is complete.

@@ -73,8 +73,11 @@ impl NodeDb {
         Ok(db)
     }
 
-    /// In-memory database for unit tests (no filesystem access).
-    #[cfg(test)]
+    /// In-memory database (no filesystem access). `#[doc(hidden)] pub` rather
+    /// than `#[cfg(test)]` so out-of-crate integration tests can build an
+    /// isolated `NodeDb` without writing to the operator's `~/.herd/herd.db`.
+    /// Not part of the stable API.
+    #[doc(hidden)]
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         let db = Self {

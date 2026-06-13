@@ -102,7 +102,12 @@ impl std::fmt::Display for RegistryError {
 
 impl std::error::Error for RegistryError {}
 
-pub(crate) type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
+/// Pluggable monotonic clock. `#[doc(hidden)] pub` (not `pub(crate)`) so
+/// out-of-crate integration tests can inject a controllable clock via
+/// [`NodeRegistry::with_clock`] and drive TTL behavior without wall-clock
+/// sleeps. Production always uses `Instant::now`.
+#[doc(hidden)]
+pub type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
 
 /// Order-insensitive comparison of two `models_loaded` lists. Agents may report
 /// the same set in a different order between beats; that is not a material change.
@@ -135,7 +140,12 @@ impl NodeRegistry {
         Self::with_clock_and_max(ttl, Arc::new(Instant::now), max_nodes)
     }
 
-    pub(crate) fn with_clock(ttl: Duration, clock: Clock) -> Self {
+    /// Construct with an injected [`Clock`]. `#[doc(hidden)] pub` so integration
+    /// tests in `tests/` (an external crate that links the non-`cfg(test)` lib,
+    /// where the in-crate `test_clock` helper is invisible) can drive TTL-based
+    /// freshness deterministically. Production uses [`NodeRegistry::new`].
+    #[doc(hidden)]
+    pub fn with_clock(ttl: Duration, clock: Clock) -> Self {
         Self::with_clock_and_max(ttl, clock, DEFAULT_MAX_AGENT_NODES)
     }
 

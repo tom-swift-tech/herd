@@ -72,7 +72,7 @@ impl AgentPoolSync {
             };
 
             if let Some(mut st) = pool.get(&name).await {
-                // Update existing entry — refresh config, models, health, and VRAM.
+                // Update existing entry — refresh config, models, health, VRAM, and live telemetry.
                 st.config = backend;
                 st.models = caps.models_loaded.clone();
                 st.healthy = true; // fresh ⇒ alive
@@ -80,14 +80,25 @@ impl AgentPoolSync {
                     st.vram_total_mb = Some(caps.vram_total_mb);
                     st.vram_populated = true;
                 }
+                st.queue_depth = Some(caps.queue_depth);
+                st.ttft_p50_ms = caps.ttft_p50_ms;
+                st.vram_free_mb = Some(caps.vram_free_mb);
+                // max_concurrent stays None — no caps source yet (future phase)
                 pool.update(st).await;
             } else {
-                // New entry: add, then set models and VRAM.
+                // New entry: add, then set models, VRAM, and live telemetry.
                 pool.add(backend).await;
                 pool.update_models(&name, caps.models_loaded.clone()).await;
                 if caps.vram_total_mb > 0 {
                     pool.set_vram(&name, caps.vram_total_mb).await;
                 }
+                pool.set_agent_telemetry(
+                    &name,
+                    caps.queue_depth,
+                    caps.ttft_p50_ms,
+                    caps.vram_free_mb,
+                )
+                .await;
                 tracing::info!("Added agent backend {} to pool ({})", name, caps.address);
             }
         }
@@ -114,7 +125,8 @@ mod tests {
             vram_total_mb: 32_768,
             vram_free_mb: 30_000,
             models_loaded: vec!["llama-3-8b".to_string()],
-            queue_depth: 0,
+            // Non-zero so telemetry-population assertions will fail if population is removed.
+            queue_depth: 3,
             ttft_p50_ms: Some(42),
             rpc_capable: false,
             rpc_port: None,
@@ -294,6 +306,150 @@ mod tests {
                 .count(),
             2,
             "enrolled and agent entries must be two distinct pool rows"
+        );
+    }
+
+    /// Test 5: A freshly-added agent entry carries queue_depth, ttft_p50_ms, and
+    /// vram_free_mb from capabilities; max_concurrent stays None (no source yet).
+    /// Covers the "add" branch of reconcile.
+    #[tokio::test]
+    async fn new_agent_carries_telemetry_fields() {
+        let reg = NodeRegistry::new(Duration::from_secs(30));
+        let pool = Arc::new(BackendPool::new(vec![], 3, Duration::from_secs(30)));
+
+        let caps = sample_caps("tele-node");
+        // Confirm sample_caps has the values we assert below.
+        assert_eq!(caps.queue_depth, 3);
+        assert_eq!(caps.ttft_p50_ms, Some(42));
+        assert_eq!(caps.vram_free_mb, 30_000);
+
+        reg.heartbeat(caps).await.unwrap();
+        AgentPoolSync::reconcile(&reg, &pool).await;
+
+        let entry = pool.get("agent:tele-node").await.unwrap();
+        assert_eq!(
+            entry.queue_depth,
+            Some(3),
+            "queue_depth must be populated on add"
+        );
+        assert_eq!(
+            entry.ttft_p50_ms,
+            Some(42),
+            "ttft_p50_ms must be populated on add"
+        );
+        assert_eq!(
+            entry.vram_free_mb,
+            Some(30_000),
+            "vram_free_mb must be populated on add"
+        );
+        assert_eq!(
+            entry.max_concurrent, None,
+            "max_concurrent has no source yet"
+        );
+    }
+
+    /// Test 6: An already-existing agent entry has its telemetry fields refreshed
+    /// when reconcile runs a second time (the "update" branch).
+    #[tokio::test]
+    async fn updated_agent_refreshes_telemetry_fields() {
+        let reg = NodeRegistry::new(Duration::from_secs(30));
+        let pool = Arc::new(BackendPool::new(vec![], 3, Duration::from_secs(30)));
+
+        // First heartbeat + reconcile — goes through the add branch.
+        let caps1 = sample_caps("tele-update");
+        reg.heartbeat(caps1).await.unwrap();
+        AgentPoolSync::reconcile(&reg, &pool).await;
+
+        // Second heartbeat with different telemetry values, then reconcile via update branch.
+        let mut caps2 = sample_caps("tele-update");
+        caps2.queue_depth = 7;
+        caps2.ttft_p50_ms = Some(99);
+        caps2.vram_free_mb = 20_000;
+        reg.heartbeat(caps2).await.unwrap();
+        AgentPoolSync::reconcile(&reg, &pool).await;
+
+        let entry = pool.get("agent:tele-update").await.unwrap();
+        assert_eq!(
+            entry.queue_depth,
+            Some(7),
+            "queue_depth must be refreshed on update"
+        );
+        assert_eq!(
+            entry.ttft_p50_ms,
+            Some(99),
+            "ttft_p50_ms must be refreshed on update"
+        );
+        assert_eq!(
+            entry.vram_free_mb,
+            Some(20_000),
+            "vram_free_mb must be refreshed on update"
+        );
+        assert_eq!(
+            entry.max_concurrent, None,
+            "max_concurrent has no source yet"
+        );
+    }
+
+    /// Test 7: Static and enrolled (`node:`) entries leave all four new fields None
+    /// after reconcile — telemetry fields are agent-only.
+    #[tokio::test]
+    async fn static_and_enrolled_entries_have_no_telemetry() {
+        let reg = NodeRegistry::new(Duration::from_secs(30));
+        let pool = Arc::new(BackendPool::new(vec![], 3, Duration::from_secs(30)));
+
+        pool.add(Backend {
+            name: "static-plain".to_string(),
+            url: "http://plain:8080".to_string(),
+            priority: 100,
+            ..Default::default()
+        })
+        .await;
+        pool.add(Backend {
+            name: "node:enrolled-one".to_string(),
+            url: "http://enrolled:11434".to_string(),
+            priority: 80,
+            ..Default::default()
+        })
+        .await;
+
+        // Reconcile with one live agent — should not disturb the other entries.
+        reg.heartbeat(sample_caps("unrelated")).await.unwrap();
+        AgentPoolSync::reconcile(&reg, &pool).await;
+
+        let static_entry = pool.get("static-plain").await.unwrap();
+        assert_eq!(
+            static_entry.queue_depth, None,
+            "static queue_depth must be None"
+        );
+        assert_eq!(
+            static_entry.ttft_p50_ms, None,
+            "static ttft_p50_ms must be None"
+        );
+        assert_eq!(
+            static_entry.vram_free_mb, None,
+            "static vram_free_mb must be None"
+        );
+        assert_eq!(
+            static_entry.max_concurrent, None,
+            "static max_concurrent must be None"
+        );
+
+        let enrolled_entry = pool.get("node:enrolled-one").await.unwrap();
+        assert_eq!(
+            enrolled_entry.queue_depth, None,
+            "enrolled queue_depth must be None"
+        );
+        assert_eq!(
+            enrolled_entry.ttft_p50_ms, None,
+            "enrolled ttft_p50_ms must be None"
+        );
+        assert_eq!(
+            enrolled_entry.vram_free_mb, None,
+            "enrolled vram_free_mb must be None"
+        );
+        assert_eq!(
+            enrolled_entry.max_concurrent, None,
+            "enrolled max_concurrent must be None"
         );
     }
 }

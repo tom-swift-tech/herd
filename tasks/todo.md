@@ -7,6 +7,53 @@
 
 ---
 
+## ACTIVE — Smart-routing scorer sprint (Phase 0 + Phase 1, two sequential PRs)
+
+Foundation on `main` is `e51d80e` (#8 merge confirmed as tip). Full design lives in
+`docs/specs/smart-routing-scorer-spec.md` (architect). 23-dimension / 4-phase rollout;
+**this sprint ships Phase 0 + Phase 1 only**, phases 2–4 documented for later.
+
+Baseline (on `main`, pre-sprint): lib **459** / total **491** (1 ignored). Build/clippy/fmt green.
+
+Phases are SEQUENTIAL, **two separate PRs**. PR A (Phase 0) merges to main BEFORE PR B (Phase 1)
+opens; PR B branches off updated main. **STOP at each open PR — no auto-merge.** Each PR also
+gets an INDEPENDENT outside review (the in-session reviewer shares the builder's blind spots).
+
+### Phase 0 (PR A) — telemetry to the pool boundary
+Branch `feat/v1.2-scorer-pr-a-telemetry` off `main`.
+- [x] ARCHITECT: wrote `docs/specs/smart-routing-scorer-spec.md` (full design, 23 dims / phases 0–4).
+- [x] BUILDER: extended `BackendState` with the four `Option` fields (init `None` in `new()`/`add()`);
+      `pool_sync.reconcile` populates queue_depth/ttft_p50_ms/vram_free_mb for `agent:` entries on BOTH
+      add & update branches (add branch via new `set_agent_telemetry` setter); `max_concurrent` stays `None`.
+      Routers untouched (`least_busy_cmp` tweak deliberately SKIPPED to keep "existing routers unchanged" literal).
+- [x] Tests: +3 lib tests — new-agent carries fields (add branch), updated-agent refreshes (update branch),
+      static/enrolled stay `None`. Anti-trivial (distinctive values: queue_depth 3/7, ttft 42/99, vram_free 30000/20000).
+- [x] OPERATOR: gates green — build ✓, clippy `-D warnings` ✓, fmt ✓; lib 459→**462** (+3), total 491→**494** (+3).
+- [x] REVIEWER: independent trace — CLEAN on all 7 hunt-list items, traced to file:line; router diff empty.
+- [ ] LEAD: commit + open PR A vs main. **STOP — no auto-merge; PR A gets an INDEPENDENT outside review before merge.**
+
+### Phase 1 (PR B, off updated main AFTER PR A merges) — the Scored router
+- [ ] `RouterEnum::Scored(ScoredRouter)` + `RoutingStrategy::Scored` ("scored") + `create_router` arm.
+- [ ] `route_excluding` drop-in: GATE (hard-eliminate ineligible) → SCORE (weighted [0,1] per dimension) → SELECT (argmax + total tie-break).
+- [ ] Phase-1 dimensions (pool + request only): model resident, GPU util (lower), VRAM headroom (higher),
+      GPU temp (lower), operator priority (higher), tag affinity, backend-type affinity, prompt size vs capacity, model-fits-VRAM.
+- [ ] `routing.scored.weights` config (sane defaults; omitted → default; active weights normalized to sum 1; missing dim → neutral 0.5).
+- [ ] Debug-log per-candidate score breakdown (auditable routing). Empty candidate set → existing no-backend error → 503.
+- [ ] Tests: picks right backend; determinism (run twice → identical); missing-telemetry neutrality; gate-before-score; total tie-break; 503-when-empty.
+
+### Reviewer hunt list (any hit BLOCKS)
+1. **DETERMINISM** — no RNG, no wall-clock in scoring path; fixed dimension iteration order; TOTAL tie-break
+   (score desc → priority desc → name asc) so two backends never order ambiguously; same snapshot+request ⇒ identical route (asserted by test).
+2. **MISSING-VALUE NEUTRALITY** — dimensions a static/enrolled backend can't report degrade to neutral 0.5, never penalize; assert static not disadvantaged vs agent.
+3. **GATE-BEFORE-SCORE** — unhealthy/excluded/model-absent/circuit-open eliminated BEFORE scoring, not scored-to-zero.
+4. **NO unwrap/expect in lib code** (test code may unwrap).
+
+### Rules
+conventional commits; commit trailer `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`.
+Each phase: build + test (count grown) + clippy `-D warnings` + fmt --check green BEFORE its PR opens.
+
+---
+
 ## PLANNED (awaiting go-ahead) — v1.2 PR #8: in-process fleet routing integration test
 
 Branch `feat/v1.2-pr8-integration-test` off `main` (`5a97eab`, PRs #1–#7 landed). Closes the

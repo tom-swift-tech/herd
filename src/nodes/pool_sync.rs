@@ -36,9 +36,13 @@ impl AgentPoolSync {
     /// Key = `"agent:{node_id}"`. An agent in `fresh_nodes()` is alive by
     /// definition → `healthy = true`.
     ///
-    /// `pub(crate)` so unit tests can drive a single pass deterministically
-    /// without the timer.
-    pub(crate) async fn reconcile(registry: &NodeRegistry, pool: &BackendPool) {
+    /// `#[doc(hidden)] pub` so both in-crate unit tests and out-of-crate
+    /// integration tests can drive a single pass deterministically without the
+    /// timer. Not part of the stable API — the production driver is [`spawn`].
+    ///
+    /// [`spawn`]: AgentPoolSync::spawn
+    #[doc(hidden)]
+    pub async fn reconcile(registry: &NodeRegistry, pool: &BackendPool) {
         let fresh = registry.fresh_nodes().await; // Vec<AgentState>
         let fresh_keys: HashSet<String> = fresh
             .iter()

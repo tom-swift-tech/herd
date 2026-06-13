@@ -102,7 +102,7 @@ impl std::fmt::Display for RegistryError {
 
 impl std::error::Error for RegistryError {}
 
-type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
+pub(crate) type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
 
 /// Order-insensitive comparison of two `models_loaded` lists. Agents may report
 /// the same set in a different order between beats; that is not a material change.
@@ -135,7 +135,7 @@ impl NodeRegistry {
         Self::with_clock_and_max(ttl, Arc::new(Instant::now), max_nodes)
     }
 
-    fn with_clock(ttl: Duration, clock: Clock) -> Self {
+    pub(crate) fn with_clock(ttl: Duration, clock: Clock) -> Self {
         Self::with_clock_and_max(ttl, clock, DEFAULT_MAX_AGENT_NODES)
     }
 
@@ -275,10 +275,45 @@ impl NodeRegistry {
     }
 }
 
+/// Test-only manual clock that `NodeRegistry` can sample. Uses a shared
+/// mutex-protected `Instant` that tests advance explicitly. Keeps `Instant`
+/// (monotonic) semantics so production code is unchanged. Shared across the
+/// `nodes` test modules (registry + pool_sync) so TTL-driven behavior is tested
+/// deterministically without wall-clock sleeps.
+#[cfg(test)]
+pub(crate) mod test_clock {
+    use super::Clock;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    #[derive(Clone)]
+    pub(crate) struct TestClock {
+        now: Arc<Mutex<Instant>>,
+    }
+
+    impl TestClock {
+        pub(crate) fn new() -> Self {
+            Self {
+                now: Arc::new(Mutex::new(Instant::now())),
+            }
+        }
+
+        pub(crate) fn advance(&self, delta: Duration) {
+            let mut guard = self.now.lock().unwrap();
+            *guard += delta;
+        }
+
+        pub(crate) fn as_fn(&self) -> Clock {
+            let now = self.now.clone();
+            Arc::new(move || *now.lock().unwrap())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_clock::TestClock;
     use super::*;
-    use std::sync::Mutex;
 
     fn sample_caps(node_id: &str) -> AgentCapabilities {
         AgentCapabilities {
@@ -296,32 +331,6 @@ mod tests {
             agent_version: "1.2.0".to_string(),
             os: Some("linux".to_string()),
             arch: Some("x86_64".to_string()),
-        }
-    }
-
-    /// Test-only manual clock that `NodeRegistry` can sample. Uses a shared
-    /// mutex-protected `Instant` that tests advance explicitly. Keeps
-    /// `Instant` (monotonic) semantics so production code is unchanged.
-    #[derive(Clone)]
-    struct TestClock {
-        now: Arc<Mutex<Instant>>,
-    }
-
-    impl TestClock {
-        fn new() -> Self {
-            Self {
-                now: Arc::new(Mutex::new(Instant::now())),
-            }
-        }
-
-        fn advance(&self, delta: Duration) {
-            let mut guard = self.now.lock().unwrap();
-            *guard += delta;
-        }
-
-        fn as_fn(&self) -> Clock {
-            let now = self.now.clone();
-            Arc::new(move || *now.lock().unwrap())
         }
     }
 

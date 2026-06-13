@@ -95,6 +95,7 @@ mod tests {
     use super::*;
     use crate::backend::BackendPool;
     use crate::config::{Backend, BackendType};
+    use crate::nodes::registry::test_clock::TestClock;
     use crate::nodes::{AgentCapabilities, NodeRegistry};
     use crate::router::model_aware::ModelAwareRouter;
     use crate::router::Router;
@@ -158,15 +159,15 @@ mod tests {
     /// from the pool on the next reconcile, and the pool becomes empty → router
     /// returns an error (the 503 path).
     ///
-    /// Determinism strategy: use a very short TTL (1 ms) registry, register an
-    /// agent, reconcile once (entry added), then sleep well past the TTL so
-    /// `fresh_nodes()` returns empty, reconcile again → pool empties. No test
-    /// clock needed; a 1 ms TTL with a 25 ms sleep (25× margin) is wall-clock
-    /// reliable even under CI scheduler jitter.
+    /// Determinism strategy: drive a manual `TestClock` (mirrors
+    /// `fresh_nodes_excludes_stale_but_not_yet_evicted` in registry.rs) instead
+    /// of sleeping. Register an agent, reconcile once (entry added), advance the
+    /// clock past the TTL so `fresh_nodes()` returns empty, reconcile again →
+    /// pool empties. No wall-clock dependence, so it can't flake under CI load.
     #[tokio::test]
     async fn stale_agent_is_drained_and_pool_empties_to_503() {
-        // 1 ms TTL — the agent will expire almost immediately.
-        let reg = NodeRegistry::new(Duration::from_millis(1));
+        let clock = TestClock::new();
+        let reg = NodeRegistry::with_clock(Duration::from_secs(30), clock.as_fn());
         let pool = Arc::new(BackendPool::new(vec![], 3, Duration::from_secs(30)));
 
         reg.heartbeat(sample_caps("node-beta")).await.unwrap();
@@ -178,8 +179,8 @@ mod tests {
             "agent should be added on first reconcile"
         );
 
-        // Wait well past the 1 ms TTL (25× margin) so the node leaves fresh_nodes().
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        // Advance past the 30 s TTL so the node leaves fresh_nodes().
+        clock.advance(Duration::from_secs(31));
 
         // Second reconcile: entry should be removed.
         AgentPoolSync::reconcile(&reg, &pool).await;

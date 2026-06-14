@@ -19,6 +19,14 @@ pub struct BackendState {
     pub vram_total_mb: Option<u64>,
     /// Whether VRAM total has been populated from backend telemetry.
     pub vram_populated: bool,
+    /// Pending request queue depth, from agent telemetry. None for static/enrolled backends.
+    pub queue_depth: Option<u32>,
+    /// p50 time-to-first-token in ms, from agent telemetry. None when unreported.
+    pub ttft_p50_ms: Option<u32>,
+    /// Free VRAM in MB, from agent telemetry. None for static/enrolled backends.
+    pub vram_free_mb: Option<u64>,
+    /// Max concurrent requests the backend will accept. None — no source field yet (future phase).
+    pub max_concurrent: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +83,10 @@ impl BackendPool {
                 last_request: now,
                 vram_total_mb: None,
                 vram_populated: false,
+                queue_depth: None,
+                ttft_p50_ms: None,
+                vram_free_mb: None,
+                max_concurrent: None,
             })
             .collect();
 
@@ -282,6 +294,24 @@ impl BackendPool {
         }
     }
 
+    /// Set agent-reported live telemetry fields on a backend entry.
+    /// `max_concurrent` is intentionally omitted — no caps source yet (future phase).
+    pub async fn set_agent_telemetry(
+        &self,
+        name: &str,
+        queue_depth: u32,
+        ttft_p50_ms: Option<u32>,
+        vram_free_mb: u64,
+    ) {
+        let mut backends = self.backends.write().await;
+        if let Some(backend) = backends.iter_mut().find(|b| b.config.name == name) {
+            backend.queue_depth = Some(queue_depth);
+            backend.ttft_p50_ms = ttft_p50_ms;
+            backend.vram_free_mb = Some(vram_free_mb);
+            // max_concurrent stays None — no caps source yet (future phase)
+        }
+    }
+
     pub async fn add(&self, backend: Backend) {
         let mut backends = self.backends.write().await;
         backends.push(BackendState {
@@ -295,6 +325,10 @@ impl BackendPool {
             last_request: Instant::now(),
             vram_total_mb: None,
             vram_populated: false,
+            queue_depth: None,
+            ttft_p50_ms: None,
+            vram_free_mb: None,
+            max_concurrent: None,
         });
     }
 

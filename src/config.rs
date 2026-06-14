@@ -1,5 +1,6 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -119,6 +120,10 @@ pub struct RoutingConfig {
 
     #[serde(default)]
     pub auto: AutoRoutingConfig,
+
+    /// Config for the Scored routing strategy. Omitting the block applies all defaults.
+    #[serde(default)]
+    pub scored: ScoredConfig,
 }
 
 impl Default for RoutingConfig {
@@ -129,6 +134,7 @@ impl Default for RoutingConfig {
             retry_count: default_retry_count(),
             default_keep_alive: default_keep_alive_value(),
             auto: AutoRoutingConfig::default(),
+            scored: ScoredConfig::default(),
         }
     }
 }
@@ -194,6 +200,9 @@ pub enum RoutingStrategy {
 
     #[serde(rename = "weighted_round_robin")]
     WeightedRoundRobin,
+
+    #[serde(rename = "scored")]
+    Scored,
 }
 
 impl std::fmt::Display for RoutingStrategy {
@@ -203,8 +212,196 @@ impl std::fmt::Display for RoutingStrategy {
             RoutingStrategy::ModelAware => write!(f, "model_aware"),
             RoutingStrategy::LeastBusy => write!(f, "least_busy"),
             RoutingStrategy::WeightedRoundRobin => write!(f, "weighted_round_robin"),
+            RoutingStrategy::Scored => write!(f, "scored"),
         }
     }
+}
+
+// ── Scored router config ─────────────────────────────────────────────────────
+
+/// Gate mode for model-residency check in the Scored router.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ModelGate {
+    /// (Default) Relax the model predicate once if no resident candidate exists —
+    /// parity with `model_aware`'s "never 503 just because the model isn't loaded."
+    #[default]
+    #[serde(rename = "relaxed")]
+    Relaxed,
+    /// Hard gate: if no backend has the model resident, return Err (→ 503).
+    #[serde(rename = "strict")]
+    Strict,
+}
+
+/// Per-dimension weights for the Scored router.
+/// Any omitted key in YAML falls back to its default fn value.
+/// Field names are byte-for-byte identical to the YAML keys and catalog names.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ScoredWeights {
+    // Group A — model & placement (Phase 1, active)
+    #[serde(default = "w_model_resident")]
+    pub model_resident: f64,
+    #[serde(default = "w_model_fits_vram")]
+    pub model_fits_vram: f64,
+    #[serde(default = "w_prompt_size_vs_capacity")]
+    pub prompt_size_vs_capacity: f64,
+    // Group B — GPU pressure (Phase 1, active)
+    #[serde(default = "w_gpu_utilization")]
+    pub gpu_utilization: f64,
+    #[serde(default = "w_vram_headroom")]
+    pub vram_headroom: f64,
+    #[serde(default = "w_gpu_temperature")]
+    pub gpu_temperature: f64,
+    // Group C — operator intent & affinity (Phase 1, active)
+    #[serde(default = "w_operator_priority")]
+    pub operator_priority: f64,
+    #[serde(default = "w_tag_affinity")]
+    pub tag_affinity: f64,
+    #[serde(default = "w_zero")]
+    pub backend_type_affinity: f64,
+    // Group D — live load (Phase 2; recognized, inert in Phase 1)
+    #[serde(default = "w_zero")]
+    pub queue_depth: f64,
+    #[serde(default = "w_zero")]
+    pub ttft_p50: f64,
+    #[serde(default = "w_zero")]
+    pub concurrency_saturation: f64,
+    #[serde(default = "w_zero")]
+    pub precise_vram_free: f64,
+    // Groups E/F (Phase 3–4; recognized, inert in Phase 1)
+    #[serde(default = "w_zero")]
+    pub ewma_latency: f64,
+    #[serde(default = "w_zero")]
+    pub recent_error_rate: f64,
+    #[serde(default = "w_zero")]
+    pub recent_success_throughput: f64,
+    #[serde(default = "w_zero")]
+    pub flap_stability: f64,
+    #[serde(default = "w_zero")]
+    pub session_stickiness: f64,
+    #[serde(default = "w_zero")]
+    pub network_locality: f64,
+    #[serde(default = "w_zero")]
+    pub power_cost: f64,
+    #[serde(default = "w_zero")]
+    pub rpc_shard_capability: f64,
+    #[serde(default = "w_zero")]
+    pub gpu_class_affinity: f64,
+    #[serde(default = "w_zero")]
+    pub warm_model_recency: f64,
+}
+
+impl Default for ScoredWeights {
+    fn default() -> Self {
+        Self {
+            model_resident: w_model_resident(),
+            model_fits_vram: w_model_fits_vram(),
+            prompt_size_vs_capacity: w_prompt_size_vs_capacity(),
+            gpu_utilization: w_gpu_utilization(),
+            vram_headroom: w_vram_headroom(),
+            gpu_temperature: w_gpu_temperature(),
+            operator_priority: w_operator_priority(),
+            tag_affinity: w_tag_affinity(),
+            backend_type_affinity: w_zero(),
+            queue_depth: w_zero(),
+            ttft_p50: w_zero(),
+            concurrency_saturation: w_zero(),
+            precise_vram_free: w_zero(),
+            ewma_latency: w_zero(),
+            recent_error_rate: w_zero(),
+            recent_success_throughput: w_zero(),
+            flap_stability: w_zero(),
+            session_stickiness: w_zero(),
+            network_locality: w_zero(),
+            power_cost: w_zero(),
+            rpc_shard_capability: w_zero(),
+            gpu_class_affinity: w_zero(),
+            warm_model_recency: w_zero(),
+        }
+    }
+}
+
+// Weight default fns — each matches the defaults table in the spec.
+fn w_model_resident() -> f64 {
+    5.0
+}
+fn w_model_fits_vram() -> f64 {
+    2.0
+}
+fn w_prompt_size_vs_capacity() -> f64 {
+    1.0
+}
+fn w_gpu_utilization() -> f64 {
+    3.0
+}
+fn w_vram_headroom() -> f64 {
+    2.0
+}
+fn w_gpu_temperature() -> f64 {
+    1.0
+}
+fn w_operator_priority() -> f64 {
+    2.0
+}
+fn w_tag_affinity() -> f64 {
+    1.0
+}
+fn w_zero() -> f64 {
+    0.0
+}
+
+/// Known weight field names (catalog order, byte-identical to YAML keys).
+/// Used by `unknown_weight_keys` to warn on unrecognized config entries.
+pub const SCORED_WEIGHT_FIELD_NAMES: &[&str] = &[
+    "model_resident",
+    "model_fits_vram",
+    "prompt_size_vs_capacity",
+    "gpu_utilization",
+    "vram_headroom",
+    "gpu_temperature",
+    "operator_priority",
+    "tag_affinity",
+    "backend_type_affinity",
+    "queue_depth",
+    "ttft_p50",
+    "concurrency_saturation",
+    "precise_vram_free",
+    "ewma_latency",
+    "recent_error_rate",
+    "recent_success_throughput",
+    "flap_stability",
+    "session_stickiness",
+    "network_locality",
+    "power_cost",
+    "rpc_shard_capability",
+    "gpu_class_affinity",
+    "warm_model_recency",
+];
+
+/// Return the keys in `mapping` that are not recognised weight field names.
+/// The caller is responsible for issuing `warn!` messages.
+pub fn unknown_weight_keys(mapping: &serde_yaml::Mapping) -> Vec<String> {
+    mapping
+        .keys()
+        .filter_map(|k| k.as_str())
+        .filter(|k| !SCORED_WEIGHT_FIELD_NAMES.contains(k))
+        .map(|k| k.to_owned())
+        .collect()
+}
+
+/// Config block for the Scored routing strategy.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ScoredConfig {
+    /// Gate mode for model-residency filter. Default `relaxed`.
+    #[serde(default)]
+    pub model_gate: ModelGate,
+    /// Optional soft preference for a backend type (feeds dim 9).
+    /// `None` → dim 9 not present (neutral) for every backend. Never a gate.
+    #[serde(default)]
+    pub prefer_backend_type: Option<BackendType>,
+    /// Per-dimension weights. Omitted keys fall back to their default values.
+    #[serde(default)]
+    pub weights: ScoredWeights,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -939,6 +1136,20 @@ impl Config {
         // First pass: check for deprecated keys in raw YAML
         if let Ok(raw) = serde_yaml::from_str::<serde_yaml::Value>(&content) {
             Self::warn_deprecated_keys(&raw, &[]);
+
+            // Warn on unrecognised keys under routing.scored.weights (spec acceptance #9).
+            // Navigate: raw["routing"]["scored"]["weights"] → Mapping → diff against known names.
+            // Every step is guarded: missing key or wrong type → skip silently (never bail).
+            if let Some(routing_val) = raw.get("routing") {
+                if let Some(scored_val) = routing_val.get("scored") {
+                    if let Some(serde_yaml::Value::Mapping(weights_map)) = scored_val.get("weights")
+                    {
+                        for k in unknown_weight_keys(weights_map) {
+                            tracing::warn!("unknown scored weight key '{}' — ignored", k);
+                        }
+                    }
+                }
+            }
         }
 
         let config: Config = serde_yaml::from_str(&content)?;
@@ -1001,9 +1212,11 @@ impl Config {
             self.model_warmer.interval_secs = 0;
         }
 
-        // Validate backend URLs. Bad backend entries are skipped so the rest of
-        // the fleet can keep serving.
+        // Validate backend URLs, reserved-prefix names, and name uniqueness.
+        // Order per spec (impl-delta #8): URL-validity → reserved-prefix → duplicate.
+        // Bad entries are skipped (warn + continue) — never bail!
         let mut valid_backends = Vec::with_capacity(self.backends.len());
+        let mut seen_names: BTreeSet<String> = BTreeSet::new();
         for (i, backend) in self.backends.drain(..).enumerate() {
             let url = backend.url.trim();
             let parsed = reqwest::Url::parse(url);
@@ -1026,6 +1239,30 @@ impl Config {
                 );
                 continue;
             }
+
+            // Reserved-prefix check (impl-delta #8 — B-1 determinism precondition).
+            // The `agent:` and `node:` namespaces are owned by the fleet reconcilers;
+            // a static entry using those prefixes would collide with reconciler-owned
+            // keys, breaking the SELECT tie-break's name-uniqueness invariant.
+            if backend.name.starts_with("agent:") || backend.name.starts_with("node:") {
+                tracing::warn!(
+                    "backend name '{}' uses a reserved prefix ('agent:' / 'node:') — \
+                     these namespaces are owned by the fleet reconcilers; skipping",
+                    backend.name
+                );
+                continue;
+            }
+
+            // Duplicate-name check (warn + keep first).
+            if seen_names.contains(&backend.name) {
+                tracing::warn!(
+                    "duplicate backend name '{}' — keeping first, dropping duplicate",
+                    backend.name
+                );
+                continue;
+            }
+            seen_names.insert(backend.name.clone());
+
             valid_backends.push(backend);
         }
         self.backends = valid_backends;
@@ -1043,6 +1280,11 @@ impl Config {
                 );
             }
         }
+
+        // Sanitize scored router weights: negative/non-finite → per-key default;
+        // all Phase-1-active dims zero → warn + restore full defaults.
+        // Never bail — house rule: degrade gracefully.
+        crate::router::scored::sanitize_weights(&mut self.routing.scored.weights);
 
         Ok(())
     }
@@ -1775,5 +2017,220 @@ backends:
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         assert!(!config.frontier.enabled);
         assert!(config.providers.is_empty());
+    }
+
+    // ── Acceptance test #11: name-uniqueness enforcement (impl-delta #8) ─────
+
+    #[test]
+    fn validate_drops_duplicate_backend_name_keeps_first() {
+        let yaml = r#"
+backends:
+  - name: gpu1
+    url: http://host1:11434
+    priority: 100
+  - name: gpu1
+    url: http://host2:11434
+    priority: 50
+  - name: gpu2
+    url: http://host3:11434
+    priority: 75
+"#;
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.backends.len(), 2, "duplicate 'gpu1' must be dropped");
+        assert_eq!(config.backends[0].name, "gpu1");
+        assert_eq!(config.backends[0].url, "http://host1:11434"); // first kept
+        assert_eq!(config.backends[1].name, "gpu2");
+    }
+
+    #[test]
+    fn validate_drops_reserved_prefix_agent() {
+        let yaml = r#"
+backends:
+  - name: agent:citadel
+    url: http://host1:11434
+    priority: 50
+  - name: good-backend
+    url: http://host2:11434
+    priority: 50
+"#;
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.backends.len(), 1);
+        assert_eq!(config.backends[0].name, "good-backend");
+    }
+
+    #[test]
+    fn validate_drops_reserved_prefix_node() {
+        let yaml = r#"
+backends:
+  - name: node:my-machine
+    url: http://host1:11434
+    priority: 50
+  - name: valid-name
+    url: http://host2:11434
+    priority: 50
+"#;
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.backends.len(), 1);
+        assert_eq!(config.backends[0].name, "valid-name");
+    }
+
+    // ── Acceptance test #9: config backward-compat + unknown-key warn ────────
+
+    #[test]
+    fn scored_config_defaults_when_block_absent() {
+        // Existing herd.yaml with no 'scored' block must deserialize cleanly
+        // and apply all defaults — no panic, no bail.
+        let yaml = r#"
+routing:
+  strategy: scored
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        use super::RoutingStrategy;
+        assert_eq!(config.routing.strategy, RoutingStrategy::Scored);
+        // Defaults table.
+        assert_eq!(config.routing.scored.weights.model_resident, 5.0);
+        assert_eq!(config.routing.scored.weights.gpu_utilization, 3.0);
+        assert_eq!(config.routing.scored.weights.queue_depth, 0.0);
+    }
+
+    #[test]
+    fn scored_config_partial_weights_override_only_named_keys() {
+        let yaml = r#"
+routing:
+  strategy: scored
+  scored:
+    weights:
+      gpu_utilization: 10.0
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.routing.scored.weights.gpu_utilization, 10.0);
+        // Other keys remain at their defaults.
+        assert_eq!(config.routing.scored.weights.model_resident, 5.0);
+        assert_eq!(config.routing.scored.weights.vram_headroom, 2.0);
+    }
+
+    #[test]
+    fn unknown_weight_keys_returns_extras() {
+        use super::{unknown_weight_keys, SCORED_WEIGHT_FIELD_NAMES};
+        let yaml = "gpu_utilization: 3.0\ntypo_key: 1.0\nanother_bogus: 5.0\n";
+        let mapping: serde_yaml::Mapping = serde_yaml::from_str(yaml).unwrap();
+        let unknowns = unknown_weight_keys(&mapping);
+        assert!(
+            unknowns.contains(&"typo_key".to_string()),
+            "typo_key must be flagged"
+        );
+        assert!(
+            unknowns.contains(&"another_bogus".to_string()),
+            "another_bogus must be flagged"
+        );
+        // Known key must NOT appear in unknowns.
+        assert!(
+            !unknowns.contains(&"gpu_utilization".to_string()),
+            "gpu_utilization is a known key"
+        );
+        // All 23 known keys must not appear.
+        for &known in SCORED_WEIGHT_FIELD_NAMES {
+            assert!(!unknowns.contains(&known.to_string()));
+        }
+    }
+
+    #[test]
+    fn scored_config_backward_compat_no_scored_block() {
+        // A herd.yaml with no 'scored' section at all must parse cleanly with defaults.
+        let yaml = r#"
+server:
+  host: 0.0.0.0
+  port: 40114
+routing:
+  strategy: model_aware
+backends:
+  - name: gpu1
+    url: http://localhost:11434
+    priority: 100
+"#;
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        // scored block not present → all defaults.
+        assert_eq!(config.routing.scored.weights.model_resident, 5.0);
+        assert_eq!(config.routing.scored.weights.gpu_utilization, 3.0);
+        assert_eq!(config.routing.scored.weights.queue_depth, 0.0);
+        // model_gate defaults to Relaxed.
+        use super::ModelGate;
+        assert_eq!(config.routing.scored.model_gate, ModelGate::Relaxed);
+    }
+
+    // ── Acceptance #9 wired-path tests (call validate() / mutate config directly) ──
+    // These assert on the WIRED path so un-wiring sanitize_weights breaks them.
+
+    #[test]
+    fn validate_wired_all_zero_phase1_weights_restores_defaults() {
+        // All Phase-1-active dims set to 0.0 in config → after validate(), defaults restored.
+        let yaml = r#"
+routing:
+  strategy: scored
+  scored:
+    weights:
+      model_resident: 0.0
+      model_fits_vram: 0.0
+      prompt_size_vs_capacity: 0.0
+      gpu_utilization: 0.0
+      vram_headroom: 0.0
+      gpu_temperature: 0.0
+      operator_priority: 0.0
+      tag_affinity: 0.0
+      backend_type_affinity: 0.0
+"#;
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        // Before validate: all zeros as set.
+        assert_eq!(config.routing.scored.weights.gpu_utilization, 0.0);
+        config.validate().unwrap();
+        // After validate: sanitize_weights ran via the wired path → defaults restored.
+        assert_eq!(config.routing.scored.weights.gpu_utilization, 3.0);
+        assert_eq!(config.routing.scored.weights.model_resident, 5.0);
+        assert_eq!(config.routing.scored.weights.vram_headroom, 2.0);
+    }
+
+    #[test]
+    fn validate_wired_negative_weight_reset_to_default() {
+        // A negative weight in the config → after validate(), reset to per-key default.
+        let yaml = r#"
+routing:
+  strategy: scored
+  scored:
+    weights:
+      gpu_utilization: -5.0
+"#;
+        let mut config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.routing.scored.weights.gpu_utilization, -5.0);
+        config.validate().unwrap();
+        assert_eq!(config.routing.scored.weights.gpu_utilization, 3.0);
+        // Other keys unchanged (still at their defaults).
+        assert_eq!(config.routing.scored.weights.model_resident, 5.0);
+    }
+
+    #[test]
+    fn unknown_weight_keys_wired_via_parsed_mapping() {
+        // Exercise unknown_weight_keys via the same raw-YAML path from_file uses:
+        // parse the weights block as a serde_yaml::Mapping and call the pure fn directly.
+        // This is the exact navigation from_file does; a future un-wiring would break
+        // the from_file path while leaving this test green — kept separate from from_file
+        // because from_file requires a real filesystem path (temp file).
+        let weights_yaml = "gpu_utilization: 3.0\nbogus_key: 1.0\n";
+        let raw: serde_yaml::Value = serde_yaml::from_str(weights_yaml).unwrap();
+        let mapping = match &raw {
+            serde_yaml::Value::Mapping(m) => m,
+            _ => panic!("expected mapping"),
+        };
+        let unknowns = super::unknown_weight_keys(mapping);
+        assert!(
+            unknowns.contains(&"bogus_key".to_string()),
+            "bogus_key must be flagged as unknown"
+        );
+        assert!(
+            !unknowns.contains(&"gpu_utilization".to_string()),
+            "gpu_utilization must not be flagged"
+        );
     }
 }

@@ -44,7 +44,7 @@ pub struct BackendPool {
     recovery_time: Duration,
 }
 
-fn filter_healthy<'a>(
+pub(crate) fn filter_healthy<'a>(
     backends: &'a [BackendState],
     excluded: &HashSet<String>,
     tags: &[String],

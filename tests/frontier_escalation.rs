@@ -101,7 +101,11 @@ fn test_state(config: Config) -> AppState {
         config.circuit_breaker.failure_threshold,
         std::time::Duration::from_secs(30),
     );
-    let router = create_router(config.routing.strategy.clone(), pool.clone());
+    let router = create_router(
+        config.routing.strategy.clone(),
+        pool.clone(),
+        &config.routing,
+    );
 
     AppState {
         pool: Arc::new(pool),

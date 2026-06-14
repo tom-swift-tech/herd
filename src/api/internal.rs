@@ -94,10 +94,14 @@ pub struct UpdateContext {
 }
 
 impl UpdateContext {
-    pub fn from_config(fleet: &crate::config::FleetConfig, store: Arc<BinaryStore>) -> Self {
+    pub fn from_config(
+        fleet: &crate::config::FleetConfig,
+        store: Arc<BinaryStore>,
+        data_root: &std::path::Path,
+    ) -> Self {
         Self {
             target_version: fleet.resolved_target_version(),
-            publish_dir: fleet.resolved_publish_dir(),
+            publish_dir: fleet.resolved_publish_dir(data_root),
             download_url_base: fleet
                 .download_url_base
                 .as_deref()
@@ -376,8 +380,10 @@ pub async fn heartbeat(
         )
     })?;
 
-    let fleet = state.config.read().await.fleet.clone();
-    let update_ctx = UpdateContext::from_config(&fleet, state.binary_store.clone());
+    let config_snap = state.config.read().await.clone();
+    let data_root = config_snap.resolved_data_dir();
+    let update_ctx =
+        UpdateContext::from_config(&config_snap.fleet, state.binary_store.clone(), &data_root);
 
     process_heartbeat(
         &state.node_registry,
@@ -466,9 +472,10 @@ pub async fn download_binary(
     let allow_unauthenticated = env_truthy("HERD_ALLOW_UNAUTHENTICATED_AGENT_HEARTBEAT");
     check_agent_token(&headers, expected.as_deref(), allow_unauthenticated)?;
 
-    let fleet = state.config.read().await.fleet.clone();
+    let config_snap = state.config.read().await.clone();
+    let data_root = config_snap.resolved_data_dir();
     serve_binary(
-        &fleet.resolved_publish_dir(),
+        &config_snap.fleet.resolved_publish_dir(&data_root),
         &state.binary_store,
         &version,
         &platform,

@@ -131,9 +131,18 @@ pub fn run(args: crate::cli::PublishArgs) -> anyhow::Result<()> {
             Some(p) => publish_dir_from_config(p)?,
             None => None,
         };
+        // The CLI has no running server context so we read HERD_DATA_DIR from
+        // env only (the config-file data_dir field is not consulted here — env
+        // is the container lever). This ensures `herd publish` writes to
+        // {HERD_DATA_DIR}/binaries, matching where the gateway serves from.
+        let data_root = crate::config::Config::data_dir_from(
+            std::env::var("HERD_DATA_DIR").ok().as_deref(),
+            None,
+        );
         FleetConfig::publish_dir_from(
             std::env::var("HERD_AGENT_PUBLISH_DIR").ok().as_deref(),
             cfg_val.as_deref(),
+            &data_root,
         )
     };
 
@@ -351,7 +360,9 @@ mod tests {
         assert_eq!(result.as_deref(), Some(publish_target.to_str().unwrap()));
 
         // FleetConfig::publish_dir_from selects config value when env is None.
-        let resolved = FleetConfig::publish_dir_from(None, Some(publish_target.to_str().unwrap()));
+        let data_root = crate::config::Config::data_dir_from(None, None);
+        let resolved =
+            FleetConfig::publish_dir_from(None, Some(publish_target.to_str().unwrap()), &data_root);
         assert_eq!(resolved, publish_target);
 
         let _ = std::fs::remove_dir_all(&dir);

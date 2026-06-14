@@ -176,10 +176,20 @@ fn build_state(registry: Arc<NodeRegistry>, pool: Arc<BackendPool>, config: Conf
         client: Arc::new(reqwest::Client::new()),
         mgmt_client: Arc::new(reqwest::Client::new()),
         config: Arc::new(tokio::sync::RwLock::new(config.clone())),
-        analytics: Arc::new(Analytics::new().unwrap()),
+        analytics: Arc::new(
+            Analytics::new(
+                &std::env::temp_dir().join(format!("herd-fr-analytics-{}", std::process::id())),
+            )
+            .unwrap(),
+        ),
         metrics: Arc::new(Metrics::new()),
         session_store: Arc::new(SessionStore::new(10)),
-        agent_audit: Arc::new(AgentAudit::new().unwrap()),
+        agent_audit: Arc::new(
+            AgentAudit::new(
+                &std::env::temp_dir().join(format!("herd-fr-audit-{}", std::process::id())),
+            )
+            .unwrap(),
+        ),
         // In-memory so the test never touches the operator's ~/.herd node DB.
         node_db: Arc::new(NodeDb::open_in_memory().unwrap()),
         node_registry: registry,

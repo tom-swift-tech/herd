@@ -336,6 +336,12 @@ impl Server {
             self.config.agent.enabled
         };
 
+        // Resolve and create the single data root for all gateway stores.
+        // All store constructors below receive &data_dir rather than resolving
+        // their own paths, so there is exactly one resolution point.
+        let data_dir = self.config.resolved_data_dir();
+        std::fs::create_dir_all(&data_dir)?;
+
         // Create backend pool with circuit breaker config
         let pool = BackendPool::new(
             self.config.backends.clone(),
@@ -358,7 +364,7 @@ impl Server {
         warmer.spawn(pool.clone()).await;
 
         // Initialize analytics
-        let analytics = Arc::new(Analytics::new()?);
+        let analytics = Arc::new(Analytics::new(&data_dir)?);
 
         // Initialize in-memory request metrics
         let metrics = Arc::new(crate::metrics::Metrics::new());
@@ -417,10 +423,7 @@ impl Server {
 
         // Initialize agent session store and audit log
         let session_store = if agent_enabled {
-            let session_dir = dirs::home_dir()
-                .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?
-                .join(".herd")
-                .join("sessions");
+            let session_dir = data_dir.join("sessions");
             Arc::new(SessionStore::persistent(
                 self.config.agent.max_sessions,
                 session_dir,
@@ -428,7 +431,7 @@ impl Server {
         } else {
             Arc::new(SessionStore::new(self.config.agent.max_sessions))
         };
-        let agent_audit = Arc::new(AgentAudit::new()?);
+        let agent_audit = Arc::new(AgentAudit::new(&data_dir)?);
 
         // Auto-generate enrollment_key if not set
         if self.config.server.enrollment_key.is_none() {
@@ -437,14 +440,9 @@ impl Server {
             self.config.server.enrollment_key = Some(key);
         }
 
-        let node_db = Arc::new(crate::nodes::NodeDb::open()?);
+        let node_db = Arc::new(crate::nodes::NodeDb::open(&data_dir)?);
         let cost_db = Arc::new(crate::providers::cost_db::CostDb::new(
-            rusqlite::Connection::open(
-                dirs::home_dir()
-                    .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?
-                    .join(".herd")
-                    .join("frontier_costs.db"),
-            )?,
+            rusqlite::Connection::open(data_dir.join("frontier_costs.db"))?,
         ));
 
         // Start node health poller (polls registered nodes every 10s, tags every 60s)
@@ -2321,11 +2319,27 @@ mod tests {
             client: Arc::new(reqwest::Client::new()),
             mgmt_client: Arc::new(reqwest::Client::new()),
             config: Arc::new(tokio::sync::RwLock::new(initial.clone())),
-            analytics: Arc::new(Analytics::new().unwrap()),
+            analytics: Arc::new(
+                Analytics::new(
+                    &std::env::temp_dir()
+                        .join(format!("herd-test-analytics-{}", std::process::id())),
+                )
+                .unwrap(),
+            ),
             session_store: Arc::new(SessionStore::new(100)),
-            agent_audit: Arc::new(AgentAudit::new().unwrap()),
+            agent_audit: Arc::new(
+                AgentAudit::new(
+                    &std::env::temp_dir().join(format!("herd-test-audit-{}", std::process::id())),
+                )
+                .unwrap(),
+            ),
             metrics: Arc::new(crate::metrics::Metrics::new()),
-            node_db: Arc::new(crate::nodes::NodeDb::open().unwrap()),
+            node_db: Arc::new(
+                crate::nodes::NodeDb::open(
+                    &std::env::temp_dir().join(format!("herd-test-nodedb-{}", std::process::id())),
+                )
+                .unwrap(),
+            ),
             node_registry: Arc::new(crate::nodes::NodeRegistry::new(Duration::from_secs(30))),
             binary_store: Arc::new(crate::nodes::BinaryStore::new()),
             budget: crate::budget::BudgetTracker::new(initial.budget.clone()),

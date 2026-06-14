@@ -88,7 +88,7 @@ Branch `feat/v1.2-scorer-pr-a-telemetry` off `main`.
 - [x] LEAD: committed (`46277b4`) + opened **PR #17** vs main. **STOPPED — no auto-merge; PR A awaits an INDEPENDENT outside review before merge. Phase 1 branches off main only AFTER #17 lands.**
 
 ### Phase 1 (PR B) — the Scored router — branch `feat/v1.2-scorer-pr-b-scored-router` off main (`c752121`, post-#17+#18)
-**Status: PLAN CONFIRMED by architect — AWAITING DIRECTOR GO-AHEAD (plan-gate, no code yet).** Baseline: **501 tests**, clean build.
+**Status: BUILT + reviewed CLEAN — LEAD opening PR (STOP at open PR for outside review).** Baseline 501 → now **lib 498 / total 530** (+29 lib / +29 total over Phase-0 baseline 469/501).
 Grounded in the hardened spec on `feat/scorer-spec-hardening` (Q6=(b) call-uniform-drop, B-1 name-uniqueness) — which must ride in (merge or land just before this PR).
 
 **Impl-delta confirmations (architect, vs real code):**
@@ -96,20 +96,21 @@ Grounded in the hardened spec on `feat/scorer-spec-hardening` (Q6=(b) call-unifo
 - **#8 name-uniqueness in `validate()`** (`config.rs:977` checks URLs only; `pool` is a `Vec`, no dedup) — determinism tie-break needs unique `name`. Fold into the backend loop: reserved `agent:`/`node:` prefix → warn+drop; duplicate static name → warn+keep-first (BTreeSet). Include in THIS PR (its tests need it).
 
 **Builder task decomposition (ordered, each compiles+tests between):**
-- [ ] T1 — config types (`RoutingStrategy::Scored`+Display, `ModelGate`, `ScoredWeights`+default fns, `ScoredConfig`, `RoutingConfig.scored`) + `RouteContext` + defaulted `route_scored` trait method + `RouterEnum::Scored` + override (#4) + `create_router` arm (widen to take `&RoutingConfig`) + stub `scored.rs`.
-- [ ] T2 — `validate()` name-uniqueness (#8) → acceptance test #11.
-- [ ] T3 — `scored.rs` GATE (make `filter_healthy` `pub(crate)`; model-gate relaxed/strict; single snapshot; temp priority-select) → gate-before-score, 503-on-empty.
-- [ ] T4 — SCORE dims 1–9 (source map per spec) + Q6 call-uniform pre-pass (same `q()=round(x*1e6)` quantizer) + active-weight renorm + `denom==0→0.5` guard. Dims 10–23 read source→None→not-present (Phase 1 must NOT assume #17 telemetry populated). → right-backend, neutrality, Q6 (#12a).
-- [ ] T5 — SELECT i64 `score_q` total tie-break (score_q↓, priority↓, name↑) + `route_excluding`→`route_scored` terminal delegation → determinism (run-twice + shuffle-invariant), tie-break totality, all-identical fleet (#12b).
-- [ ] T6 — config sanitize: `unknown_weight_keys(&Mapping)` pure fn + warn (no `deny_unknown_fields`); negative/non-finite→default; all-Phase-1-dims-zero→default. → backward-compat (#9), Phase-2+ inertness (#10).
-- [ ] T7 — debug-log per-candidate breakdown (level-gated; surviving dims + `[dropped (call-uniform)]` + `[absent]` + denom).
-- [ ] T8 — reviewer pass + full suite green.
+- [x] T1 — config types (`RoutingStrategy::Scored`+Display, `ModelGate`, `ScoredWeights`+default fns, `ScoredConfig`, `RoutingConfig.scored`) + `RouteContext` + defaulted `route_scored` trait method + `RouterEnum::Scored` + override (#4) + `create_router` arm (widen to take `&RoutingConfig`) + stub `scored.rs`.
+- [x] T2 — `validate()` name-uniqueness (#8) → acceptance test #11.
+- [x] T3 — `scored.rs` GATE (make `filter_healthy` `pub(crate)`; model-gate relaxed/strict; single snapshot; temp priority-select) → gate-before-score, 503-on-empty.
+- [x] T4 — SCORE dims 1–9 (source map per spec) + Q6 call-uniform pre-pass (same `q()=round(x*1e6)` quantizer) + active-weight renorm + `denom==0→0.5` guard. Dims 10–23 read source→None→not-present (Phase 1 must NOT assume #17 telemetry populated). → right-backend, neutrality, Q6 (#12a).
+- [x] T5 — SELECT i64 `score_q` total tie-break (score_q↓, priority↓, name↑) + `route_excluding`→`route_scored` terminal delegation → determinism (run-twice + shuffle-invariant), tie-break totality, all-identical fleet (#12b).
+- [x] T6 — config sanitize: `unknown_weight_keys(&Mapping)` pure fn + warn (no `deny_unknown_fields`); negative/non-finite→default; all-Phase-1-dims-zero→default. → backward-compat (#9), Phase-2+ inertness (#10).
+- [x] T7 — debug-log per-candidate breakdown (level-gated; surviving dims + `[dropped (call-uniform)]` + `[absent]` + denom).
+- [x] T8 — reviewer pass + full suite green.
+  - **Note:** T6's `sanitize_weights`/`unknown_weight_keys` were initially defined-but-UNWIRED (independent review caught it); wired into `validate()` (config.rs:1287) + `from_file` (config.rs:1147) and re-verified. LEAD re-ran gates: build/clippy `-D warnings`/fmt ✓, **lib 498 / total 530**, no unwrap in `scored.rs` lib.
 
 **Call sites:** keep `route_excluding` drop-in for Phase 1 (proxy/retry/exclusion/503 unchanged); prompt-size (dim 3) stays dormant-neutral by construction (`Backend` has NO `max_context_len`; `ctx` unpopulated) — NOT a bug; call-site swap deferred. Note `openai.rs:359` + `server.rs:1437`.
 
 **Risks flagged:** (1) hardened spec on separate branch must ride in (merge precondition); (2) `create_router` signature widen touches its 1 caller; (3) unknown-key diff needs raw-YAML mapping at load; (4) dim 3 doubly-dormant; (5) Phase-1 must not wire dim 5 to `vram_free_mb` (use gpu_metrics path) — the subtlest Phase-1/2 boundary.
 
-- [ ] **DIRECTOR GO-AHEAD** → then BUILDER (T1–T8) → REVIEWER (hunt list) → OPERATOR (gates, grow from 501) → LEAD opens PR, **STOP at open PR (no auto-merge; independent outside review before merge).**
+- [x] **DIRECTOR GO-AHEAD** → BUILDER (T1–T8) ✓ → REVIEWER CLEAN ✓ → OPERATOR gates green ✓ → LEAD opening PR. **STOP at open PR — no auto-merge; independent outside review before merge.**
 
 ### Reviewer hunt list (any hit BLOCKS)
 1. **DETERMINISM** — no RNG, no wall-clock in scoring path; fixed dimension iteration order; TOTAL tie-break

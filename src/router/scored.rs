@@ -1,0 +1,1242 @@
+/// Scored router — Phase 1 (stub, replaced below with full impl).
+///
+/// GATE → SCORE → SELECT pipeline over 23 dimensions (dims 1–9 active in Phase 1;
+/// dims 10–23 always absent/neutral until later phases populate their sources).
+use crate::backend::{pool::filter_healthy, BackendPool};
+use crate::config::{BackendType, ModelGate, ScoredConfig, ScoredWeights};
+use crate::router::{RouteContext, RoutedBackend, Router};
+use anyhow::Result;
+use async_trait::async_trait;
+use std::collections::HashSet;
+use tracing::debug;
+
+// ── Normalization constants ──────────────────────────────────────────────────
+
+const TEMP_MIN: f64 = 40.0;
+const TEMP_MAX: f64 = 85.0;
+/// Soft score for a backend whose type doesn't match the preference (dim 9).
+const BACKEND_NEUTRAL: f64 = 0.6;
+/// Bytes of VRAM per billion parameters (fp16-ish rough estimate).
+const BYTES_PER_BILLION_MB: u64 = 1024;
+/// Scale factor for quantizing scores to i64 comparison keys.
+const SCORE_SCALE: f64 = 1_000_000.0;
+
+// ── Dimension catalog ────────────────────────────────────────────────────────
+
+/// Fixed-order catalog of all 23 dimensions (catalog order = array index).
+/// `#[repr(u8)]` so `as usize` gives the index directly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Dimension {
+    ModelResident = 0,
+    ModelFitsVram = 1,
+    PromptSizeVsCapacity = 2,
+    GpuUtilization = 3,
+    VramHeadroom = 4,
+    GpuTemperature = 5,
+    OperatorPriority = 6,
+    TagAffinity = 7,
+    BackendTypeAffinity = 8,
+    // Phase 2 — always absent in Phase 1
+    QueueDepth = 9,
+    TtftP50 = 10,
+    ConcurrencySaturation = 11,
+    PreciseVramFree = 12,
+    // Phase 3 — always absent in Phase 1
+    EwmaLatency = 13,
+    RecentErrorRate = 14,
+    RecentSuccessThroughput = 15,
+    FlapStability = 16,
+    // Phase 4 — always absent in Phase 1
+    SessionStickiness = 17,
+    NetworkLocality = 18,
+    PowerCost = 19,
+    RpcShardCapability = 20,
+    GpuClassAffinity = 21,
+    WarmModelRecency = 22,
+}
+
+const DIM_COUNT: usize = 23;
+
+// Ordered list for iteration in canonical catalog order.
+const ALL_DIMS: [Dimension; DIM_COUNT] = [
+    Dimension::ModelResident,
+    Dimension::ModelFitsVram,
+    Dimension::PromptSizeVsCapacity,
+    Dimension::GpuUtilization,
+    Dimension::VramHeadroom,
+    Dimension::GpuTemperature,
+    Dimension::OperatorPriority,
+    Dimension::TagAffinity,
+    Dimension::BackendTypeAffinity,
+    Dimension::QueueDepth,
+    Dimension::TtftP50,
+    Dimension::ConcurrencySaturation,
+    Dimension::PreciseVramFree,
+    Dimension::EwmaLatency,
+    Dimension::RecentErrorRate,
+    Dimension::RecentSuccessThroughput,
+    Dimension::FlapStability,
+    Dimension::SessionStickiness,
+    Dimension::NetworkLocality,
+    Dimension::PowerCost,
+    Dimension::RpcShardCapability,
+    Dimension::GpuClassAffinity,
+    Dimension::WarmModelRecency,
+];
+
+impl Dimension {
+    #[inline]
+    fn idx(self) -> usize {
+        self as usize
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Dimension::ModelResident => "model_resident",
+            Dimension::ModelFitsVram => "model_fits_vram",
+            Dimension::PromptSizeVsCapacity => "prompt_size_vs_capacity",
+            Dimension::GpuUtilization => "gpu_utilization",
+            Dimension::VramHeadroom => "vram_headroom",
+            Dimension::GpuTemperature => "gpu_temperature",
+            Dimension::OperatorPriority => "operator_priority",
+            Dimension::TagAffinity => "tag_affinity",
+            Dimension::BackendTypeAffinity => "backend_type_affinity",
+            Dimension::QueueDepth => "queue_depth",
+            Dimension::TtftP50 => "ttft_p50",
+            Dimension::ConcurrencySaturation => "concurrency_saturation",
+            Dimension::PreciseVramFree => "precise_vram_free",
+            Dimension::EwmaLatency => "ewma_latency",
+            Dimension::RecentErrorRate => "recent_error_rate",
+            Dimension::RecentSuccessThroughput => "recent_success_throughput",
+            Dimension::FlapStability => "flap_stability",
+            Dimension::SessionStickiness => "session_stickiness",
+            Dimension::NetworkLocality => "network_locality",
+            Dimension::PowerCost => "power_cost",
+            Dimension::RpcShardCapability => "rpc_shard_capability",
+            Dimension::GpuClassAffinity => "gpu_class_affinity",
+            Dimension::WarmModelRecency => "warm_model_recency",
+        }
+    }
+}
+
+// ── Router struct ────────────────────────────────────────────────────────────
+
+/// Scored router: GATE → SCORE (dims 1–9 active) → SELECT.
+#[derive(Clone)]
+pub struct ScoredRouter {
+    pool: BackendPool,
+    /// Fixed weight array in catalog order (index = Dimension as usize).
+    weights: [f64; DIM_COUNT],
+    model_gate: ModelGate,
+    prefer_backend_type: Option<BackendType>,
+}
+
+impl ScoredRouter {
+    pub fn new(pool: BackendPool, config: &ScoredConfig) -> Self {
+        let w = &config.weights;
+        let weights = weights_array(w);
+        Self {
+            pool,
+            weights,
+            model_gate: config.model_gate,
+            prefer_backend_type: config.prefer_backend_type,
+        }
+    }
+}
+
+/// Build the fixed-size weights array from a `ScoredWeights` struct.
+fn weights_array(w: &ScoredWeights) -> [f64; DIM_COUNT] {
+    [
+        w.model_resident,            // 0
+        w.model_fits_vram,           // 1
+        w.prompt_size_vs_capacity,   // 2
+        w.gpu_utilization,           // 3
+        w.vram_headroom,             // 4
+        w.gpu_temperature,           // 5
+        w.operator_priority,         // 6
+        w.tag_affinity,              // 7
+        w.backend_type_affinity,     // 8
+        w.queue_depth,               // 9
+        w.ttft_p50,                  // 10
+        w.concurrency_saturation,    // 11
+        w.precise_vram_free,         // 12
+        w.ewma_latency,              // 13
+        w.recent_error_rate,         // 14
+        w.recent_success_throughput, // 15
+        w.flap_stability,            // 16
+        w.session_stickiness,        // 17
+        w.network_locality,          // 18
+        w.power_cost,                // 19
+        w.rpc_shard_capability,      // 20
+        w.gpu_class_affinity,        // 21
+        w.warm_model_recency,        // 22
+    ]
+}
+
+/// Quantize a `[0,1]` score to a fixed-scale integer comparison key.
+/// Same quantizer the pre-pass uniformity test uses — no new epsilon.
+#[inline]
+fn quantize(score: f64) -> i64 {
+    (score * SCORE_SCALE).round() as i64
+}
+
+// ── Per-candidate score computation ─────────────────────────────────────────
+
+/// Per-candidate raw norm values and presence flags (before pre-pass).
+struct CandidateRaw {
+    /// Normalised value for each dimension. Only meaningful when `present0[i]` is true.
+    norms: [f64; DIM_COUNT],
+    /// Whether the dimension's source datum is present for this candidate.
+    present0: [bool; DIM_COUNT],
+}
+
+/// Compute raw norms for all 23 dimensions for a single candidate.
+///
+/// Dims 10–23 (Phase 2/3/4): their sources are all `None` in Phase 1, so
+/// `present0` will be `false` for each → neutral/weight-dropped.  No scoring.
+fn compute_raw(
+    b: &crate::backend::pool::BackendState,
+    model: Option<&str>,
+    tags: Option<&[String]>,
+    relaxed: bool,
+    prefer_backend_type: Option<BackendType>,
+    pmin: u32,
+    pmax: u32,
+) -> CandidateRaw {
+    let mut norms = [0.0f64; DIM_COUNT];
+    let mut present0 = [false; DIM_COUNT];
+
+    // ── Dim 1: model_resident ────────────────────────────────────────────────
+    // present if model was requested AND (resident OR gate has relaxed).
+    if let Some(m) = model {
+        let resident = b.models.contains(&m.to_string());
+        if resident || relaxed {
+            present0[Dimension::ModelResident.idx()] = true;
+            norms[Dimension::ModelResident.idx()] = if resident { 1.0 } else { 0.0 };
+        }
+    }
+
+    // ── Dim 2: model_fits_vram ───────────────────────────────────────────────
+    // est_mb = extract_param_billions(model).filter(>0) * 1024
+    // free_mb = vram_free_mb if Some, else gpu_metrics.(total - used)
+    if let Some(m) = model {
+        if let Some(est_b) = crate::analytics::extract_param_billions(m).filter(|&b| b > 0) {
+            let est_mb = est_b * BYTES_PER_BILLION_MB;
+            let free_mb: Option<u64> = b.vram_free_mb.or_else(|| {
+                b.gpu_metrics
+                    .as_ref()
+                    .map(|gm| gm.memory_total.saturating_sub(gm.memory_used))
+            });
+            if let Some(free) = free_mb {
+                present0[Dimension::ModelFitsVram.idx()] = true;
+                norms[Dimension::ModelFitsVram.idx()] =
+                    (free as f64 / est_mb as f64).clamp(0.0, 1.0);
+            }
+        }
+    }
+
+    // ── Dim 3: prompt_size_vs_capacity ───────────────────────────────────────
+    // present only if prompt_tokens AND ctx_window known.
+    // Backend has no max_context_len field in Phase 1 → always absent (neutral).
+    // (kept as a stub; ctx_window(b) is None until the field is added)
+    // present0[Dimension::PromptSizeVsCapacity.idx()] remains false.
+
+    // ── Dim 4: gpu_utilization ───────────────────────────────────────────────
+    if let Some(ref gm) = b.gpu_metrics {
+        present0[Dimension::GpuUtilization.idx()] = true;
+        norms[Dimension::GpuUtilization.idx()] =
+            (1.0 - gm.utilization as f64 / 100.0).clamp(0.0, 1.0);
+    }
+
+    // ── Dim 5: vram_headroom ─────────────────────────────────────────────────
+    // Phase 1: use gpu_metrics (memory_total - memory_used) / memory_total.
+    // Phase 2 will flip to vram_free_mb / vram_total_mb when both are Some.
+    if let Some(ref gm) = b.gpu_metrics {
+        if gm.memory_total > 0 {
+            present0[Dimension::VramHeadroom.idx()] = true;
+            let free = gm.memory_total.saturating_sub(gm.memory_used);
+            norms[Dimension::VramHeadroom.idx()] =
+                (free as f64 / gm.memory_total as f64).clamp(0.0, 1.0);
+        }
+    }
+
+    // ── Dim 6: gpu_temperature ───────────────────────────────────────────────
+    if let Some(ref gm) = b.gpu_metrics {
+        present0[Dimension::GpuTemperature.idx()] = true;
+        // Denominator is TEMP_MAX - TEMP_MIN = 45.0, a compile-time constant ≠ 0.
+        norms[Dimension::GpuTemperature.idx()] =
+            ((TEMP_MAX - gm.temperature as f64) / (TEMP_MAX - TEMP_MIN)).clamp(0.0, 1.0);
+    }
+
+    // ── Dim 7: operator_priority ─────────────────────────────────────────────
+    // Always present (priority is non-Option). Fleet-relative; pmin/pmax
+    // already computed over the whole candidate set.
+    present0[Dimension::OperatorPriority.idx()] = true;
+    norms[Dimension::OperatorPriority.idx()] = if pmax == pmin {
+        // all-equal → 0.5 (will be dropped by pre-pass as call-uniform)
+        0.5
+    } else {
+        let p = b.config.priority;
+        ((p - pmin) as f64 / (pmax - pmin) as f64).clamp(0.0, 1.0)
+    };
+
+    // ── Dim 8: tag_affinity ──────────────────────────────────────────────────
+    // present if the request supplied a non-empty tag set.
+    if let Some(req_tags) = tags {
+        if !req_tags.is_empty() {
+            present0[Dimension::TagAffinity.idx()] = true;
+            let matched = req_tags
+                .iter()
+                .filter(|t| b.config.tags.contains(t))
+                .count();
+            norms[Dimension::TagAffinity.idx()] = matched as f64 / req_tags.len() as f64;
+        }
+    }
+
+    // ── Dim 9: backend_type_affinity ─────────────────────────────────────────
+    if let Some(pref) = prefer_backend_type {
+        present0[Dimension::BackendTypeAffinity.idx()] = true;
+        norms[Dimension::BackendTypeAffinity.idx()] = if b.config.backend == pref {
+            1.0
+        } else {
+            BACKEND_NEUTRAL
+        };
+    }
+
+    // ── Dims 10–23: Phase 2/3/4 — always absent in Phase 1 ──────────────────
+    // present0[9..23] remain false; they contribute neutral 0.5 and weight-drop.
+
+    CandidateRaw { norms, present0 }
+}
+
+// ── GATE → SCORE → SELECT ────────────────────────────────────────────────────
+
+#[async_trait]
+impl Router for ScoredRouter {
+    /// Delegates to `route_scored` with a default (empty) context.
+    /// Legacy callers using `route_excluding` get correct scored routing;
+    /// dims 2–3 stay dormant-neutral (no prompt_tokens supplied).
+    async fn route_excluding(
+        &self,
+        model: Option<&str>,
+        tags: Option<&[String]>,
+        excluded: &HashSet<String>,
+    ) -> Result<RoutedBackend> {
+        self.route_scored(model, tags, excluded, &RouteContext::default())
+            .await
+    }
+
+    /// GATE → SCORE → SELECT.  Terminal — never calls back into `route_excluding`.
+    async fn route_scored(
+        &self,
+        model: Option<&str>,
+        tags: Option<&[String]>,
+        excluded: &HashSet<String>,
+        _ctx: &RouteContext,
+    ) -> Result<RoutedBackend> {
+        // ── Single snapshot — ONE read, no .await between here and the return. ──
+        let backends_guard = self.pool.backends.read().await;
+        let backends: &[crate::backend::pool::BackendState] = &backends_guard;
+
+        let tag_slice: &[String] = tags.unwrap_or(&[]);
+
+        // ── GATE ──────────────────────────────────────────────────────────────
+        // Step 1: healthy ∧ ¬excluded ∧ tags⊆
+        let healthy: Vec<&crate::backend::pool::BackendState> =
+            filter_healthy(backends, excluded, tag_slice);
+
+        if healthy.is_empty() {
+            return Err(anyhow::anyhow!("No healthy backends available"));
+        }
+
+        // Step 2: model-residency filter.
+        let (candidates, relaxed): (Vec<&crate::backend::pool::BackendState>, bool) =
+            if let Some(m) = model {
+                let residents: Vec<_> = healthy
+                    .iter()
+                    .copied()
+                    .filter(|b| b.models.contains(&m.to_string()))
+                    .collect();
+
+                if !residents.is_empty() {
+                    (residents, false)
+                } else {
+                    // Relaxed mode: fall back to model-unaware healthy set.
+                    // Strict mode: no residents → Err.
+                    match self.model_gate {
+                        ModelGate::Relaxed => (healthy, true),
+                        ModelGate::Strict => {
+                            return Err(anyhow::anyhow!("No healthy backends available"));
+                        }
+                    }
+                }
+            } else {
+                // No model requested — use the full healthy set.
+                (healthy, false)
+            };
+
+        // candidates is never empty here (healthy was non-empty; residents
+        // branch returned early if empty+strict; relaxed keeps healthy).
+        let n_total = backends.len();
+        let n_gated = n_total - candidates.len();
+
+        // ── SCORE: compute raw norms (present₀) ──────────────────────────────
+
+        // Dim 7 (operator_priority) is fleet-relative: need pmin/pmax first.
+        let (pmin, pmax) = candidates.iter().fold((u32::MAX, u32::MIN), |(lo, hi), b| {
+            (lo.min(b.config.priority), hi.max(b.config.priority))
+        });
+
+        // Per-candidate raw norms + present₀ flags.
+        let raws: Vec<CandidateRaw> = candidates
+            .iter()
+            .map(|b| {
+                compute_raw(
+                    b,
+                    model,
+                    tags,
+                    relaxed,
+                    self.prefer_backend_type,
+                    pmin,
+                    pmax,
+                )
+            })
+            .collect();
+
+        // ── Q6 call-uniform pre-pass ──────────────────────────────────────────
+        // For each dimension i, if Pᵢ (candidates where present₀) is non-empty
+        // AND every norm in Pᵢ maps to the same quantized value → drop dim i
+        // from ALL candidates' present sets for this call.
+        let mut uniform = [false; DIM_COUNT];
+        for dim in ALL_DIMS {
+            let i = dim.idx();
+            // Collect quantized values for present₀ candidates.
+            let mut q_vals: Option<i64> = None;
+            let mut any_present = false;
+            let mut all_same = true;
+            for raw in &raws {
+                if raw.present0[i] {
+                    let qv = quantize(raw.norms[i]);
+                    any_present = true;
+                    match q_vals {
+                        None => q_vals = Some(qv),
+                        Some(prev) => {
+                            if prev != qv {
+                                all_same = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if any_present && all_same {
+                uniform[i] = true;
+            }
+        }
+
+        // ── Per-backend final score ───────────────────────────────────────────
+        // present(b,i) = present₀(b,i) AND NOT uniform[i]
+        // score(b) = Σ(w·n for surviving present dims) / Σ(w for those dims)
+        //            or 0.5 if denom == 0.
+        struct Scored<'a> {
+            backend: &'a crate::backend::pool::BackendState,
+            score_q: i64,
+        }
+
+        let scored: Vec<Scored> = candidates
+            .iter()
+            .zip(raws.iter())
+            .map(|(b, raw)| {
+                let mut numerator = 0.0_f64;
+                let mut denom = 0.0_f64;
+                for dim in ALL_DIMS {
+                    let i = dim.idx();
+                    let w = self.weights[i];
+                    if w > 0.0 && raw.present0[i] && !uniform[i] {
+                        numerator += w * raw.norms[i];
+                        denom += w;
+                    }
+                }
+                let score = if denom > 0.0 { numerator / denom } else { 0.5 };
+                Scored {
+                    backend: b,
+                    score_q: quantize(score),
+                }
+            })
+            .collect();
+
+        // ── SELECT — total tie-break (score_q↓, priority↓, name↑) ────────────
+        let winner = scored
+            .iter()
+            .max_by(|a, b| {
+                // score_q descending
+                let cmp = a.score_q.cmp(&b.score_q);
+                if cmp != std::cmp::Ordering::Equal {
+                    return cmp;
+                }
+                // priority descending
+                let cmp2 = a.backend.config.priority.cmp(&b.backend.config.priority);
+                if cmp2 != std::cmp::Ordering::Equal {
+                    return cmp2;
+                }
+                // name ascending (guaranteed unique by validate())
+                b.backend.config.name.cmp(&a.backend.config.name)
+            })
+            .ok_or_else(|| anyhow::anyhow!("No healthy backends available"))?;
+
+        // ── Debug audit log ───────────────────────────────────────────────────
+        debug!(
+            "scored route → {}  score_q={}  (candidates={}, gated_out={}, gate={:?}, relaxed={})",
+            winner.backend.config.name,
+            winner.score_q,
+            candidates.len(),
+            n_gated,
+            self.model_gate,
+            relaxed,
+        );
+
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            // Per-candidate breakdown (only emitted when debug is enabled).
+            for (s, raw) in scored.iter().zip(raws.iter()) {
+                let mut surviving_parts = Vec::new();
+                let mut dropped_parts = Vec::new();
+                let mut absent_parts = Vec::new();
+                let mut denom_val = 0.0_f64;
+
+                for dim in ALL_DIMS {
+                    let i = dim.idx();
+                    let w = self.weights[i];
+                    if w <= 0.0 {
+                        continue; // weight 0 → skip entirely from breakdown
+                    }
+                    if uniform[i] {
+                        dropped_parts.push(dim.name());
+                    } else if raw.present0[i] {
+                        surviving_parts.push(format!(
+                            "{}={:.4}·{:.1}",
+                            dim.name(),
+                            raw.norms[i],
+                            w
+                        ));
+                        denom_val += w;
+                    } else {
+                        absent_parts.push(dim.name());
+                    }
+                }
+
+                debug!(
+                    "  scored: {}  score_q={}  denom={:.1}  [{}]  [dropped(call-uniform): {}]  [absent: {}]",
+                    s.backend.config.name,
+                    s.score_q,
+                    denom_val,
+                    surviving_parts.join("  "),
+                    dropped_parts.join(", "),
+                    absent_parts.join(", "),
+                );
+            }
+        }
+
+        Ok(RoutedBackend {
+            name: winner.backend.config.name.clone(),
+            url: winner.backend.config.url.clone(),
+        })
+    }
+}
+
+// ── T6: Config sanitize helpers ──────────────────────────────────────────────
+
+/// Sanitize a `ScoredWeights` struct in-place:
+/// - Negative or non-finite weight → warn + reset to default.
+/// - All Phase-1-active dims (1–9) zero → warn + restore all defaults.
+pub fn sanitize_weights(weights: &mut ScoredWeights) {
+    use crate::config::ScoredWeights as SW;
+
+    macro_rules! fix_weight {
+        ($field:ident, $default_fn:expr) => {
+            if weights.$field < 0.0 || !weights.$field.is_finite() {
+                tracing::warn!(
+                    "scored weight '{}' = {} is negative or non-finite — using default {}",
+                    stringify!($field),
+                    weights.$field,
+                    $default_fn,
+                );
+                weights.$field = $default_fn;
+            }
+        };
+    }
+
+    fix_weight!(model_resident, 5.0);
+    fix_weight!(model_fits_vram, 2.0);
+    fix_weight!(prompt_size_vs_capacity, 1.0);
+    fix_weight!(gpu_utilization, 3.0);
+    fix_weight!(vram_headroom, 2.0);
+    fix_weight!(gpu_temperature, 1.0);
+    fix_weight!(operator_priority, 2.0);
+    fix_weight!(tag_affinity, 1.0);
+    fix_weight!(backend_type_affinity, 0.0);
+    fix_weight!(queue_depth, 0.0);
+    fix_weight!(ttft_p50, 0.0);
+    fix_weight!(concurrency_saturation, 0.0);
+    fix_weight!(precise_vram_free, 0.0);
+    fix_weight!(ewma_latency, 0.0);
+    fix_weight!(recent_error_rate, 0.0);
+    fix_weight!(recent_success_throughput, 0.0);
+    fix_weight!(flap_stability, 0.0);
+    fix_weight!(session_stickiness, 0.0);
+    fix_weight!(network_locality, 0.0);
+    fix_weight!(power_cost, 0.0);
+    fix_weight!(rpc_shard_capability, 0.0);
+    fix_weight!(gpu_class_affinity, 0.0);
+    fix_weight!(warm_model_recency, 0.0);
+
+    // Check if all Phase-1-active dims (1–9) are zero → restore defaults.
+    let phase1_active_all_zero = weights.model_resident == 0.0
+        && weights.model_fits_vram == 0.0
+        && weights.prompt_size_vs_capacity == 0.0
+        && weights.gpu_utilization == 0.0
+        && weights.vram_headroom == 0.0
+        && weights.gpu_temperature == 0.0
+        && weights.operator_priority == 0.0
+        && weights.tag_affinity == 0.0
+        && weights.backend_type_affinity == 0.0;
+
+    if phase1_active_all_zero {
+        tracing::warn!("all Phase-1 scored weights are zero — falling back to default weight set");
+        *weights = SW::default();
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::{pool::BackendState, BackendPool, GpuMetrics};
+    use crate::config::{Backend, ModelGate, ScoredConfig, ScoredWeights};
+    use std::collections::HashSet;
+    use std::time::{Duration, Instant};
+
+    // ── Pool builder helpers ─────────────────────────────────────────────────
+
+    fn make_backend(name: &str, priority: u32) -> Backend {
+        Backend {
+            name: name.to_string(),
+            url: format!("http://{}.local", name),
+            priority,
+            ..Backend::default()
+        }
+    }
+
+    fn make_state(name: &str, priority: u32, healthy: bool) -> BackendState {
+        let now = Instant::now();
+        BackendState {
+            config: make_backend(name, priority),
+            healthy,
+            models: Vec::new(),
+            current_model: None,
+            gpu_metrics: None,
+            failure_count: 0,
+            last_check: now,
+            last_request: now,
+            vram_total_mb: None,
+            vram_populated: false,
+            queue_depth: None,
+            ttft_p50_ms: None,
+            vram_free_mb: None,
+            max_concurrent: None,
+        }
+    }
+
+    fn pool_from_states(states: Vec<BackendState>) -> BackendPool {
+        // Build via the public constructor, then swap in our pre-built states.
+        // BackendPool::new initialises from Backend configs; we need full BackendState
+        // control (health, models, gpu_metrics, etc.) so we replace directly.
+        let pool = BackendPool::new(vec![], 5, Duration::from_secs(30));
+        // SAFETY: we own this pool, just constructed — no concurrent access.
+        *pool.backends.try_write().unwrap() = states;
+        pool
+    }
+
+    fn default_scored_config() -> ScoredConfig {
+        ScoredConfig::default()
+    }
+
+    // ── Test 1 & determinism: same pool + request → same result every time ──
+
+    #[tokio::test]
+    async fn scored_picks_right_backend() {
+        // B has better GPU (lower utilization) → should win.
+        let mut state_a = make_state("alpha", 50, true);
+        let mut state_b = make_state("beta", 50, true);
+        state_a.models = vec!["llama3:8b".to_string()];
+        state_b.models = vec!["llama3:8b".to_string()];
+        state_a.gpu_metrics = Some(GpuMetrics {
+            utilization: 80.0,
+            memory_used: 4096,
+            memory_total: 8192,
+            temperature: 60.0,
+        });
+        state_b.gpu_metrics = Some(GpuMetrics {
+            utilization: 10.0,
+            memory_used: 1024,
+            memory_total: 8192,
+            temperature: 50.0,
+        });
+
+        let pool = pool_from_states(vec![state_a, state_b]);
+        let router = ScoredRouter::new(pool, &default_scored_config());
+
+        let result = router
+            .route_scored(
+                Some("llama3:8b"),
+                None,
+                &HashSet::new(),
+                &RouteContext::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.name, "beta");
+    }
+
+    #[tokio::test]
+    async fn determinism_run_twice() {
+        let mut state_a = make_state("node-a", 50, true);
+        let mut state_b = make_state("node-b", 50, true);
+        state_a.models = vec!["m".to_string()];
+        state_b.models = vec!["m".to_string()];
+        state_a.gpu_metrics = Some(GpuMetrics {
+            utilization: 70.0,
+            memory_used: 6000,
+            memory_total: 8000,
+            temperature: 75.0,
+        });
+        state_b.gpu_metrics = Some(GpuMetrics {
+            utilization: 20.0,
+            memory_used: 2000,
+            memory_total: 8000,
+            temperature: 50.0,
+        });
+
+        let pool = pool_from_states(vec![state_a, state_b]);
+        let router = ScoredRouter::new(pool, &default_scored_config());
+        let exc = HashSet::new();
+        let ctx = RouteContext::default();
+
+        let r1 = router
+            .route_scored(Some("m"), None, &exc, &ctx)
+            .await
+            .unwrap();
+        let r2 = router
+            .route_scored(Some("m"), None, &exc, &ctx)
+            .await
+            .unwrap();
+        assert_eq!(r1.name, r2.name);
+    }
+
+    #[tokio::test]
+    async fn determinism_order_invariant() {
+        // Shuffled input order must produce the same winner.
+        let make = |name: &str, util: f32| {
+            let mut s = make_state(name, 50, true);
+            s.models = vec!["m".to_string()];
+            s.gpu_metrics = Some(GpuMetrics {
+                utilization: util,
+                memory_used: 2000,
+                memory_total: 8000,
+                temperature: 55.0,
+            });
+            s
+        };
+        let sa = make("aaa", 80.0);
+        let sb = make("bbb", 20.0); // best util → should win
+
+        let pool1 = pool_from_states(vec![sa.clone(), sb.clone()]);
+        let pool2 = pool_from_states(vec![sb, sa]);
+
+        let cfg = default_scored_config();
+        let r1 = ScoredRouter::new(pool1, &cfg)
+            .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
+            .await
+            .unwrap();
+        let r2 = ScoredRouter::new(pool2, &cfg)
+            .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
+            .await
+            .unwrap();
+        assert_eq!(r1.name, r2.name);
+        assert_eq!(r1.name, "bbb");
+    }
+
+    // ── Test 2: gate-before-score ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn gate_before_score_model_absent_not_returned() {
+        // X does NOT have the model but would score highest on GPU.
+        // Y has the model and must win.
+        let mut state_x = make_state("x-no-model", 50, true);
+        let mut state_y = make_state("y-has-model", 50, true);
+        // X has great GPU but lacks the model
+        state_x.gpu_metrics = Some(GpuMetrics {
+            utilization: 0.0,
+            memory_used: 0,
+            memory_total: 32768,
+            temperature: 40.0,
+        });
+        state_y.models = vec!["llama3:8b".to_string()];
+        state_y.gpu_metrics = Some(GpuMetrics {
+            utilization: 90.0,
+            memory_used: 7000,
+            memory_total: 8000,
+            temperature: 80.0,
+        });
+
+        // Strict gate: X has no model → must never be chosen.
+        let mut cfg = default_scored_config();
+        cfg.model_gate = ModelGate::Strict;
+        let pool = pool_from_states(vec![state_x, state_y]);
+        let router = ScoredRouter::new(pool, &cfg);
+
+        let result = router
+            .route_scored(
+                Some("llama3:8b"),
+                None,
+                &HashSet::new(),
+                &RouteContext::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.name, "y-has-model");
+    }
+
+    #[tokio::test]
+    async fn gate_before_score_unhealthy_not_returned() {
+        let mut state_good = make_state("good", 50, true);
+        let mut state_bad = make_state("bad", 100, false); // higher priority but unhealthy
+        state_good.models = vec!["m".to_string()];
+        state_bad.models = vec!["m".to_string()];
+
+        let pool = pool_from_states(vec![state_good, state_bad]);
+        let router = ScoredRouter::new(pool, &default_scored_config());
+
+        let result = router
+            .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
+            .await
+            .unwrap();
+        assert_eq!(result.name, "good");
+    }
+
+    // ── Test 3: missing-value neutrality ────────────────────────────────────
+    //
+    // Q6=(b) semantics: Pᵢ = set of candidates for which dim i is present₀.
+    // If Pᵢ has only one member, the dim is trivially uniform → dropped by
+    // the pre-pass. The non-reporter is NOT penalized.
+    // A genuinely discriminating signal (|Pᵢ| ≥ 2, values differ) DOES sort
+    // candidates: good beats bad; a non-reporter sits at neutral (weight-dropped).
+
+    #[tokio::test]
+    async fn missing_value_neutrality_two_reporters_good_wins_over_bad() {
+        // Three candidates: A (good temp 45°C), B (bad temp 84°C), C (no metrics).
+        // Pᵢ = {A, B} for gpu_temperature → NOT uniform (different quantized norms)
+        // → dim survives pre-pass → A wins.  C is neutral (weight-dropped).
+        let cfg = ScoredConfig {
+            weights: ScoredWeights {
+                model_resident: 0.0,
+                model_fits_vram: 0.0,
+                prompt_size_vs_capacity: 0.0,
+                gpu_utilization: 0.0,
+                vram_headroom: 0.0,
+                gpu_temperature: 5.0,
+                operator_priority: 0.0,
+                tag_affinity: 0.0,
+                backend_type_affinity: 0.0,
+                ..ScoredWeights::default()
+            },
+            ..default_scored_config()
+        };
+
+        let mut sa = make_state("a-good-temp", 50, true);
+        let mut sb = make_state("b-bad-temp", 50, true);
+        let mut sc = make_state("c-no-metrics", 50, true);
+        for s in [&mut sa, &mut sb, &mut sc] {
+            s.models = vec!["m".to_string()];
+        }
+        sa.gpu_metrics = Some(GpuMetrics {
+            utilization: 50.0,
+            memory_used: 4000,
+            memory_total: 8000,
+            temperature: 45.0,
+        });
+        sb.gpu_metrics = Some(GpuMetrics {
+            utilization: 50.0,
+            memory_used: 4000,
+            memory_total: 8000,
+            temperature: 84.0,
+        });
+        // C has no gpu_metrics.
+
+        let pool = pool_from_states(vec![sa, sb, sc]);
+        let result = ScoredRouter::new(pool, &cfg)
+            .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
+            .await
+            .unwrap();
+        // A has genuinely good temp; the dim discriminates → A wins.
+        assert_eq!(result.name, "a-good-temp");
+    }
+
+    #[tokio::test]
+    async fn missing_value_neutrality_single_reporter_dim_dropped() {
+        // A (bad temp 84°C), B (no metrics). Pᵢ = {A} → single-member → trivially
+        // uniform → dropped. Both score 0.5 → tie-break by name asc.
+        // This proves the non-reporter is NOT penalized for not reporting.
+        let cfg = ScoredConfig {
+            weights: ScoredWeights {
+                model_resident: 0.0,
+                model_fits_vram: 0.0,
+                prompt_size_vs_capacity: 0.0,
+                gpu_utilization: 0.0,
+                vram_headroom: 0.0,
+                gpu_temperature: 5.0,
+                operator_priority: 0.0,
+                tag_affinity: 0.0,
+                backend_type_affinity: 0.0,
+                ..ScoredWeights::default()
+            },
+            ..default_scored_config()
+        };
+
+        let mut sa = make_state("a-bad-temp", 50, true);
+        let mut sb = make_state("b-no-metrics", 50, true);
+        sa.models = vec!["m".to_string()];
+        sb.models = vec!["m".to_string()];
+        sa.gpu_metrics = Some(GpuMetrics {
+            utilization: 50.0,
+            memory_used: 4000,
+            memory_total: 8000,
+            temperature: 84.0,
+        });
+        // B has no gpu_metrics. Pᵢ = {A} → single-member → trivially uniform → dropped.
+        // Both score 0.5 → name asc: "a-bad-temp" < "b-no-metrics" → A wins on name.
+        let pool = pool_from_states(vec![sa, sb]);
+        let result = ScoredRouter::new(pool, &cfg)
+            .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
+            .await
+            .unwrap();
+        // Tie at 0.5; "a-bad-temp" < "b-no-metrics" lexicographically.
+        assert_eq!(result.name, "a-bad-temp");
+    }
+
+    // ── Test 5: tie-break by name ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn tiebreak_name_asc() {
+        // Two identical backends (same priority, no metrics) → lexicographically smaller name wins.
+        let mut state_a = make_state("zz-last", 50, true);
+        let mut state_b = make_state("aa-first", 50, true);
+        state_a.models = vec!["m".to_string()];
+        state_b.models = vec!["m".to_string()];
+
+        let pool1 = pool_from_states(vec![state_a.clone(), state_b.clone()]);
+        let pool2 = pool_from_states(vec![state_b, state_a]);
+        let cfg = default_scored_config();
+
+        let r1 = ScoredRouter::new(pool1, &cfg)
+            .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
+            .await
+            .unwrap();
+        let r2 = ScoredRouter::new(pool2, &cfg)
+            .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
+            .await
+            .unwrap();
+        assert_eq!(r1.name, "aa-first");
+        assert_eq!(r2.name, "aa-first");
+    }
+
+    // ── Test 6: priority tie-break ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn tiebreak_priority_desc() {
+        let mut lo = make_state("low-prio", 10, true);
+        let mut hi = make_state("high-prio", 90, true);
+        lo.models = vec!["m".to_string()];
+        hi.models = vec!["m".to_string()];
+        // No GPU metrics → all dims absent except operator_priority.
+
+        // Use only operator_priority with weight (everything else 0).
+        let cfg = ScoredConfig {
+            weights: ScoredWeights {
+                operator_priority: 5.0,
+                model_resident: 0.0,
+                model_fits_vram: 0.0,
+                prompt_size_vs_capacity: 0.0,
+                gpu_utilization: 0.0,
+                vram_headroom: 0.0,
+                gpu_temperature: 0.0,
+                tag_affinity: 0.0,
+                backend_type_affinity: 0.0,
+                ..ScoredWeights::default()
+            },
+            ..default_scored_config()
+        };
+
+        let pool = pool_from_states(vec![lo, hi]);
+        let result = ScoredRouter::new(pool, &cfg)
+            .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
+            .await
+            .unwrap();
+        assert_eq!(result.name, "high-prio");
+    }
+
+    // ── Test 7: 503-on-empty ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn returns_err_on_empty_pool() {
+        let pool = pool_from_states(vec![]);
+        let router = ScoredRouter::new(pool, &default_scored_config());
+        let result = router
+            .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn returns_err_when_all_unhealthy() {
+        let mut s = make_state("sick", 50, false);
+        s.models = vec!["m".to_string()];
+        let pool = pool_from_states(vec![s]);
+        let router = ScoredRouter::new(pool, &default_scored_config());
+        let result = router
+            .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn strict_gate_errors_when_no_model_resident() {
+        let s = make_state("node", 50, true); // models is empty
+        let pool = pool_from_states(vec![s]);
+        let mut cfg = default_scored_config();
+        cfg.model_gate = ModelGate::Strict;
+        let result = ScoredRouter::new(pool, &cfg)
+            .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
+            .await;
+        assert!(result.is_err());
+    }
+
+    // ── Test 8: relaxed fallback ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn relaxed_gate_falls_back_when_no_resident() {
+        // Model not resident anywhere; healthy backends exist → relaxed should not 503.
+        let s = make_state("node", 50, true); // no models
+        let pool = pool_from_states(vec![s]);
+        let mut cfg = default_scored_config();
+        cfg.model_gate = ModelGate::Relaxed;
+        let result = ScoredRouter::new(pool, &cfg)
+            .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
+            .await;
+        assert!(result.is_ok());
+    }
+
+    // ── Test 10: Phase 2+ inertness ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn phase2_dims_inert_in_phase1() {
+        // Two backends with agent telemetry set; routing with high Phase-2 weights
+        // must give the same result as routing with those weights at 0, because the
+        // source Options are None for enrolled (non-agent) backends.
+        let mut s1 = make_state("n1", 50, true);
+        let mut s2 = make_state("n2", 50, true);
+        s1.models = vec!["m".to_string()];
+        s2.models = vec!["m".to_string()];
+        s1.gpu_metrics = Some(GpuMetrics {
+            utilization: 10.0,
+            memory_used: 1000,
+            memory_total: 8000,
+            temperature: 50.0,
+        });
+        s2.gpu_metrics = Some(GpuMetrics {
+            utilization: 80.0,
+            memory_used: 7000,
+            memory_total: 8000,
+            temperature: 70.0,
+        });
+        // Phase-2 fields stay None (simulating non-agent backend).
+
+        let cfg_no_phase2 = ScoredConfig::default();
+        let mut cfg_with_phase2 = ScoredConfig::default();
+        cfg_with_phase2.weights.queue_depth = 100.0;
+        cfg_with_phase2.weights.ttft_p50 = 100.0;
+        cfg_with_phase2.weights.precise_vram_free = 100.0;
+
+        let r1 = ScoredRouter::new(
+            pool_from_states(vec![s1.clone(), s2.clone()]),
+            &cfg_no_phase2,
+        )
+        .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
+        .await
+        .unwrap();
+        let r2 = ScoredRouter::new(pool_from_states(vec![s1, s2]), &cfg_with_phase2)
+            .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
+            .await
+            .unwrap();
+        assert_eq!(r1.name, r2.name);
+    }
+
+    // ── Test 12a: Q6 call-uniform drop ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn q6_uniform_dim_dropped_discriminating_wins() {
+        // All backends have same temperature (uniform → dropped).
+        // Only vram_headroom differs → that dim decides.
+        let temp = 60.0_f32;
+        let mut s1 = make_state("low-vram", 50, true);
+        let mut s2 = make_state("high-vram", 50, true);
+        s1.models = vec!["m".to_string()];
+        s2.models = vec!["m".to_string()];
+        s1.gpu_metrics = Some(GpuMetrics {
+            utilization: 50.0,
+            memory_used: 7500,
+            memory_total: 8000,
+            temperature: temp,
+        });
+        s2.gpu_metrics = Some(GpuMetrics {
+            utilization: 50.0,
+            memory_used: 2000,
+            memory_total: 8000,
+            temperature: temp,
+        });
+
+        // Weight only temperature and vram_headroom.
+        let cfg = ScoredConfig {
+            weights: ScoredWeights {
+                model_resident: 0.0,
+                model_fits_vram: 0.0,
+                prompt_size_vs_capacity: 0.0,
+                gpu_utilization: 0.0,
+                vram_headroom: 3.0,
+                gpu_temperature: 3.0, // uniform → will be dropped
+                operator_priority: 0.0,
+                tag_affinity: 0.0,
+                backend_type_affinity: 0.0,
+                ..ScoredWeights::default()
+            },
+            ..default_scored_config()
+        };
+
+        let pool = pool_from_states(vec![s1, s2]);
+        let result = ScoredRouter::new(pool, &cfg)
+            .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
+            .await
+            .unwrap();
+        // high-vram wins (vram_headroom discriminates); temperature dropped.
+        assert_eq!(result.name, "high-vram");
+
+        // Control: same result when temperature weight is 0.
+        let cfg_no_temp = ScoredConfig {
+            weights: ScoredWeights {
+                model_resident: 0.0,
+                model_fits_vram: 0.0,
+                prompt_size_vs_capacity: 0.0,
+                gpu_utilization: 0.0,
+                vram_headroom: 3.0,
+                gpu_temperature: 0.0,
+                operator_priority: 0.0,
+                tag_affinity: 0.0,
+                backend_type_affinity: 0.0,
+                ..ScoredWeights::default()
+            },
+            ..default_scored_config()
+        };
+        let mut sv1 = make_state("low-vram", 50, true);
+        let mut sv2 = make_state("high-vram", 50, true);
+        sv1.models = vec!["m".to_string()];
+        sv2.models = vec!["m".to_string()];
+        sv1.gpu_metrics = Some(GpuMetrics {
+            utilization: 50.0,
+            memory_used: 7500,
+            memory_total: 8000,
+            temperature: temp,
+        });
+        sv2.gpu_metrics = Some(GpuMetrics {
+            utilization: 50.0,
+            memory_used: 2000,
+            memory_total: 8000,
+            temperature: temp,
+        });
+        let pool2 = pool_from_states(vec![sv1, sv2]);
+        let result2 = ScoredRouter::new(pool2, &cfg_no_temp)
+            .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
+            .await
+            .unwrap();
+        assert_eq!(result2.name, "high-vram");
+    }
+
+    #[tokio::test]
+    async fn q6_all_identical_fleet_no_panic() {
+        // All identical → all dims uniform → all score 0.5 → tie-break by name.
+        let mut s1 = make_state("alpha", 50, true);
+        let mut s2 = make_state("beta", 50, true);
+        let mut s3 = make_state("gamma", 50, true);
+        for s in [&mut s1, &mut s2, &mut s3] {
+            s.models = vec!["m".to_string()];
+            s.gpu_metrics = Some(GpuMetrics {
+                utilization: 50.0,
+                memory_used: 4000,
+                memory_total: 8000,
+                temperature: 60.0,
+            });
+        }
+
+        let pool = pool_from_states(vec![s1, s2, s3]);
+        let result = ScoredRouter::new(pool, &default_scored_config())
+            .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
+            .await;
+        // Must not panic; winner is "alpha" (lexicographically smallest).
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().name, "alpha");
+    }
+
+    // ── T6: sanitize_weights tests ───────────────────────────────────────────
+
+    #[test]
+    fn sanitize_negative_weight_reset_to_default() {
+        let mut w = ScoredWeights {
+            gpu_utilization: -1.0,
+            ..ScoredWeights::default()
+        };
+        sanitize_weights(&mut w);
+        assert_eq!(w.gpu_utilization, 3.0);
+    }
+
+    #[test]
+    fn sanitize_nan_weight_reset_to_default() {
+        let mut w = ScoredWeights {
+            vram_headroom: f64::NAN,
+            ..ScoredWeights::default()
+        };
+        sanitize_weights(&mut w);
+        assert_eq!(w.vram_headroom, 2.0);
+    }
+
+    #[test]
+    fn sanitize_all_zero_phase1_restores_defaults() {
+        let mut w = ScoredWeights {
+            model_resident: 0.0,
+            model_fits_vram: 0.0,
+            prompt_size_vs_capacity: 0.0,
+            gpu_utilization: 0.0,
+            vram_headroom: 0.0,
+            gpu_temperature: 0.0,
+            operator_priority: 0.0,
+            tag_affinity: 0.0,
+            backend_type_affinity: 0.0,
+            ..ScoredWeights::default()
+        };
+        sanitize_weights(&mut w);
+        // Should restore defaults.
+        assert_eq!(w.gpu_utilization, 3.0);
+        assert_eq!(w.model_resident, 5.0);
+    }
+}

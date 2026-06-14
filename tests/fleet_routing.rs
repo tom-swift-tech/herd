@@ -169,7 +169,11 @@ struct Gateway {
 }
 
 fn build_state(registry: Arc<NodeRegistry>, pool: Arc<BackendPool>, config: Config) -> AppState {
-    let router = create_router(config.routing.strategy.clone(), (*pool).clone());
+    let router = create_router(
+        config.routing.strategy.clone(),
+        (*pool).clone(),
+        &config.routing,
+    );
     AppState {
         pool,
         router: Arc::new(tokio::sync::RwLock::new(router)),

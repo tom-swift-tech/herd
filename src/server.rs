@@ -253,7 +253,11 @@ impl AppState {
         }
 
         // Swap router (new router shares the same pool data)
-        let new_router = create_router(new_config.routing.strategy.clone(), (*self.pool).clone());
+        let new_router = create_router(
+            new_config.routing.strategy.clone(),
+            (*self.pool).clone(),
+            &new_config.routing,
+        );
         *self.router.write().await = new_router;
 
         // Update timeout and retry count
@@ -406,7 +410,11 @@ impl Server {
         });
 
         // Create router
-        let router = create_router(self.config.routing.strategy.clone(), pool.clone());
+        let router = create_router(
+            self.config.routing.strategy.clone(),
+            pool.clone(),
+            &self.config.routing,
+        );
 
         // Wrap in Arc
         let pool = Arc::new(pool);
@@ -2311,7 +2319,11 @@ mod tests {
             initial.circuit_breaker.failure_threshold,
             parse_duration(&initial.circuit_breaker.recovery_time).unwrap(),
         ));
-        let router = create_router(initial.routing.strategy.clone(), (*pool).clone());
+        let router = create_router(
+            initial.routing.strategy.clone(),
+            (*pool).clone(),
+            &initial.routing,
+        );
 
         let state = AppState {
             pool,

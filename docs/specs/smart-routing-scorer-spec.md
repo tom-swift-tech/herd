@@ -351,8 +351,9 @@ step — this is the second line of defence against NaN/out-of-range (see Determ
 | 2 | `model_fits_vram` | A | est. model size vs `vram_free_mb` (else `gpu_metrics.memory_*`) | see formula below | higher | 1 |
 | 3 | `prompt_size_vs_capacity` | A | `RouteContext.prompt_tokens` vs node ctx window | see formula below | higher | 1 |
 
-**Dim 1 — `model_resident` (absolute).** Presence depends on the gate's relax state, so the
-predicate is stated explicitly for both cases:
+**Dim 1 — `model_resident` (absolute).** *Enforced at the gate; self-neutralizes in scoring
+(see `compute_raw` in `scored.rs`) — its weight is effectively the gate, not a score term.*
+Presence depends on the gate's relax state, so the predicate is stated explicitly for both cases:
 ```
 present₁(b) = (model requested) AND (b is model-resident OR the gate has relaxed)
             // ⇔ model requested AND (b.models.contains(model) OR relaxed == true)

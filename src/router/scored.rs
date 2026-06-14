@@ -208,6 +208,13 @@ fn compute_raw(
     let mut present0 = [false; DIM_COUNT];
 
     // ── Dim 1: model_resident ────────────────────────────────────────────────
+    // NOTE: model_resident self-neutralizes via the Q6 pre-pass and does NOT
+    // contribute to ranking. The GATE (step 2) already filters to residents-only
+    // unless relaxed, so within the scored set this dim is uniform — all 1.0
+    // (resident set) or all 0.0 (relaxed, none resident) — and Q6 drops it as
+    // call-uniform. Its weight (default 5.0) is effectively the GATE, not a score
+    // term: residency is enforced by elimination, not scored. A resident-vs-
+    // cold-loadable distinction that would actually rank needs Phase 2.
     // present if model was requested AND (resident OR gate has relaxed).
     if let Some(m) = model {
         let resident = b.models.contains(&m.to_string());

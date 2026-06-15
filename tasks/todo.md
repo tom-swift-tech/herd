@@ -3,7 +3,34 @@
 > Scratchpad for in-flight work. Milestone tracking lives in `ROADMAP.md`;
 > the v1.2 PR breakdown + acceptance checklist live in `tasks/HERD-V1.2-SPRINT.md`.
 
-**Last updated:** 2026-06-13
+**Last updated:** 2026-06-15
+
+---
+
+## ACTIVE — Scorer Phase-1 hardening (post-PR #19 review follow-ups)
+
+Branch off `main` (`71e69ad`). Review of merged PR #19 (`ScoredRouter`) surfaced
+low-severity follow-ups; this slice does the genuine *hardening* ones only.
+
+**Scope decision:** the dim-3 (`prompt_size_vs_capacity`) "call-site swap" I
+floated turned out to be **feature work**, not hardening — it needs a new public
+`Backend` context-window config field + proxy token estimation + switching the
+proxy (`api/openai.rs:359`) from `route_excluding` to `route_scored`. PR #19
+deferred it deliberately. **Deferred to scorer Phase 2**, not done here.
+
+- [x] **Fix 1 — dim-6 temperature sentinel guard** (`src/router/scored.rs:279`).
+  Mark dim 6 present only when `temperature > 0.0`; a non-positive reading is the
+  "sensor unavailable" sentinel → source-absent (neutral + weight-dropped). Dim 4
+  (`utilization == 0`, idle GPU) deliberately left alone.
+- [x] **Fix 2 — drop per-candidate String alloc** — `b.models.contains(&m.to_string())`
+  → `b.models.iter().any(|x| x == m)` at gate filter + dim 1.
+- [x] **Fix 3 — correct VRAM-estimate comment** — `BYTES_PER_BILLION_MB` doc now
+  reads "~1 GB/billion (q8-ish; fp16 ≈ 2×)". Constant unchanged.
+- [x] **Test** `temperature_zero_sentinel_not_favored` — A=50/B=80/C=0.0 °C; coolest
+  real reporter (A) wins, sentinel (C) must not. **Verified anti-trivial**: removing
+  the guard flips the winner to `c-nosensor` (the bug), confirming the test catches it.
+- [x] **Verify** — build ✓, full suite **499 lib** (+1) / 0 fail / 1 ignored ✓,
+  clippy `-D warnings` ✓, fmt `--check` ✓. No lib unwrap (only `#[cfg(test)]`).
 
 ---
 

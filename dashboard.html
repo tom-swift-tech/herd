@@ -692,7 +692,8 @@
             </div>
             <div class="stat-card">
                 <div class="stat-value" id="stat-backends">--</div>
-                <div class="stat-label">Online Backends</div>
+                <div class="stat-label" id="stat-backends-label">Fleet Nodes Online</div>
+                <div class="stat-sub" id="stat-backends-sub"></div>
             </div>
         </div>
 
@@ -1293,7 +1294,7 @@ Content-Type: application/json
         <div class="footer">
             <span id="last-update">Updating...</span>
             <span class="footer-refresh" id="refresh-countdown">Refreshing in 5s</span>
-            <span id="version-info">Herd</span>
+            <span id="version-info">Gateway v--</span>
         </div>
     </div>
 
@@ -1352,6 +1353,7 @@ Content-Type: application/json
         let countdownInterval = null;
         let fleetNodes = [];
         let fleetRefreshInterval = null;
+        let lastRouterSummary = { totalBackends: 0, healthyBackends: 0 };
 
         // -- Tab System --
         function switchTab(name) {
@@ -1403,6 +1405,64 @@ Content-Type: application/json
             if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
             if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
             return `${Math.floor(seconds / 86400)}d ago`;
+        }
+
+        function isFleetNodeOnline(status) {
+            return status === 'healthy' || status === 'online';
+        }
+
+        function summarizeFleetNodes(nodes) {
+            return nodes.reduce((summary, node) => {
+                summary.total++;
+                if (node.enabled !== false) summary.enabled++;
+                if (isFleetNodeOnline(node.status)) summary.online++;
+                if (node.status === 'degraded') summary.degraded++;
+                if (node.source === 'agent') summary.agent++;
+                else summary.enrolled++;
+                summary.totalVramMb += Number(node.vram_mb || 0);
+                return summary;
+            }, {
+                total: 0,
+                enabled: 0,
+                online: 0,
+                degraded: 0,
+                agent: 0,
+                enrolled: 0,
+                totalVramMb: 0,
+            });
+        }
+
+        function updateInfrastructureSummary() {
+            const summary = summarizeFleetNodes(fleetNodes);
+            const labelEl = document.getElementById('stat-backends-label');
+            const valueEl = document.getElementById('stat-backends');
+            const subEl = document.getElementById('stat-backends-sub');
+            if (!labelEl || !valueEl || !subEl) return;
+
+            if (summary.total > 0) {
+                const totalVramGb = summary.totalVramMb > 0
+                    ? `${(summary.totalVramMb / 1024).toFixed(summary.totalVramMb >= 16 * 1024 ? 0 : 1)} GB VRAM`
+                    : 'no VRAM reported';
+                valueEl.textContent = `${summary.online}/${summary.total}`;
+                labelEl.textContent = 'Fleet Nodes Online';
+                const parts = [
+                    `${summary.agent} agent / ${summary.enrolled} enrolled`,
+                    `${summary.enabled} enabled`,
+                ];
+                if (summary.degraded > 0) parts.push(`${summary.degraded} degraded`);
+                parts.push(
+                    `${lastRouterSummary.healthyBackends}/${lastRouterSummary.totalBackends} router backends active`
+                );
+                parts.push(totalVramGb);
+                subEl.textContent = parts.join(' · ');
+                return;
+            }
+
+            valueEl.textContent = `${lastRouterSummary.healthyBackends}/${lastRouterSummary.totalBackends}`;
+            labelEl.textContent = 'Router Backends Online';
+            subEl.textContent = lastRouterSummary.totalBackends > 0
+                ? 'Fleet registry empty; showing live router pool only'
+                : 'No fleet nodes or backends registered yet';
         }
 
         function gpuClass(pct) {
@@ -1966,7 +2026,7 @@ Content-Type: application/json
                     badge.style.display = 'inline-block';
                     badge.onclick = () => window.open(data.download_url, '_blank');
                 }
-                document.getElementById('version-info').textContent = `Herd v${data.current}`;
+                document.getElementById('version-info').textContent = `Gateway v${data.current}`;
             } catch (e) {
                 console.error('Update check failed:', e);
             }
@@ -1976,9 +2036,10 @@ Content-Type: application/json
         async function refresh() {
             const conn = document.getElementById('conn-indicator');
             try {
-                const [statusRes, gpuRes] = await Promise.all([
+                const [statusRes, gpuRes, nodesRes] = await Promise.all([
                     fetch('/status'),
                     fetch('/gpu').catch(() => null),
+                    fetch('/api/nodes').catch(() => null),
                 ]);
                 const data = await statusRes.json();
                 const healthy = data.healthy_backends || [];
@@ -1986,6 +2047,10 @@ Content-Type: application/json
                 const all = [...healthy, ...unhealthy];
                 const timeout = data.idle_timeout_minutes || 30;
                 const healthyCount = healthy.length;
+                lastRouterSummary = {
+                    totalBackends: all.length,
+                    healthyBackends: healthyCount,
+                };
 
                 // GPU map
                 let gpuMap = {};
@@ -2000,6 +2065,12 @@ Content-Type: application/json
                 }
                 for (const b of all) { if (!b.gpu && gpuMap[b.name]) b.gpu = gpuMap[b.name]; }
 
+                if (nodesRes && nodesRes.ok) {
+                    const nodesData = await nodesRes.json();
+                    fleetNodes = nodesData.nodes || [];
+                    renderFleetTable();
+                }
+
                 // Update UI
                 document.getElementById('strategy').textContent = data.routing_strategy || '--';
                 document.getElementById('idle-timeout').textContent = timeout;
@@ -2007,7 +2078,7 @@ Content-Type: application/json
                     ? all.map(b => renderCard(b, timeout)).join('')
                     : '<div class="empty-state" style="grid-column:1/-1;"><div class="empty-state-title">No backends configured</div><div class="empty-state-text">Click "+ Add Node" to add an Ollama backend</div></div>';
                 document.getElementById('backends-count').textContent = all.length;
-                document.getElementById('stat-backends').textContent = `${healthyCount}/${all.length}`;
+                updateInfrastructureSummary();
 
                 conn.classList.remove('error');
                 refreshCountdown = 5;
@@ -2170,6 +2241,7 @@ Content-Type: application/json
                 const data = await resp.json();
                 fleetNodes = data.nodes || [];
                 renderFleetTable();
+                updateInfrastructureSummary();
             } catch (e) {
                 console.error('Failed to fetch fleet nodes:', e);
             }

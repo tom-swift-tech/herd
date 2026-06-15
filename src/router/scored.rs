@@ -16,7 +16,8 @@ const TEMP_MIN: f64 = 40.0;
 const TEMP_MAX: f64 = 85.0;
 /// Soft score for a backend whose type doesn't match the preference (dim 9).
 const BACKEND_NEUTRAL: f64 = 0.6;
-/// Bytes of VRAM per billion parameters (fp16-ish rough estimate).
+/// Rough VRAM estimate: ~1 GB (1024 MB) per billion params (q8-ish; fp16 ≈ 2×).
+/// Coarse fit heuristic for dim 2 (`model_fits_vram`) only.
 const BYTES_PER_BILLION_MB: u64 = 1024;
 /// Scale factor for quantizing scores to i64 comparison keys.
 const SCORE_SCALE: f64 = 1_000_000.0;
@@ -217,7 +218,7 @@ fn compute_raw(
     // cold-loadable distinction that would actually rank needs Phase 2.
     // present if model was requested AND (resident OR gate has relaxed).
     if let Some(m) = model {
-        let resident = b.models.contains(&m.to_string());
+        let resident = b.models.iter().any(|x| x == m);
         if resident || relaxed {
             present0[Dimension::ModelResident.idx()] = true;
             norms[Dimension::ModelResident.idx()] = if resident { 1.0 } else { 0.0 };
@@ -269,11 +270,19 @@ fn compute_raw(
     }
 
     // ── Dim 6: gpu_temperature ───────────────────────────────────────────────
+    // A GPU under load is never ≤ 0 °C, so a non-positive reading is the
+    // "sensor unavailable" sentinel (the agent reports the field but the driver
+    // had no value). Treat it as source-absent — neutral and weight-dropped —
+    // rather than scoring a perfect coolness norm (1.0) that would unfairly win
+    // dim 6. NOTE: utilization == 0 (dim 4) is NOT a sentinel — an idle GPU is
+    // genuinely the best routing target — so dim 4 keeps the zero.
     if let Some(ref gm) = b.gpu_metrics {
-        present0[Dimension::GpuTemperature.idx()] = true;
-        // Denominator is TEMP_MAX - TEMP_MIN = 45.0, a compile-time constant ≠ 0.
-        norms[Dimension::GpuTemperature.idx()] =
-            ((TEMP_MAX - gm.temperature as f64) / (TEMP_MAX - TEMP_MIN)).clamp(0.0, 1.0);
+        if gm.temperature > 0.0 {
+            present0[Dimension::GpuTemperature.idx()] = true;
+            // Denominator is TEMP_MAX - TEMP_MIN = 45.0, a compile-time constant ≠ 0.
+            norms[Dimension::GpuTemperature.idx()] =
+                ((TEMP_MAX - gm.temperature as f64) / (TEMP_MAX - TEMP_MIN)).clamp(0.0, 1.0);
+        }
     }
 
     // ── Dim 7: operator_priority ─────────────────────────────────────────────
@@ -363,7 +372,7 @@ impl Router for ScoredRouter {
                 let residents: Vec<_> = healthy
                     .iter()
                     .copied()
-                    .filter(|b| b.models.contains(&m.to_string()))
+                    .filter(|b| b.models.iter().any(|x| x == m))
                     .collect();
 
                 if !residents.is_empty() {
@@ -1203,6 +1212,73 @@ mod tests {
         // Must not panic; winner is "alpha" (lexicographically smallest).
         assert!(result.is_ok());
         assert_eq!(result.unwrap().name, "alpha");
+    }
+
+    // ── Dim-6 temperature sentinel guard ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn temperature_zero_sentinel_not_favored() {
+        // A=50°C (cool, real), B=80°C (hot, real), C=0.0 (sensor unavailable).
+        // Pre-guard, C's temp norm is (85-0)/45 → clamp 1.0 → C wins dim 6 with a
+        // bogus "perfect coolness". With the guard, C's temperature is treated as
+        // source-absent (neutral, weight-dropped); P_temp = {A, B} discriminates,
+        // and the genuinely-coolest real reporter (A) wins. The sentinel node must
+        // NOT be favored just because its driver reported 0 °C.
+        let cfg = ScoredConfig {
+            weights: ScoredWeights {
+                model_resident: 0.0,
+                model_fits_vram: 0.0,
+                prompt_size_vs_capacity: 0.0,
+                gpu_utilization: 0.0,
+                vram_headroom: 0.0,
+                gpu_temperature: 5.0,
+                operator_priority: 0.0,
+                tag_affinity: 0.0,
+                backend_type_affinity: 0.0,
+                ..ScoredWeights::default()
+            },
+            ..default_scored_config()
+        };
+
+        let mut sa = make_state("a-cool", 50, true);
+        let mut sb = make_state("b-hot", 50, true);
+        let mut sc = make_state("c-nosensor", 50, true);
+        for s in [&mut sa, &mut sb, &mut sc] {
+            s.models = vec!["m".to_string()];
+        }
+        // Same memory everywhere so vram_headroom (weight 0 anyway) can't sway it.
+        sa.gpu_metrics = Some(GpuMetrics {
+            utilization: 50.0,
+            memory_used: 4000,
+            memory_total: 8000,
+            temperature: 50.0,
+        });
+        sb.gpu_metrics = Some(GpuMetrics {
+            utilization: 50.0,
+            memory_used: 4000,
+            memory_total: 8000,
+            temperature: 80.0,
+        });
+        sc.gpu_metrics = Some(GpuMetrics {
+            utilization: 50.0,
+            memory_used: 4000,
+            memory_total: 8000,
+            temperature: 0.0, // sensor unavailable — must not score a perfect norm
+        });
+
+        let pool = pool_from_states(vec![sa, sb, sc]);
+        let result = ScoredRouter::new(pool, &cfg)
+            .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            result.name, "a-cool",
+            "coolest real reporter should win; the 0°C sentinel must not be favored"
+        );
+        assert_ne!(
+            result.name, "c-nosensor",
+            "a backend with an unavailable temp sensor must not win on temperature"
+        );
     }
 
     // ── T6: sanitize_weights tests ───────────────────────────────────────────

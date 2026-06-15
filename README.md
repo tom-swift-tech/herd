@@ -388,7 +388,7 @@ Herd is a **smart stateless proxy with a stateful routing cache**. It is not HA 
 - **Tokens per second** — Exponential moving average gauge
 - **Labeled latency** — Per-backend, per-model, per-status latency histograms (cardinality-capped at 200)
 - **Request analytics** — JSONL logging with auto-retention
-- **Interactive dashboard** — Real-time charts (Backends, Analytics, Sessions, Fleet, Models, Agent Guide, Settings)
+- **Interactive dashboard** — Real-time charts (Backends, Analytics, Sessions, Fleet, Models, Agent Guide, Settings), with a header infrastructure summary that distinguishes Fleet Nodes Online from live Router Backends Online
 - **GPU metrics** — Real-time VRAM, utilization, temperature via gpu-hot
 - **Latency tracking** — P50, P95, P99 percentiles
 - **Log rotation** — Size-based rotation with configurable retention
@@ -715,6 +715,8 @@ Wire these into Grafana, Datadog, or any Prometheus-compatible monitoring stack.
 
 Access the interactive dashboard at `http://your-herd:40114/dashboard`
 
+The header carries an at-a-glance **infrastructure summary**. When fleet nodes are registered (from `/api/nodes`) it reads **Fleet Nodes Online** (`online / total`) with a sub-line of active router-pool backends, enabled node count, and aggregate VRAM; with an empty fleet registry it falls back to **Router Backends Online** drawn from the live routing pool (`/status`). A node counts as online when its status is `healthy` or `online` (`degraded`/`offline` do not). The footer reports the running **Gateway** build version.
+
 **Tabs:**
 - **Backends** — Real-time node status with GPU metrics
 - **Analytics** — Request volume, top models, latency percentiles
@@ -726,7 +728,7 @@ Access the interactive dashboard at `http://your-herd:40114/dashboard`
 
 ### Request Logging
 
-All proxied requests are logged to `~/.herd/requests.jsonl`:
+All proxied requests are logged to `{HERD_DATA_DIR}/requests.jsonl` (default `~/.herd/requests.jsonl`; see [Running in Docker](#running-in-docker) for the container data dir):
 
 ```json
 {"timestamp":1709395200,"model":"qwen2.5-coder:32b","backend":"fast-node","duration_ms":234,"status":"success","path":"/api/generate","request_id":"550e8400-...","tier":"heavy","classified_by":"keyword"}

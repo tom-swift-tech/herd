@@ -2068,7 +2068,12 @@ Content-Type: application/json
                 if (nodesRes && nodesRes.ok) {
                     const nodesData = await nodesRes.json();
                     fleetNodes = nodesData.nodes || [];
-                    renderFleetTable();
+                    // Keep fleetNodes fresh every cycle (the infrastructure summary
+                    // below reads it), but only re-render the table when its tab is
+                    // visible — skip the wasted DOM work while the Fleet tab is hidden.
+                    if (document.getElementById('tab-fleet')?.classList.contains('active')) {
+                        renderFleetTable();
+                    }
                 }
 
                 // Update UI

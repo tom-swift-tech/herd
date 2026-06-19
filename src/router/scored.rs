@@ -1,7 +1,9 @@
-/// Scored router — Phase 1 (stub, replaced below with full impl).
+/// Scored router.
 ///
-/// GATE → SCORE → SELECT pipeline over 23 dimensions (dims 1–9 active in Phase 1;
-/// dims 10–23 always absent/neutral until later phases populate their sources).
+/// GATE → SCORE → SELECT pipeline over 23 dimensions. Active: dims 1–9 (Phase 1)
+/// plus dims 10, 11, 13 (Phase 2 Slice 1 — live load & latency from agent
+/// telemetry). Dims 12, 14–23 remain absent/neutral until later phases/slices
+/// populate their sources.
 use crate::backend::{pool::filter_healthy, BackendPool};
 use crate::config::{BackendType, ModelGate, ScoredConfig, ScoredWeights};
 use crate::router::{RouteContext, RoutedBackend, Router};
@@ -19,6 +21,12 @@ const BACKEND_NEUTRAL: f64 = 0.6;
 /// Rough VRAM estimate: ~1 GB (1024 MB) per billion params (q8-ish; fp16 ≈ 2×).
 /// Coarse fit heuristic for dim 2 (`model_fits_vram`) only.
 const BYTES_PER_BILLION_MB: u64 = 1024;
+/// Reference queue depth for dim 10 (`queue_depth`); a backend with this many
+/// queued requests normalizes to 0.0, an empty queue to 1.0.
+const QUEUE_REF: f64 = 8.0;
+/// Reference TTFT (ms) for dim 11 (`ttft_p50`); at/above this a backend
+/// normalizes to 0.0, instant first token to 1.0.
+const TTFT_REF: f64 = 2000.0;
 /// Scale factor for quantizing scores to i64 comparison keys.
 const SCORE_SCALE: f64 = 1_000_000.0;
 
@@ -194,8 +202,9 @@ struct CandidateRaw {
 
 /// Compute raw norms for all 23 dimensions for a single candidate.
 ///
-/// Dims 10–23 (Phase 2/3/4): their sources are all `None` in Phase 1, so
-/// `present0` will be `false` for each → neutral/weight-dropped.  No scoring.
+/// Dims 10, 11, 13 (Phase 2 Slice 1) read agent live-load telemetry when present.
+/// Dims 12, 14–23: their sources are `None`/absent, so `present0` is `false` for
+/// each → neutral/weight-dropped. No scoring.
 fn compute_raw(
     b: &crate::backend::pool::BackendState,
     model: Option<&str>,
@@ -320,8 +329,46 @@ fn compute_raw(
         };
     }
 
-    // ── Dims 10–23: Phase 2/3/4 — always absent in Phase 1 ──────────────────
-    // present0[9..23] remain false; they contribute neutral 0.5 and weight-drop.
+    // ── Dim 10: queue_depth (Phase 2 Slice 1) ───────────────────────────────
+    // Presence predicate is `is_some()`, NOT `unwrap_or(0) > 0`: Some(0) is a
+    // REAL signal (an empty queue, the best possible target → 1.0), not absent.
+    // Only None (agent never reported it) → not-present → neutral, weight-dropped.
+    if let Some(qd) = b.queue_depth {
+        present0[Dimension::QueueDepth.idx()] = true;
+        norms[Dimension::QueueDepth.idx()] = (1.0 - qd as f64 / QUEUE_REF).clamp(0.0, 1.0);
+    }
+
+    // ── Dim 11: ttft_p50 (Phase 2 Slice 1) ───────────────────────────────────
+    if let Some(ttft) = b.ttft_p50_ms {
+        present0[Dimension::TtftP50.idx()] = true;
+        norms[Dimension::TtftP50.idx()] = (1.0 - ttft as f64 / TTFT_REF).clamp(0.0, 1.0);
+    }
+
+    // ── Dim 12: concurrency_saturation — deferred (Phase 2 Slice 2) ──────────
+    // Source `max_concurrent` is not yet reported by the agent protocol → stays
+    // None → not-present. Left absent on purpose.
+
+    // ── Dim 13: precise_vram_free (Phase 2 Slice 1) ──────────────────────────
+    // Measured free VRAM from agent telemetry. When present it SUPERSEDES dim 5
+    // (vram_headroom, gpu_metrics-derived) for this candidate to avoid double-
+    // counting the same VRAM-pressure signal — clearing dim 5's present flag
+    // drops its weight from this backend's score denominator. Supersession is
+    // per-candidate: a static backend with no agent telemetry keeps its dim-5.
+    // Some(0) free VRAM is a REAL signal (worst, → 0.0), not absent.
+    if let Some(free) = b.vram_free_mb {
+        if let Some(total) = b.vram_total_mb {
+            if total > 0 {
+                present0[Dimension::PreciseVramFree.idx()] = true;
+                norms[Dimension::PreciseVramFree.idx()] =
+                    (free as f64 / total as f64).clamp(0.0, 1.0);
+                // Supersede dim 5 — the precise signal wins.
+                present0[Dimension::VramHeadroom.idx()] = false;
+            }
+        }
+    }
+
+    // ── Dims 12, 14–23: Phase 2 Slice 2 / 3 / 4 — absent in this slice ───────
+    // Their sources are None/absent → present0 stays false → neutral, weight-dropped.
 
     CandidateRaw { norms, present0 }
 }
@@ -591,10 +638,10 @@ pub fn sanitize_weights(weights: &mut ScoredWeights) {
     fix_weight!(operator_priority, 2.0);
     fix_weight!(tag_affinity, 1.0);
     fix_weight!(backend_type_affinity, 0.0);
-    fix_weight!(queue_depth, 0.0);
-    fix_weight!(ttft_p50, 0.0);
+    fix_weight!(queue_depth, 2.0);
+    fix_weight!(ttft_p50, 3.0);
     fix_weight!(concurrency_saturation, 0.0);
-    fix_weight!(precise_vram_free, 0.0);
+    fix_weight!(precise_vram_free, 2.0);
     fix_weight!(ewma_latency, 0.0);
     fix_weight!(recent_error_rate, 0.0);
     fix_weight!(recent_success_throughput, 0.0);
@@ -1321,5 +1368,163 @@ mod tests {
         // Should restore defaults.
         assert_eq!(w.gpu_utilization, 3.0);
         assert_eq!(w.model_resident, 5.0);
+    }
+
+    // ── Phase 2 Slice 1: live-load telemetry dims (10, 11, 13) ───────────────
+
+    /// dim 10 — an idle backend (`queue_depth: Some(0)`) out-ranks a saturated
+    /// one (`Some(8)`). All other dims are uniform → dropped, so queue_depth is
+    /// the sole differentiator. Anti-trivial: with QueueDepth weight at 0 (or the
+    /// dim removed) the two tie and "alpha" wins by name — so a "beta" win proves
+    /// the dim is live.
+    #[tokio::test]
+    async fn queue_depth_idle_outranks_busy() {
+        let mut busy = make_state("alpha", 50, true);
+        let mut idle = make_state("beta", 50, true);
+        busy.models = vec!["m".to_string()];
+        idle.models = vec!["m".to_string()];
+        busy.queue_depth = Some(8); // saturated → 0.0
+        idle.queue_depth = Some(0); // empty → 1.0
+
+        let pool = pool_from_states(vec![busy, idle]);
+        let router = ScoredRouter::new(pool, &default_scored_config());
+        let result = router
+            .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
+            .await
+            .unwrap();
+        assert_eq!(result.name, "beta", "idle backend (Some(0)) must win");
+    }
+
+    /// dim 10 — `Some(0)` is a REAL signal, scored (not absent). Three backends:
+    /// idle=Some(0), busy=Some(8), silent=None. queue_depth is present on the two
+    /// reporters with differing values, so it survives the call-uniform pre-pass
+    /// and the idle reporter's 1.0 wins. Anti-trivial against the `Some(0)→None`
+    /// bug: the idle node is named LAST alphabetically, so were `Some(0)` mistaken
+    /// for absent, the dim would collapse to a single reporter → dropped → the
+    /// name tie-break hands the win to "aaa-busy". Asserting "zzz-idle" proves
+    /// `Some(0)` is matched on the `Option`, never via a `.unwrap_or(0)` proxy.
+    #[tokio::test]
+    async fn queue_depth_some_zero_scored_not_absent() {
+        let mut busy = make_state("aaa-busy", 50, true);
+        let mut silent = make_state("mmm-silent", 50, true);
+        let mut idle = make_state("zzz-idle", 50, true);
+        for s in [&mut busy, &mut silent, &mut idle] {
+            s.models = vec!["m".to_string()];
+        }
+        busy.queue_depth = Some(8); // → 0.0
+        idle.queue_depth = Some(0); // → 1.0 (the signal under test)
+                                    // silent leaves queue_depth = None (genuinely absent)
+
+        let pool = pool_from_states(vec![busy, silent, idle]);
+        let router = ScoredRouter::new(pool, &default_scored_config());
+        let result = router
+            .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            result.name, "zzz-idle",
+            "Some(0) must be scored as the best queue signal, not flattened to absent"
+        );
+    }
+
+    /// dim 11 — a backend with low TTFT out-ranks a slow one. Other dims uniform
+    /// → dropped, so ttft_p50 decides. Anti-trivial via name (slow = "alpha").
+    #[tokio::test]
+    async fn ttft_p50_fast_outranks_slow() {
+        let mut slow = make_state("alpha", 50, true);
+        let mut fast = make_state("beta", 50, true);
+        slow.models = vec!["m".to_string()];
+        fast.models = vec!["m".to_string()];
+        slow.ttft_p50_ms = Some(1900); // near TTFT_REF → ~0.05
+        fast.ttft_p50_ms = Some(100); // → 0.95
+
+        let pool = pool_from_states(vec![slow, fast]);
+        let router = ScoredRouter::new(pool, &default_scored_config());
+        let result = router
+            .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
+            .await
+            .unwrap();
+        assert_eq!(result.name, "beta", "lower TTFT must win");
+    }
+
+    /// dim 13 SUPERSEDES dim 5. Construct the signals in OPPOSITE directions:
+    /// "zeta" has poor gpu_metrics headroom (dim 5 low) but high precise free-VRAM
+    /// (dim 13 high); "alpha" is the reverse. With supersession only dim 13 counts
+    /// → "zeta" wins. WITHOUT supersession dim 5 also counts → the two tie at 0.5
+    /// and "alpha" wins by name. Asserting "zeta" proves dim 5 is dropped.
+    #[tokio::test]
+    async fn precise_vram_free_supersedes_vram_headroom() {
+        let mut alpha = make_state("alpha", 50, true);
+        let mut zeta = make_state("zeta", 50, true);
+        alpha.models = vec!["m".to_string()];
+        zeta.models = vec!["m".to_string()];
+        // Identical utilization + temperature → those dims are call-uniform → dropped.
+        let gm = |used: u64| GpuMetrics {
+            utilization: 50.0,
+            memory_used: used,
+            memory_total: 8000,
+            temperature: 60.0,
+        };
+        // alpha: high gpu headroom (dim5 0.875), low precise free (dim13 0.125)
+        alpha.gpu_metrics = Some(gm(1000));
+        alpha.vram_total_mb = Some(8000);
+        alpha.vram_free_mb = Some(1000);
+        // zeta: low gpu headroom (dim5 0.125), high precise free (dim13 0.875)
+        zeta.gpu_metrics = Some(gm(7000));
+        zeta.vram_total_mb = Some(8000);
+        zeta.vram_free_mb = Some(7000);
+
+        let pool = pool_from_states(vec![alpha, zeta]);
+        let router = ScoredRouter::new(pool, &default_scored_config());
+        let result = router
+            .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            result.name, "zeta",
+            "precise free-VRAM must supersede gpu_metrics headroom (no double-count)"
+        );
+    }
+
+    /// Supersession is PER-CANDIDATE, tested directly on `compute_raw` (free of
+    /// the call-uniform pre-pass, which would drop a single-reporter dim). An
+    /// agent node with precise telemetry has dim 13 present and dim 5 cleared; a
+    /// static node with only gpu_metrics keeps dim 5 and has dim 13 absent — so a
+    /// static node is never penalized for lacking agent telemetry.
+    #[test]
+    fn supersession_is_per_candidate_in_compute_raw() {
+        let gm = GpuMetrics {
+            utilization: 50.0,
+            memory_used: 1000,
+            memory_total: 8000,
+            temperature: 60.0,
+        };
+        // Agent node: gpu_metrics + precise free/total VRAM.
+        let mut agent = make_state("agent", 50, true);
+        agent.gpu_metrics = Some(gm.clone());
+        agent.vram_total_mb = Some(8000);
+        agent.vram_free_mb = Some(4000);
+        let raw_a = compute_raw(&agent, None, None, false, None, 50, 50);
+        assert!(
+            raw_a.present0[Dimension::PreciseVramFree.idx()],
+            "agent dim 13 must be present"
+        );
+        assert!(
+            !raw_a.present0[Dimension::VramHeadroom.idx()],
+            "agent dim 5 must be superseded (cleared) when dim 13 is present"
+        );
+
+        // Static node: gpu_metrics only, no agent telemetry.
+        let mut stat = make_state("static", 50, true);
+        stat.gpu_metrics = Some(gm);
+        let raw_s = compute_raw(&stat, None, None, false, None, 50, 50);
+        assert!(
+            !raw_s.present0[Dimension::PreciseVramFree.idx()],
+            "static dim 13 must be absent"
+        );
+        assert!(
+            raw_s.present0[Dimension::VramHeadroom.idx()],
+            "static dim 5 must survive (not penalized for missing precise telemetry)"
+        );
     }
 }

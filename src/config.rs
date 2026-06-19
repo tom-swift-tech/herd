@@ -259,14 +259,17 @@ pub struct ScoredWeights {
     pub tag_affinity: f64,
     #[serde(default = "w_zero")]
     pub backend_type_affinity: f64,
-    // Group D — live load (Phase 2; recognized, inert in Phase 1)
-    #[serde(default = "w_zero")]
+    // Group D — live load (Phase 2). queue_depth / ttft_p50 / precise_vram_free
+    // are active as of Phase 2 Slice 1 (latency-aware balanced defaults).
+    // concurrency_saturation stays inert — its source (max_concurrent) is not yet
+    // reported by the agent protocol (Phase 2 Slice 2).
+    #[serde(default = "w_queue_depth")]
     pub queue_depth: f64,
-    #[serde(default = "w_zero")]
+    #[serde(default = "w_ttft_p50")]
     pub ttft_p50: f64,
     #[serde(default = "w_zero")]
     pub concurrency_saturation: f64,
-    #[serde(default = "w_zero")]
+    #[serde(default = "w_precise_vram_free")]
     pub precise_vram_free: f64,
     // Groups E/F (Phase 3–4; recognized, inert in Phase 1)
     #[serde(default = "w_zero")]
@@ -303,10 +306,10 @@ impl Default for ScoredWeights {
             operator_priority: w_operator_priority(),
             tag_affinity: w_tag_affinity(),
             backend_type_affinity: w_zero(),
-            queue_depth: w_zero(),
-            ttft_p50: w_zero(),
+            queue_depth: w_queue_depth(),
+            ttft_p50: w_ttft_p50(),
             concurrency_saturation: w_zero(),
-            precise_vram_free: w_zero(),
+            precise_vram_free: w_precise_vram_free(),
             ewma_latency: w_zero(),
             recent_error_rate: w_zero(),
             recent_success_throughput: w_zero(),
@@ -345,6 +348,18 @@ fn w_operator_priority() -> f64 {
 }
 fn w_tag_affinity() -> f64 {
     1.0
+}
+// Group D — live load (Phase 2 Slice 1). Latency-aware balanced posture: the
+// measured live-load signals sit at parity with the sampled gpu_utilization (3.0)
+// and vram_headroom (2.0) rather than dominating operator intent / model placement.
+fn w_queue_depth() -> f64 {
+    2.0
+}
+fn w_ttft_p50() -> f64 {
+    3.0
+}
+fn w_precise_vram_free() -> f64 {
+    2.0
 }
 fn w_zero() -> f64 {
     0.0
@@ -2093,7 +2108,12 @@ routing:
         // Defaults table.
         assert_eq!(config.routing.scored.weights.model_resident, 5.0);
         assert_eq!(config.routing.scored.weights.gpu_utilization, 3.0);
-        assert_eq!(config.routing.scored.weights.queue_depth, 0.0);
+        // Phase 2 Slice 1: live-load dims now carry latency-aware balanced weights.
+        assert_eq!(config.routing.scored.weights.queue_depth, 2.0);
+        assert_eq!(config.routing.scored.weights.ttft_p50, 3.0);
+        assert_eq!(config.routing.scored.weights.precise_vram_free, 2.0);
+        // Dim 12 source (max_concurrent) not yet wired → stays inert.
+        assert_eq!(config.routing.scored.weights.concurrency_saturation, 0.0);
     }
 
     #[test]
@@ -2155,7 +2175,7 @@ backends:
         // scored block not present → all defaults.
         assert_eq!(config.routing.scored.weights.model_resident, 5.0);
         assert_eq!(config.routing.scored.weights.gpu_utilization, 3.0);
-        assert_eq!(config.routing.scored.weights.queue_depth, 0.0);
+        assert_eq!(config.routing.scored.weights.queue_depth, 2.0);
         // model_gate defaults to Relaxed.
         use super::ModelGate;
         assert_eq!(config.routing.scored.model_gate, ModelGate::Relaxed);

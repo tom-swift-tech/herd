@@ -635,6 +635,17 @@ Flip dims 10–13 from "always absent" to reading their Phase-0 `BackendState` f
 Add `max_concurrent` to `AgentCapabilities` + agent protocol to light up dim 12. No
 scoring-engine change — purely turning on source reads + default weights.
 
+> **Slice 1 (PR #23):** dims 10 (`queue_depth`), 11 (`ttft_p50`), 13
+> (`precise_vram_free`) read agent telemetry already at the pool boundary
+> (`vram_total_mb`/`vram_free_mb`/`queue_depth`/`ttft_p50_ms` were carried in Phase 0).
+> Presence uses the `is_some()` predicate so `Some(0)` is scored (empty queue → 1.0,
+> zero free VRAM → 0.0), never conflated with `None`. Dim 13 **supersedes dim 5**
+> per-candidate (clears its present flag) to avoid double-counting VRAM pressure.
+> Default weights are latency-aware balanced: `ttft_p50=3`, `queue_depth=2`,
+> `precise_vram_free=2`. **Slice 2 (deferred):** dim 12 (`concurrency_saturation`)
+> needs a `max_concurrent` field on `AgentCapabilities` + the heartbeat protocol +
+> the agent daemon — its `BackendState.max_concurrent` stays `None` until then.
+
 ### Phase 3 — History & stability (dims 14–17)
 
 Add the per-(backend,model) derived-stats store (EWMA latency, rolling error-rate) updated

@@ -39,6 +39,13 @@ pub struct ProbeOutcome {
     pub backend: BackendType,
     pub models_loaded: Vec<String>,
     pub reachable: bool,
+    /// Measured in-flight request count (llama-server `/slots` busy count).
+    /// `None` when the backend can't report it (Ollama, `/slots` disabled, or
+    /// any probe failure) — an honest "unmeasured", never a fake 0.
+    pub queue_depth: Option<u32>,
+    /// Concurrency limit the backend launched with (llama-server `/props`
+    /// `total_slots`). `None` when unavailable.
+    pub max_concurrent: Option<u32>,
 }
 
 /// Ollama `/api/ps` response (currently loaded models).
@@ -69,6 +76,20 @@ struct OpenAIModel {
     id: String,
 }
 
+/// llama-server `/props` (subset): `total_slots` is the `--parallel` limit.
+#[derive(Debug, Deserialize)]
+struct LlamaProps {
+    #[serde(default)]
+    total_slots: Option<u32>,
+}
+
+/// llama-server `/slots` entry (subset): `is_processing` marks a busy slot.
+#[derive(Debug, Deserialize)]
+struct LlamaSlot {
+    #[serde(default)]
+    is_processing: bool,
+}
+
 /// Parse an Ollama `/api/ps` body into loaded model names. Prefers the
 /// fully-qualified `model` field, falling back to `name` (same preference as
 /// `backend/discovery.rs`).
@@ -87,6 +108,18 @@ pub fn parse_ollama_ps(body: &str) -> Option<Vec<String>> {
 pub fn parse_openai_models(body: &str) -> Option<Vec<String>> {
     let models: OpenAIModels = serde_json::from_str(body).ok()?;
     Some(models.data.into_iter().map(|m| m.id).collect())
+}
+
+/// Parse a llama-server `/props` body into its `total_slots` (concurrency limit).
+pub fn parse_llama_total_slots(body: &str) -> Option<u32> {
+    serde_json::from_str::<LlamaProps>(body).ok()?.total_slots
+}
+
+/// Parse a llama-server `/slots` body into the count of busy slots. `[]` →
+/// `Some(0)` (idle, a real signal); a non-array / malformed body → `None`.
+pub fn parse_llama_busy_slots(body: &str) -> Option<u32> {
+    let slots: Vec<LlamaSlot> = serde_json::from_str(body).ok()?;
+    Some(slots.iter().filter(|s| s.is_processing).count() as u32)
 }
 
 /// Probes the local inference backend. With no explicit backend type, it
@@ -130,13 +163,36 @@ impl LocalProbe {
         parse_openai_models(&body)
     }
 
+    /// Best-effort llama-server load probe: `max_concurrent` from `/props`
+    /// (`total_slots`) and `queue_depth` from `/slots` (busy count). Each is
+    /// independent — a missing or disabled endpoint yields `None` for just that
+    /// value and never affects reachability.
+    async fn probe_llama_load(&self) -> (Option<u32>, Option<u32>) {
+        let max_concurrent = self
+            .get_body("/props")
+            .await
+            .and_then(|b| parse_llama_total_slots(&b));
+        let queue_depth = self
+            .get_body("/slots")
+            .await
+            .and_then(|b| parse_llama_busy_slots(&b));
+        (queue_depth, max_concurrent)
+    }
+
     pub async fn probe(&self) -> ProbeOutcome {
         match self.override_backend {
             Some(BackendType::Ollama) => {
-                self.outcome(BackendType::Ollama, self.probe_ollama().await)
+                // Ollama exposes no slot/concurrency telemetry → load stays None.
+                self.outcome(BackendType::Ollama, self.probe_ollama().await, None, None)
             }
             Some(backend @ (BackendType::LlamaServer | BackendType::OpenAICompat)) => {
-                self.outcome(backend, self.probe_openai().await)
+                let models = self.probe_openai().await;
+                let (queue_depth, max_concurrent) = if models.is_some() {
+                    self.probe_llama_load().await
+                } else {
+                    (None, None)
+                };
+                self.outcome(backend, models, queue_depth, max_concurrent)
             }
             None => {
                 if let Some(models) = self.probe_ollama().await {
@@ -144,24 +200,47 @@ impl LocalProbe {
                         backend: BackendType::Ollama,
                         models_loaded: models,
                         reachable: true,
+                        queue_depth: None,
+                        max_concurrent: None,
                     };
                 }
-                self.outcome(BackendType::LlamaServer, self.probe_openai().await)
+                let models = self.probe_openai().await;
+                let (queue_depth, max_concurrent) = if models.is_some() {
+                    self.probe_llama_load().await
+                } else {
+                    (None, None)
+                };
+                self.outcome(
+                    BackendType::LlamaServer,
+                    models,
+                    queue_depth,
+                    max_concurrent,
+                )
             }
         }
     }
 
-    fn outcome(&self, backend: BackendType, models: Option<Vec<String>>) -> ProbeOutcome {
+    fn outcome(
+        &self,
+        backend: BackendType,
+        models: Option<Vec<String>>,
+        queue_depth: Option<u32>,
+        max_concurrent: Option<u32>,
+    ) -> ProbeOutcome {
         match models {
             Some(models_loaded) => ProbeOutcome {
                 backend,
                 models_loaded,
                 reachable: true,
+                queue_depth,
+                max_concurrent,
             },
             None => ProbeOutcome {
                 backend,
                 models_loaded: Vec::new(),
                 reachable: false,
+                queue_depth: None,
+                max_concurrent: None,
             },
         }
     }
@@ -230,5 +309,49 @@ mod tests {
         assert!(!outcome.reachable);
         assert!(outcome.models_loaded.is_empty());
         assert_eq!(outcome.backend, BackendType::LlamaServer);
+        // Unmeasured load must be None, never a fake 0.
+        assert_eq!(outcome.queue_depth, None);
+        assert_eq!(outcome.max_concurrent, None);
+    }
+
+    #[test]
+    fn parses_total_slots_from_props() {
+        let body = r#"{"total_slots":4,"model_path":"m.gguf","is_sleeping":false}"#;
+        assert_eq!(parse_llama_total_slots(body), Some(4));
+    }
+
+    #[test]
+    fn props_without_total_slots_is_none() {
+        assert_eq!(parse_llama_total_slots(r#"{"model_path":"m.gguf"}"#), None);
+        assert_eq!(parse_llama_total_slots("not json"), None);
+    }
+
+    #[test]
+    fn counts_busy_slots() {
+        // Two slots, one processing → busy count 1.
+        let body = r#"[{"id":0,"is_processing":true},{"id":1,"is_processing":false}]"#;
+        assert_eq!(parse_llama_busy_slots(body), Some(1));
+    }
+
+    #[test]
+    fn empty_slots_array_is_zero_busy() {
+        // Idle is a REAL signal (Some(0)), distinct from unmeasured (None).
+        assert_eq!(parse_llama_busy_slots("[]"), Some(0));
+    }
+
+    #[test]
+    fn all_slots_busy_counts_all() {
+        let body = r#"[{"is_processing":true},{"is_processing":true},{"is_processing":true}]"#;
+        assert_eq!(parse_llama_busy_slots(body), Some(3));
+    }
+
+    #[test]
+    fn malformed_or_disabled_slots_is_none() {
+        // `/slots` disabled returns a non-array error object → None (unmeasured).
+        assert_eq!(
+            parse_llama_busy_slots(r#"{"error":"slots disabled"}"#),
+            None
+        );
+        assert_eq!(parse_llama_busy_slots("not json"), None);
     }
 }

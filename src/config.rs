@@ -259,15 +259,14 @@ pub struct ScoredWeights {
     pub tag_affinity: f64,
     #[serde(default = "w_zero")]
     pub backend_type_affinity: f64,
-    // Group D — live load (Phase 2). queue_depth / ttft_p50 / precise_vram_free
-    // are active as of Phase 2 Slice 1 (latency-aware balanced defaults).
-    // concurrency_saturation stays inert — its source (max_concurrent) is not yet
-    // reported by the agent protocol (Phase 2 Slice 2).
+    // Group D — live load (Phase 2). All active (latency-aware balanced defaults).
+    // concurrency_saturation (dim 12) carries a lower weight than queue_depth
+    // (dim 10): the two coexist (absolute vs capacity-relative queue pressure).
     #[serde(default = "w_queue_depth")]
     pub queue_depth: f64,
     #[serde(default = "w_ttft_p50")]
     pub ttft_p50: f64,
-    #[serde(default = "w_zero")]
+    #[serde(default = "w_concurrency_saturation")]
     pub concurrency_saturation: f64,
     #[serde(default = "w_precise_vram_free")]
     pub precise_vram_free: f64,
@@ -308,7 +307,7 @@ impl Default for ScoredWeights {
             backend_type_affinity: w_zero(),
             queue_depth: w_queue_depth(),
             ttft_p50: w_ttft_p50(),
-            concurrency_saturation: w_zero(),
+            concurrency_saturation: w_concurrency_saturation(),
             precise_vram_free: w_precise_vram_free(),
             ewma_latency: w_zero(),
             recent_error_rate: w_zero(),
@@ -357,6 +356,9 @@ fn w_queue_depth() -> f64 {
 }
 fn w_ttft_p50() -> f64 {
     3.0
+}
+fn w_concurrency_saturation() -> f64 {
+    1.0
 }
 fn w_precise_vram_free() -> f64 {
     2.0
@@ -2108,12 +2110,12 @@ routing:
         // Defaults table.
         assert_eq!(config.routing.scored.weights.model_resident, 5.0);
         assert_eq!(config.routing.scored.weights.gpu_utilization, 3.0);
-        // Phase 2 Slice 1: live-load dims now carry latency-aware balanced weights.
+        // Phase 2: live-load dims carry latency-aware balanced weights.
         assert_eq!(config.routing.scored.weights.queue_depth, 2.0);
         assert_eq!(config.routing.scored.weights.ttft_p50, 3.0);
         assert_eq!(config.routing.scored.weights.precise_vram_free, 2.0);
-        // Dim 12 source (max_concurrent) not yet wired → stays inert.
-        assert_eq!(config.routing.scored.weights.concurrency_saturation, 0.0);
+        // Dim 12 (Slice 2): lower weight than dim 10, coexisting.
+        assert_eq!(config.routing.scored.weights.concurrency_saturation, 1.0);
     }
 
     #[test]

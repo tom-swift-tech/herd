@@ -72,6 +72,8 @@ fn test_snapshot(node_id: &str) -> herd::nodes::AgentCapabilities {
         "http://127.0.0.1:8080".into(),
         30_000,
         vec!["qwen3-32b.gguf".into()],
+        Some(1),
+        Some(4),
     )
 }
 

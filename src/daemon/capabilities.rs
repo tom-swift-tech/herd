@@ -223,6 +223,8 @@ impl SnapshotBuilder {
         address: String,
         vram_free_mb: u64,
         models_loaded: Vec<String>,
+        queue_depth: Option<u32>,
+        max_concurrent: Option<u32>,
     ) -> AgentCapabilities {
         AgentCapabilities {
             node_id: self.node_id.clone(),
@@ -234,8 +236,10 @@ impl SnapshotBuilder {
             // model unloads can't invalidate the whole snapshot.
             vram_free_mb: vram_free_mb.min(self.gpu.vram_total_mb),
             models_loaded,
-            queue_depth: 0,
-            ttft_p50_ms: None,
+            // Measured live load (llama-server); None when unmeasurable.
+            queue_depth,
+            ttft_p50_ms: None, // deferred — needs --metrics + p50 windowing
+            max_concurrent,
             rpc_capable: false, // v1.4 (pipeline parallel)
             rpc_port: None,
             agent_version: AGENT_VERSION.to_string(),
@@ -352,12 +356,16 @@ mod tests {
             "http://127.0.0.1:8080".into(),
             99_999,
             vec!["qwen3-32b".into()],
+            Some(2),
+            Some(4),
         );
         assert_eq!(caps.vram_free_mb, 32607);
         assert_eq!(caps.vram_total_mb, 32607);
         assert_eq!(caps.node_id, "citadel-5090");
         assert_eq!(caps.models_loaded, vec!["qwen3-32b"]);
         assert_eq!(caps.agent_version, AGENT_VERSION);
+        assert_eq!(caps.queue_depth, Some(2));
+        assert_eq!(caps.max_concurrent, Some(4));
         assert!(!caps.rpc_capable);
         assert_eq!(caps.os.as_deref(), Some(std::env::consts::OS));
         assert_eq!(caps.arch.as_deref(), Some(std::env::consts::ARCH));
@@ -371,9 +379,14 @@ mod tests {
             "http://127.0.0.1:11434".into(),
             0,
             vec![],
+            None,
+            None,
         );
         assert_eq!(caps.vram_total_mb, 0);
         assert_eq!(caps.vram_free_mb, 0);
         assert!(caps.gpu_model.is_none());
+        // Ollama can't report load → honest None, not a fake 0.
+        assert_eq!(caps.queue_depth, None);
+        assert_eq!(caps.max_concurrent, None);
     }
 }

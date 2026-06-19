@@ -1,9 +1,9 @@
 /// Scored router.
 ///
 /// GATE → SCORE → SELECT pipeline over 23 dimensions. Active: dims 1–9 (Phase 1)
-/// plus dims 10, 11, 13 (Phase 2 Slice 1 — live load & latency from agent
-/// telemetry). Dims 12, 14–23 remain absent/neutral until later phases/slices
-/// populate their sources.
+/// plus dims 10–13 (Phase 2 — live load & latency from agent telemetry; dim 11
+/// `ttft_p50` reads agent caps but the agent does not yet measure it). Dims 14–23
+/// remain absent/neutral until Phase 3/4 populate their sources.
 use crate::backend::{pool::filter_healthy, BackendPool};
 use crate::config::{BackendType, ModelGate, ScoredConfig, ScoredWeights};
 use crate::router::{RouteContext, RoutedBackend, Router};
@@ -344,9 +344,19 @@ fn compute_raw(
         norms[Dimension::TtftP50.idx()] = (1.0 - ttft as f64 / TTFT_REF).clamp(0.0, 1.0);
     }
 
-    // ── Dim 12: concurrency_saturation — deferred (Phase 2 Slice 2) ──────────
-    // Source `max_concurrent` is not yet reported by the agent protocol → stays
-    // None → not-present. Left absent on purpose.
+    // ── Dim 12: concurrency_saturation (Phase 2 Slice 2) ─────────────────────
+    // How full the backend's concurrency slots are: queue_depth / max_concurrent.
+    // Present only when BOTH are known and max_concurrent > 0 (the `> 0` is the
+    // div-by-zero guard; a degenerate Some(0) capacity is treated as unmeasured).
+    // Coexists with dim 10 (no supersession): dim 10 is absolute queue pressure,
+    // dim 12 is capacity-relative; per-backend renorm tolerates the correlation.
+    if let (Some(depth), Some(max)) = (b.queue_depth, b.max_concurrent) {
+        if max > 0 {
+            present0[Dimension::ConcurrencySaturation.idx()] = true;
+            norms[Dimension::ConcurrencySaturation.idx()] =
+                (1.0 - depth as f64 / max as f64).clamp(0.0, 1.0);
+        }
+    }
 
     // ── Dim 13: precise_vram_free (Phase 2 Slice 1) ──────────────────────────
     // Measured free VRAM from agent telemetry. When present it SUPERSEDES dim 5
@@ -367,7 +377,7 @@ fn compute_raw(
         }
     }
 
-    // ── Dims 12, 14–23: Phase 2 Slice 2 / 3 / 4 — absent in this slice ───────
+    // ── Dims 14–23: Phase 3 / 4 — absent until those phases ──────────────────
     // Their sources are None/absent → present0 stays false → neutral, weight-dropped.
 
     CandidateRaw { norms, present0 }
@@ -640,7 +650,7 @@ pub fn sanitize_weights(weights: &mut ScoredWeights) {
     fix_weight!(backend_type_affinity, 0.0);
     fix_weight!(queue_depth, 2.0);
     fix_weight!(ttft_p50, 3.0);
-    fix_weight!(concurrency_saturation, 0.0);
+    fix_weight!(concurrency_saturation, 1.0);
     fix_weight!(precise_vram_free, 2.0);
     fix_weight!(ewma_latency, 0.0);
     fix_weight!(recent_error_rate, 0.0);
@@ -1525,6 +1535,78 @@ mod tests {
         assert!(
             raw_s.present0[Dimension::VramHeadroom.idx()],
             "static dim 5 must survive (not penalized for missing precise telemetry)"
+        );
+    }
+
+    // ── Phase 2 Slice 2: concurrency_saturation (dim 12) ─────────────────────
+
+    /// dim 12 — with equal absolute queue depth (dim 10 uniform → dropped), the
+    /// backend with MORE concurrency headroom (higher max_concurrent → lower
+    /// saturation) wins. Anti-trivial: remove dim 12 and the two tie → "alpha"
+    /// wins by name; a "zeta" win proves dim 12 decided.
+    #[tokio::test]
+    async fn concurrency_saturation_more_headroom_wins() {
+        let mut tight = make_state("alpha", 50, true);
+        let mut roomy = make_state("zeta", 50, true);
+        tight.models = vec!["m".to_string()];
+        roomy.models = vec!["m".to_string()];
+        // Equal queue_depth → dim 10 is call-uniform → dropped.
+        tight.queue_depth = Some(2);
+        roomy.queue_depth = Some(2);
+        // Different capacity → dim 12 differs: tight 1-2/4=0.5, roomy 1-2/16=0.875.
+        tight.max_concurrent = Some(4);
+        roomy.max_concurrent = Some(16);
+
+        let pool = pool_from_states(vec![tight, roomy]);
+        let router = ScoredRouter::new(pool, &default_scored_config());
+        let result = router
+            .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
+            .await
+            .unwrap();
+        assert_eq!(result.name, "zeta", "more concurrency headroom must win");
+    }
+
+    /// dim 12 div-by-zero guard + coexistence (no supersession of dim 10), tested
+    /// directly on `compute_raw`. A degenerate `max_concurrent: Some(0)` or a
+    /// missing `max_concurrent`/`queue_depth` → dim 12 absent. When both are
+    /// present, dim 12 AND dim 10 are both present (coexist, unlike dim 13/5).
+    #[test]
+    fn concurrency_saturation_guard_and_coexistence_in_compute_raw() {
+        let dim12 = Dimension::ConcurrencySaturation.idx();
+        let dim10 = Dimension::QueueDepth.idx();
+
+        // Valid: both present and max > 0 → dim 12 present, dim 10 still present.
+        let mut ok = make_state("ok", 50, true);
+        ok.queue_depth = Some(3);
+        ok.max_concurrent = Some(8);
+        let raw = compute_raw(&ok, None, None, false, None, 50, 50);
+        assert!(
+            raw.present0[dim12],
+            "dim 12 present when both known and max>0"
+        );
+        assert!(
+            raw.present0[dim10],
+            "dim 10 must still be present — dim 12 does NOT supersede it"
+        );
+
+        // Guard: max_concurrent Some(0) → dim 12 absent (no div-by-zero).
+        let mut zero_cap = make_state("zerocap", 50, true);
+        zero_cap.queue_depth = Some(3);
+        zero_cap.max_concurrent = Some(0);
+        let raw = compute_raw(&zero_cap, None, None, false, None, 50, 50);
+        assert!(
+            !raw.present0[dim12],
+            "Some(0) capacity → dim 12 absent (guard)"
+        );
+
+        // Missing max_concurrent → dim 12 absent (dim 10 unaffected).
+        let mut no_cap = make_state("nocap", 50, true);
+        no_cap.queue_depth = Some(3);
+        let raw = compute_raw(&no_cap, None, None, false, None, 50, 50);
+        assert!(!raw.present0[dim12], "no max_concurrent → dim 12 absent");
+        assert!(
+            raw.present0[dim10],
+            "dim 10 still present without max_concurrent"
         );
     }
 }

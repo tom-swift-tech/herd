@@ -294,21 +294,23 @@ impl BackendPool {
         }
     }
 
-    /// Set agent-reported live telemetry fields on a backend entry.
-    /// `max_concurrent` is intentionally omitted — no caps source yet (future phase).
+    /// Set agent-reported live telemetry fields on a backend entry. All load
+    /// fields are `Option`: `None` means the agent couldn't measure it (honest
+    /// unmeasured, not a fake 0).
     pub async fn set_agent_telemetry(
         &self,
         name: &str,
-        queue_depth: u32,
+        queue_depth: Option<u32>,
         ttft_p50_ms: Option<u32>,
         vram_free_mb: u64,
+        max_concurrent: Option<u32>,
     ) {
         let mut backends = self.backends.write().await;
         if let Some(backend) = backends.iter_mut().find(|b| b.config.name == name) {
-            backend.queue_depth = Some(queue_depth);
+            backend.queue_depth = queue_depth;
             backend.ttft_p50_ms = ttft_p50_ms;
             backend.vram_free_mb = Some(vram_free_mb);
-            // max_concurrent stays None — no caps source yet (future phase)
+            backend.max_concurrent = max_concurrent;
         }
     }
 

@@ -80,10 +80,10 @@ impl AgentPoolSync {
                     st.vram_total_mb = Some(caps.vram_total_mb);
                     st.vram_populated = true;
                 }
-                st.queue_depth = Some(caps.queue_depth);
+                st.queue_depth = caps.queue_depth;
                 st.ttft_p50_ms = caps.ttft_p50_ms;
                 st.vram_free_mb = Some(caps.vram_free_mb);
-                // max_concurrent stays None — no caps source yet (future phase)
+                st.max_concurrent = caps.max_concurrent;
                 pool.update(st).await;
             } else {
                 // New entry: add, then set models, VRAM, and live telemetry.
@@ -97,6 +97,7 @@ impl AgentPoolSync {
                     caps.queue_depth,
                     caps.ttft_p50_ms,
                     caps.vram_free_mb,
+                    caps.max_concurrent,
                 )
                 .await;
                 tracing::info!("Added agent backend {} to pool ({})", name, caps.address);
@@ -126,8 +127,9 @@ mod tests {
             vram_free_mb: 30_000,
             models_loaded: vec!["llama-3-8b".to_string()],
             // Non-zero so telemetry-population assertions will fail if population is removed.
-            queue_depth: 3,
+            queue_depth: Some(3),
             ttft_p50_ms: Some(42),
+            max_concurrent: Some(8),
             rpc_capable: false,
             rpc_port: None,
             agent_version: "1.2.0".to_string(),
@@ -309,9 +311,9 @@ mod tests {
         );
     }
 
-    /// Test 5: A freshly-added agent entry carries queue_depth, ttft_p50_ms, and
-    /// vram_free_mb from capabilities; max_concurrent stays None (no source yet).
-    /// Covers the "add" branch of reconcile.
+    /// Test 5: A freshly-added agent entry carries queue_depth, ttft_p50_ms,
+    /// vram_free_mb, and max_concurrent from capabilities. Covers the "add"
+    /// branch of reconcile.
     #[tokio::test]
     async fn new_agent_carries_telemetry_fields() {
         let reg = NodeRegistry::new(Duration::from_secs(30));
@@ -319,9 +321,10 @@ mod tests {
 
         let caps = sample_caps("tele-node");
         // Confirm sample_caps has the values we assert below.
-        assert_eq!(caps.queue_depth, 3);
+        assert_eq!(caps.queue_depth, Some(3));
         assert_eq!(caps.ttft_p50_ms, Some(42));
         assert_eq!(caps.vram_free_mb, 30_000);
+        assert_eq!(caps.max_concurrent, Some(8));
 
         reg.heartbeat(caps).await.unwrap();
         AgentPoolSync::reconcile(&reg, &pool).await;
@@ -343,8 +346,9 @@ mod tests {
             "vram_free_mb must be populated on add"
         );
         assert_eq!(
-            entry.max_concurrent, None,
-            "max_concurrent has no source yet"
+            entry.max_concurrent,
+            Some(8),
+            "max_concurrent must be populated on add (Slice 2)"
         );
     }
 
@@ -362,9 +366,10 @@ mod tests {
 
         // Second heartbeat with different telemetry values, then reconcile via update branch.
         let mut caps2 = sample_caps("tele-update");
-        caps2.queue_depth = 7;
+        caps2.queue_depth = Some(7);
         caps2.ttft_p50_ms = Some(99);
         caps2.vram_free_mb = 20_000;
+        caps2.max_concurrent = Some(16);
         reg.heartbeat(caps2).await.unwrap();
         AgentPoolSync::reconcile(&reg, &pool).await;
 
@@ -385,8 +390,9 @@ mod tests {
             "vram_free_mb must be refreshed on update"
         );
         assert_eq!(
-            entry.max_concurrent, None,
-            "max_concurrent has no source yet"
+            entry.max_concurrent,
+            Some(16),
+            "max_concurrent must be refreshed on update"
         );
     }
 

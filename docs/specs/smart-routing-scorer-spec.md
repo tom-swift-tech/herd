@@ -415,7 +415,7 @@ ratio = prompt_tokens / ctx_window
 n₃(b) = clamp( (1.0 - ratio) / 0.5 , 0.0 , 1.0 )
         // = 1.0 when prompt ≤ 50% of window; linear down to 0.0 at 100%; 0.0 past 100%
 ```
-> **Source gap — CLOSED (PR E).** `Backend.max_context_len: Option<u32>` was added to
+> **Source gap — CLOSED (PR #25).** `Backend.max_context_len: Option<u32>` was added to
 > `config.rs` (`#[serde(default)]`), and the proxy now estimates `RouteContext.prompt_tokens`
 > (`api/openai::estimate_prompt_tokens`, ~4 chars/token) and routes via `route_scored`. So
 > `ctx_window(b) = b.config.max_context_len`, and dim 3 is present when both that and

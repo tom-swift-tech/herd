@@ -644,7 +644,7 @@ scoring-engine change — purely turning on source reads + default weights.
 > Default weights are latency-aware balanced: `ttft_p50=3`, `queue_depth=2`,
 > `precise_vram_free=2`.
 >
-> **Slice 2 (PR D):** the `herd agent` daemon now MEASURES real load. It probes
+> **Slice 2 (PR #24):** the `herd agent` daemon now MEASURES real load. It probes
 > llama-server `/props` (`total_slots` → `max_concurrent`) and `/slots` (count
 > `is_processing` → `queue_depth`), best-effort — any failure / disabled endpoint /
 > non-llama backend degrades to `None` and never affects reachability. To represent

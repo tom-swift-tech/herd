@@ -52,6 +52,42 @@ pub(crate) fn rewrite_request_model(body: &[u8], model: Option<&str>) -> Vec<u8>
     serde_json::to_vec(&parsed).unwrap_or_else(|_| body.to_vec())
 }
 
+/// Cheap pre-routing estimate of prompt size in tokens, for the scored router's
+/// `prompt_size_vs_capacity` dimension. Heuristic: ~4 characters per token over
+/// all chat `messages[].content` (string or multimodal `text` parts) or a plain
+/// `prompt` string. Returns `None` when the body isn't recognized JSON or has no
+/// text — the dimension then stays absent (neutral), never a penalty.
+pub(crate) fn estimate_prompt_tokens(body: &[u8]) -> Option<u32> {
+    const CHARS_PER_TOKEN: usize = 4;
+    let json: Value = serde_json::from_slice(body).ok()?;
+
+    let mut chars: usize = 0;
+    if let Some(messages) = json.get("messages").and_then(Value::as_array) {
+        for msg in messages {
+            match msg.get("content") {
+                Some(Value::String(s)) => chars += s.chars().count(),
+                Some(Value::Array(parts)) => {
+                    for part in parts {
+                        if let Some(t) = part.get("text").and_then(Value::as_str) {
+                            chars += t.chars().count();
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    } else if let Some(prompt) = json.get("prompt").and_then(Value::as_str) {
+        chars += prompt.chars().count();
+    } else {
+        return None;
+    }
+
+    if chars == 0 {
+        return None;
+    }
+    Some((chars / CHARS_PER_TOKEN).max(1) as u32)
+}
+
 /// GET /v1/models — OpenAI-compatible model listing.
 /// Aggregates unique model names from all healthy backends.
 pub async fn list_models(State(state): State<AppState>) -> Json<Value> {
@@ -351,12 +387,24 @@ pub async fn chat_completions(
 
     let forward_body = rewrite_request_model(&body_bytes, model_name.as_deref());
 
+    // Estimate prompt size once (pre-routing) for the scored router's dim 3.
+    // Ignored by the other routing strategies (their route_scored is ctx-blind).
+    let route_ctx = crate::router::RouteContext {
+        prompt_tokens: estimate_prompt_tokens(&body_bytes),
+        requested_ctx_len: None,
+    };
+
     for _ in 0..=state.retry_count() {
         let backend = state
             .router
             .read()
             .await
-            .route_excluding(model_name.as_deref(), tags.as_deref(), &excluded)
+            .route_scored(
+                model_name.as_deref(),
+                tags.as_deref(),
+                &excluded,
+                &route_ctx,
+            )
             .await
             .map_err(|_| {
                 openai_error(
@@ -661,6 +709,38 @@ mod tests {
 
     fn parse(bytes: &[u8]) -> Value {
         serde_json::from_slice(bytes).unwrap()
+    }
+
+    #[test]
+    fn estimate_tokens_sums_chat_message_content() {
+        // 40 chars across two messages → 40/4 = 10 tokens.
+        let body = br#"{"messages":[{"role":"system","content":"aaaaaaaaaaaaaaaaaaaa"},{"role":"user","content":"bbbbbbbbbbbbbbbbbbbb"}]}"#;
+        assert_eq!(estimate_prompt_tokens(body), Some(10));
+    }
+
+    #[test]
+    fn estimate_tokens_handles_multimodal_text_parts() {
+        // Only the text parts count (8 chars → 2 tokens); image parts ignored.
+        let body = br#"{"messages":[{"role":"user","content":[{"type":"text","text":"abcdefgh"},{"type":"image_url","image_url":{"url":"x"}}]}]}"#;
+        assert_eq!(estimate_prompt_tokens(body), Some(2));
+    }
+
+    #[test]
+    fn estimate_tokens_handles_plain_prompt() {
+        // Completions/Ollama-generate style `prompt` string (12 chars → 3).
+        assert_eq!(
+            estimate_prompt_tokens(br#"{"prompt":"abcdefghijkl"}"#),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn estimate_tokens_none_when_unrecognized_or_empty() {
+        assert_eq!(estimate_prompt_tokens(b"not json"), None);
+        assert_eq!(estimate_prompt_tokens(br#"{"model":"x"}"#), None);
+        assert_eq!(estimate_prompt_tokens(br#"{"messages":[]}"#), None);
+        // A sub-token-length prompt still rounds up to at least 1.
+        assert_eq!(estimate_prompt_tokens(br#"{"prompt":"hi"}"#), Some(1));
     }
 
     #[test]

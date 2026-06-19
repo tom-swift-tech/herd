@@ -415,12 +415,14 @@ ratio = prompt_tokens / ctx_window
 n₃(b) = clamp( (1.0 - ratio) / 0.5 , 0.0 , 1.0 )
         // = 1.0 when prompt ≤ 50% of window; linear down to 0.0 at 100%; 0.0 past 100%
 ```
-> **Source gap flagged.** There is **no `max_context_len`/ctx-window field on `Backend`
-> today** (verified against `config.rs`). Until one is added to the node registry or
-> `RouteContext.requested_ctx_len` is populated by the proxy, `ctx_window(b)` is unknown,
-> so dim 3 is **never present in Phase 1** and sits neutral regardless of weight. This is
-> consistent with the spec's "inert until wired" stance for prompt-size; the *exact* wiring
-> requirement is in the Prompt-Size section. Do not assume `Backend` carries context length.
+> **Source gap — CLOSED (PR E).** `Backend.max_context_len: Option<u32>` was added to
+> `config.rs` (`#[serde(default)]`), and the proxy now estimates `RouteContext.prompt_tokens`
+> (`api/openai::estimate_prompt_tokens`, ~4 chars/token) and routes via `route_scored`. So
+> `ctx_window(b) = b.config.max_context_len`, and dim 3 is present when both that and
+> `prompt_tokens` are known (`max_context_len > 0`). It applies to statically-configured
+> backends; agent nodes leave `max_context_len = None` (dim 3 absent for them) until a
+> follow-up reports llama-server `/props` `n_ctx`. Dim 3 was inert in Phase 1 only because
+> this field didn't exist yet — the wiring, not the engine, was the gap.
 
 ### Group B — GPU pressure (Phase 1) — all absolute-threshold
 

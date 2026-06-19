@@ -484,6 +484,12 @@ pub struct Backend {
 
     #[serde(default)]
     pub tags: Vec<String>,
+
+    /// Context-window size (tokens) this backend serves. Feeds the scored
+    /// router's `prompt_size_vs_capacity` dimension; `None` (the default) →
+    /// that dimension is absent for this backend (neutral, weight-dropped).
+    #[serde(default)]
+    pub max_context_len: Option<u32>,
 }
 
 impl Backend {
@@ -510,6 +516,7 @@ impl Default for Backend {
             health_check_path: None,
             health_check_status: None,
             tags: Vec::new(),
+            max_context_len: None,
         }
     }
 }

@@ -1437,12 +1437,24 @@ async fn proxy_handler(
         }
     }
 
+    // Estimate prompt size once (pre-routing) for the scored router's dim 3.
+    // No-op for the other routing strategies (their route_scored is ctx-blind).
+    let route_ctx = crate::router::RouteContext {
+        prompt_tokens: crate::api::openai::estimate_prompt_tokens(&body_bytes),
+        requested_ctx_len: None,
+    };
+
     for _ in 0..=state.retry_count() {
         let backend = state
             .router
             .read()
             .await
-            .route_excluding(model_name.as_deref(), tags.as_deref(), &excluded)
+            .route_scored(
+                model_name.as_deref(),
+                tags.as_deref(),
+                &excluded,
+                &route_ctx,
+            )
             .await
             .map_err(|_| axum::http::StatusCode::SERVICE_UNAVAILABLE)?;
 

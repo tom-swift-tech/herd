@@ -205,6 +205,10 @@ struct CandidateRaw {
 /// Dims 10, 11, 13 (Phase 2 Slice 1) read agent live-load telemetry when present.
 /// Dims 12, 14–23: their sources are `None`/absent, so `present0` is `false` for
 /// each → neutral/weight-dropped. No scoring.
+// Each parameter is a distinct, independent scoring input (candidate, request,
+// fleet-relative bounds); grouping them into a struct would obscure more than it
+// clarifies for this private pure fn.
+#[allow(clippy::too_many_arguments)]
 fn compute_raw(
     b: &crate::backend::pool::BackendState,
     model: Option<&str>,
@@ -213,6 +217,7 @@ fn compute_raw(
     prefer_backend_type: Option<BackendType>,
     pmin: u32,
     pmax: u32,
+    prompt_tokens: Option<u32>,
 ) -> CandidateRaw {
     let mut norms = [0.0f64; DIM_COUNT];
     let mut present0 = [false; DIM_COUNT];
@@ -254,10 +259,18 @@ fn compute_raw(
     }
 
     // ── Dim 3: prompt_size_vs_capacity ───────────────────────────────────────
-    // present only if prompt_tokens AND ctx_window known.
-    // Backend has no max_context_len field in Phase 1 → always absent (neutral).
-    // (kept as a stub; ctx_window(b) is None until the field is added)
-    // present0[Dimension::PromptSizeVsCapacity.idx()] remains false.
+    // present iff the proxy estimated prompt_tokens AND this backend declares a
+    // ctx window (`config.max_context_len`, > 0). n = (1 - prompt/window) / 0.5,
+    // clamped: 1.0 when the prompt is ≤ 50% of the window, linear down to 0.0 at
+    // 100%, and 0.0 beyond. A backend without a configured window (most agent
+    // nodes today) is simply absent here — neutral, never penalized.
+    if let (Some(pt), Some(ctx)) = (prompt_tokens, b.config.max_context_len) {
+        if ctx > 0 {
+            present0[Dimension::PromptSizeVsCapacity.idx()] = true;
+            let ratio = pt as f64 / ctx as f64;
+            norms[Dimension::PromptSizeVsCapacity.idx()] = ((1.0 - ratio) / 0.5).clamp(0.0, 1.0);
+        }
+    }
 
     // ── Dim 4: gpu_utilization ───────────────────────────────────────────────
     if let Some(ref gm) = b.gpu_metrics {
@@ -406,7 +419,7 @@ impl Router for ScoredRouter {
         model: Option<&str>,
         tags: Option<&[String]>,
         excluded: &HashSet<String>,
-        _ctx: &RouteContext,
+        ctx: &RouteContext,
     ) -> Result<RoutedBackend> {
         // ── Single snapshot — ONE read, no .await between here and the return. ──
         let backends_guard = self.pool.backends.read().await;
@@ -473,6 +486,7 @@ impl Router for ScoredRouter {
                     self.prefer_backend_type,
                     pmin,
                     pmax,
+                    ctx.prompt_tokens,
                 )
             })
             .collect();
@@ -1514,7 +1528,7 @@ mod tests {
         agent.gpu_metrics = Some(gm.clone());
         agent.vram_total_mb = Some(8000);
         agent.vram_free_mb = Some(4000);
-        let raw_a = compute_raw(&agent, None, None, false, None, 50, 50);
+        let raw_a = compute_raw(&agent, None, None, false, None, 50, 50, None);
         assert!(
             raw_a.present0[Dimension::PreciseVramFree.idx()],
             "agent dim 13 must be present"
@@ -1527,7 +1541,7 @@ mod tests {
         // Static node: gpu_metrics only, no agent telemetry.
         let mut stat = make_state("static", 50, true);
         stat.gpu_metrics = Some(gm);
-        let raw_s = compute_raw(&stat, None, None, false, None, 50, 50);
+        let raw_s = compute_raw(&stat, None, None, false, None, 50, 50, None);
         assert!(
             !raw_s.present0[Dimension::PreciseVramFree.idx()],
             "static dim 13 must be absent"
@@ -1579,7 +1593,7 @@ mod tests {
         let mut ok = make_state("ok", 50, true);
         ok.queue_depth = Some(3);
         ok.max_concurrent = Some(8);
-        let raw = compute_raw(&ok, None, None, false, None, 50, 50);
+        let raw = compute_raw(&ok, None, None, false, None, 50, 50, None);
         assert!(
             raw.present0[dim12],
             "dim 12 present when both known and max>0"
@@ -1593,7 +1607,7 @@ mod tests {
         let mut zero_cap = make_state("zerocap", 50, true);
         zero_cap.queue_depth = Some(3);
         zero_cap.max_concurrent = Some(0);
-        let raw = compute_raw(&zero_cap, None, None, false, None, 50, 50);
+        let raw = compute_raw(&zero_cap, None, None, false, None, 50, 50, None);
         assert!(
             !raw.present0[dim12],
             "Some(0) capacity → dim 12 absent (guard)"
@@ -1602,11 +1616,100 @@ mod tests {
         // Missing max_concurrent → dim 12 absent (dim 10 unaffected).
         let mut no_cap = make_state("nocap", 50, true);
         no_cap.queue_depth = Some(3);
-        let raw = compute_raw(&no_cap, None, None, false, None, 50, 50);
+        let raw = compute_raw(&no_cap, None, None, false, None, 50, 50, None);
         assert!(!raw.present0[dim12], "no max_concurrent → dim 12 absent");
         assert!(
             raw.present0[dim10],
             "dim 10 still present without max_concurrent"
         );
+    }
+
+    // ── Phase 2: prompt_size_vs_capacity (dim 3) ─────────────────────────────
+
+    /// dim 3 — given the same prompt, the backend with the LARGER context window
+    /// (lower prompt/window ratio → higher norm) wins. Anti-trivial: remove dim 3
+    /// and the two tie → "alpha" wins by name; a "zeta" win proves dim 3 decided.
+    #[tokio::test]
+    async fn prompt_size_larger_window_wins() {
+        let mut small = make_state("alpha", 50, true);
+        let mut large = make_state("zeta", 50, true);
+        small.models = vec!["m".to_string()];
+        large.models = vec!["m".to_string()];
+        small.config.max_context_len = Some(4096);
+        large.config.max_context_len = Some(32768);
+
+        let pool = pool_from_states(vec![small, large]);
+        let router = ScoredRouter::new(pool, &default_scored_config());
+        let ctx = RouteContext {
+            prompt_tokens: Some(4000),
+            requested_ctx_len: None,
+        };
+        let result = router
+            .route_scored(Some("m"), None, &HashSet::new(), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(result.name, "zeta", "larger context window must win");
+    }
+
+    /// dim 3 formula + presence, tested directly on `compute_raw`. n = (1-ratio)/0.5
+    /// clamped: ≤50% of window → 1.0, 75% → 0.5, ≥100% → 0.0. Absent when either
+    /// `prompt_tokens` or `max_context_len` is missing (neutral, not a penalty).
+    #[test]
+    fn prompt_size_formula_and_absence_in_compute_raw() {
+        let dim3 = Dimension::PromptSizeVsCapacity.idx();
+        let with_window = |ctx: u32| {
+            let mut s = make_state("b", 50, true);
+            s.config.max_context_len = Some(ctx);
+            s
+        };
+
+        // 500/1000 = 50% → 1.0
+        let raw = compute_raw(
+            &with_window(1000),
+            None,
+            None,
+            false,
+            None,
+            50,
+            50,
+            Some(500),
+        );
+        assert!(raw.present0[dim3]);
+        assert!((raw.norms[dim3] - 1.0).abs() < 1e-9, "≤50% window → 1.0");
+
+        // 750/1000 = 75% → 0.5
+        let raw = compute_raw(
+            &with_window(1000),
+            None,
+            None,
+            false,
+            None,
+            50,
+            50,
+            Some(750),
+        );
+        assert!((raw.norms[dim3] - 0.5).abs() < 1e-9, "75% window → 0.5");
+
+        // 1000/1000 = 100% → 0.0
+        let raw = compute_raw(
+            &with_window(1000),
+            None,
+            None,
+            false,
+            None,
+            50,
+            50,
+            Some(1000),
+        );
+        assert!((raw.norms[dim3]).abs() < 1e-9, "≥100% window → 0.0");
+
+        // No prompt_tokens → absent even with a window configured.
+        let raw = compute_raw(&with_window(1000), None, None, false, None, 50, 50, None);
+        assert!(!raw.present0[dim3], "no prompt_tokens → dim 3 absent");
+
+        // No max_context_len → absent even with a prompt size.
+        let no_window = make_state("nw", 50, true);
+        let raw = compute_raw(&no_window, None, None, false, None, 50, 50, Some(500));
+        assert!(!raw.present0[dim3], "no max_context_len → dim 3 absent");
     }
 }

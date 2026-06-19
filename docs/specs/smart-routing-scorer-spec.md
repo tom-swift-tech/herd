@@ -635,7 +635,7 @@ Flip dims 10–13 from "always absent" to reading their Phase-0 `BackendState` f
 Add `max_concurrent` to `AgentCapabilities` + agent protocol to light up dim 12. No
 scoring-engine change — purely turning on source reads + default weights.
 
-> **Slice 1 (shipped, PR C):** dims 10 (`queue_depth`), 11 (`ttft_p50`), 13
+> **Slice 1 (PR #23):** dims 10 (`queue_depth`), 11 (`ttft_p50`), 13
 > (`precise_vram_free`) read agent telemetry already at the pool boundary
 > (`vram_total_mb`/`vram_free_mb`/`queue_depth`/`ttft_p50_ms` were carried in Phase 0).
 > Presence uses the `is_some()` predicate so `Some(0)` is scored (empty queue → 1.0,

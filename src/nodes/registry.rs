@@ -22,10 +22,16 @@ pub struct AgentCapabilities {
     pub vram_free_mb: u64,
     #[serde(default)]
     pub models_loaded: Vec<String>,
+    /// Measured in-flight request count (`None` = backend can't report it).
+    /// Wire-compat: a pre-Slice-2 agent sends `0` → deserializes to `Some(0)`.
     #[serde(default)]
-    pub queue_depth: u32,
+    pub queue_depth: Option<u32>,
     #[serde(default)]
     pub ttft_p50_ms: Option<u32>,
+    /// Backend concurrency limit (llama-server `total_slots`); `None` when
+    /// unavailable. `#[serde(default)]` keeps pre-Slice-2 agents wire-compatible.
+    #[serde(default)]
+    pub max_concurrent: Option<u32>,
     #[serde(default)]
     pub rpc_capable: bool,
     #[serde(default)]
@@ -334,8 +340,9 @@ mod tests {
             vram_total_mb: 32_768,
             vram_free_mb: 30_000,
             models_loaded: vec!["llama-3-8b".to_string()],
-            queue_depth: 0,
+            queue_depth: Some(0),
             ttft_p50_ms: Some(42),
+            max_concurrent: Some(4),
             rpc_capable: false,
             rpc_port: None,
             agent_version: "1.2.0".to_string(),
@@ -409,7 +416,7 @@ mod tests {
         let mut caps = sample_caps("a");
         caps.models_loaded = vec!["m2".to_string(), "m1".to_string()];
         caps.vram_free_mb = 1;
-        caps.queue_depth = 99;
+        caps.queue_depth = Some(99);
         let outcome = reg.heartbeat(caps).await.unwrap();
         assert_eq!(
             outcome,

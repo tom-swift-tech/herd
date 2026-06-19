@@ -642,9 +642,21 @@ scoring-engine change — purely turning on source reads + default weights.
 > zero free VRAM → 0.0), never conflated with `None`. Dim 13 **supersedes dim 5**
 > per-candidate (clears its present flag) to avoid double-counting VRAM pressure.
 > Default weights are latency-aware balanced: `ttft_p50=3`, `queue_depth=2`,
-> `precise_vram_free=2`. **Slice 2 (deferred):** dim 12 (`concurrency_saturation`)
-> needs a `max_concurrent` field on `AgentCapabilities` + the heartbeat protocol +
-> the agent daemon — its `BackendState.max_concurrent` stays `None` until then.
+> `precise_vram_free=2`.
+>
+> **Slice 2 (PR D):** the `herd agent` daemon now MEASURES real load. It probes
+> llama-server `/props` (`total_slots` → `max_concurrent`) and `/slots` (count
+> `is_processing` → `queue_depth`), best-effort — any failure / disabled endpoint /
+> non-llama backend degrades to `None` and never affects reachability. To represent
+> "unmeasured" honestly, `AgentCapabilities.queue_depth` became `Option<u32>` (a
+> backend that can't report load no longer claims a fake `Some(0)` idle) and a new
+> `max_concurrent: Option<u32>` was added (both `#[serde(default)]` → wire-compatible
+> with pre-Slice-2 agents). Dim 12 (`concurrency_saturation` = `1 - queue_depth /
+> max_concurrent`, present only when both known and `max_concurrent > 0`) is lit up; it
+> COEXISTS with dim 10 (no supersession — absolute vs capacity-relative queue pressure)
+> at a lower default weight (`concurrency_saturation=1`). **Still deferred:** agent ttft
+> measurement (dim 11 reads the caps field but the agent reports `None` — needs the
+> llama-server `--metrics` endpoint + p50 windowing).
 
 ### Phase 3 — History & stability (dims 14–17)
 

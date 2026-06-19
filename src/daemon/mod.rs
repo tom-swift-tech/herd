@@ -150,6 +150,8 @@ pub async fn run(args: AgentArgs) -> anyhow::Result<()> {
             advertise_url.clone(),
             last_vram_free_mb,
             local.models_loaded,
+            local.queue_depth,
+            local.max_concurrent,
         );
 
         let outcome = heartbeat.send(&caps, false).await;

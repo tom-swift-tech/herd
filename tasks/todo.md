@@ -8,86 +8,47 @@
 
 ---
 
-## ACTIVE — Scorer Phase 2, Slice 2: measure real load + dim 12 (concurrency_saturation)
+## ACTIVE — Scorer Phase 2: prompt_size_vs_capacity (dim 3)
 
-Branch `feat/v1.2-scorer-pr-d-slice2` off `main` (post-#23). Carries the todo cleanup.
+Branch `feat/v1.2-scorer-pr-e-dim3` off `main` (post-#24). The deferred dim-3 feature.
 
-**The problem Slice 1 left:** the agent's `snapshot()` HARDCODES `queue_depth: 0`,
-`ttft_p50_ms: None` (`capabilities.rs:237`). The "live-load" dims consume placeholders —
-every agent reads as perpetually idle. Slice 2 makes the agent **measure real load**.
+**Scope decision (Director, 2026-06-19):** picked over ttft (dim 11), which isn't cleanly
+reachable for an observe-only agent (no per-request timings; `/metrics` has no quantiles).
+dim-3 is self-contained, no approximation, no new protocol field.
 
-**Scope decisions (Director, 2026-06-19):**
-- **Measure real load** (not the thin field-only path). Agent probes llama-server.
-- **Dims 10 & 12 coexist**, dim 12 at lower weight (no supersession). Both derive from
-  queue_depth (absolute vs capacity-relative); per-backend renorm tolerates correlation.
-- **ttft (dim 11) deferred** — needs the `--metrics` flag + p50 windowing; later micro-slice.
-
-**llama-server API (verified vs ggml-org/llama.cpp docs):**
-- `GET /props` → `total_slots` (int) = `max_concurrent`. **Read-only, no flag needed.**
-- `GET /slots` → JSON array; count `is_processing==true` = real queue depth. Enabled by
-  default (disabled via `--no-slots` → degrade to None).
-- Ollama / openai-compat / probe failure → None (honest "unmeasured", not fake-0).
-
-**Honesty change (in scope):** `AgentCapabilities.queue_depth: u32 → Option<u32>` so an
-unmeasurable backend reports `None` (dim 10 absent) instead of `Some(0)` (fake idle that
-would unfairly win queue routing). `#[serde(default)]` keeps wire-compat (old agents send
-`0` → `Some(0)`, same as before).
-
-### Plan
-1. **`lifecycle.rs`** — extend `ProbeOutcome` with `queue_depth: Option<u32>` +
-   `max_concurrent: Option<u32>`. Add pure parse fns (canned-output tested, matching the
-   file's style): `parse_llama_total_slots(body)->Option<u32>` (`/props`.`total_slots`),
-   `parse_llama_busy_slots(body)->Option<u32>` (`/slots` array, count `is_processing`).
-   For LlamaServer (and auto-detected openai path), best-effort GET `/props` + `/slots`;
-   any failure → None, never flips `reachable`. Ollama → both None.
-2. **`capabilities.rs`** — `snapshot()` takes `queue_depth: Option<u32>` +
-   `max_concurrent: Option<u32>` (no more hardcoded 0). `AgentCapabilities.queue_depth`
-   → `Option<u32>`; add `max_concurrent: Option<u32>` (`#[serde(default)]`).
-3. **`mod.rs` run loop** — thread `local.queue_depth` / `local.max_concurrent` into snapshot.
-4. **`registry.rs`** — `queue_depth: Option<u32>`, add `max_concurrent: Option<u32>`
-   (`#[serde(default)]`). Fix the ~10 literal sites (mostly test `queue_depth: 0` →
-   `Some(0)`; client.rs/internal.rs/health.rs/db.rs/fleet_routing.rs).
-5. **`pool.rs`** — `set_agent_telemetry` signature: `queue_depth: Option<u32>` +
-   add `max_concurrent: Option<u32>`; assign straight through (no `Some()` wrap).
-6. **`pool_sync.rs`** — `st.queue_depth = caps.queue_depth` (now Option),
-   `st.max_concurrent = caps.max_concurrent`, on BOTH add & update branches.
-7. **`scored.rs` dim 12** (`ConcurrencySaturation`, idx 11): present iff
-   `max_concurrent.is_some() && >0` AND `queue_depth.is_some()`;
-   `norm = clamp(1 - depth/max_concurrent, 0, 1)`. NO supersession (coexists with dim 10).
-8. **`config.rs`** — `w_concurrency_saturation()=1.0` (lower than dim 10's 2.0); flip serde
-   default + `Default` impl + `sanitize_weights` reset value (scored.rs).
-9. **Tests:** lifecycle parse fns (canned `/props`+`/slots`); snapshot carries the values;
-   pool_sync agent entry carries max_concurrent + real queue_depth, static stays None; dim
-   12 saturation differentiates + coexists with dim 10 + div-by-zero guard (`Some(0)`
-   max_concurrent → absent); config default weight; backward-compat (old agent `queue_depth:0`
-   → Some(0)). Anti-trivial vs Q6 single-reporter drop (≥2 reporters per live-dim test).
-10. **Gates:** build + test (lib count grown from 504) + clippy `-D warnings` + fmt. No lib unwrap.
-
-### Roles
-ARCHITECT (done, this session): API verified vs docs; queue_depth→Option ripple mapped
-(~12 sites); /props for max_concurrent (no flag), /slots for depth (default-on). BUILDER:
-steps 1–9. REVIEWER (independent, blocking): (1) probe failure → None, never flips
-`reachable` or breaks the beat; (2) queue_depth Option honest — Ollama/unmeasured → None,
-not Some(0); (3) wire-compat — old agent JSON still deserializes; (4) dim 12 div-by-zero
-guard (`max_concurrent` Some(0)/None → absent); (5) determinism; (6) no lib unwrap; (7)
-tests anti-trivial vs Q6. OPERATOR: gates, lib/total counts. LEAD: docs (ROADMAP, spec
-§Phase 2 Slice 2) + commit + PR. **STOP at open PR — independent outside review before merge.**
+- New `Backend.max_context_len: Option<u32>` config field (`#[serde(default)]`); static
+  backends only — agent nodes stay None (a later slice could report `/props` `n_ctx`).
+- `api/openai.rs::estimate_prompt_tokens(body)` — ~4 chars/token over chat `messages`
+  content (string or multimodal text) or a `prompt` string; None when unrecognized/empty.
+- BOTH proxy sites (`openai.rs` chat, `server.rs` generic) switch `route_excluding` →
+  `route_scored(&RouteContext{prompt_tokens, ..})`. No-op for the 4 legacy routers (ctx-blind).
+- `scored.rs` dim 3: present iff `prompt_tokens.is_some()` AND `max_context_len Some(>0)`;
+  `n = clamp((1 - prompt/window)/0.5, 0, 1)`. `compute_raw` gains a `prompt_tokens` arg.
 
 ### Status
-- [x] STOP for go-ahead → approved (measure-real-load + coexist-both-dims)
-- [x] ARCHITECT — llama-server API verified (Context7/ggml-org docs); design locked
-- [x] BUILDER steps 1–9 — agent probe (`/props`+`/slots`), `queue_depth`→Option,
-  `max_concurrent` through caps→pool→scorer, dim 12 (no supersession), weight 1.0.
-- [x] OPERATOR gates — build ✓, clippy `-D warnings` ✓, fmt ✓; lib 504→**512** (+8). No lib unwrap.
-- [x] REVIEWER independent hunt list — **CLEAN, all 8 items PASS** (best-effort probe,
-  None honesty, wire-compat, div-by-zero guard, no-supersession, determinism, no lib
-  unwrap, anti-trivial tests vs Q6).
-- [x] LEAD docs (ROADMAP, spec §Phase 2 Slice 2) + commit + PR.
+- [x] ARCHITECT — spec dim-3 formula confirmed; `RouteContext.prompt_tokens` seam already
+  existed (route_scored), so wiring is threading one value + the config field + the proxy switch.
+- [x] BUILDER — config field, estimator, both proxy switches, dim 3, tests.
+- [x] OPERATOR gates — build ✓, clippy `-D warnings` ✓, fmt ✓; lib 512→**518** (+6). No lib unwrap.
+- [x] REVIEWER independent hunt list — **CLEAN, all 8 items PASS** (legacy-router safety,
+  div-by-zero/presence guard, formula, estimator honesty, wire-compat, determinism, no lib
+  unwrap, anti-trivial tests).
+- [x] LEAD docs (ROADMAP, spec dim-3 source-gap closed) + commit + PR.
 - [ ] INDEPENDENT outside review before merge
 
 ---
 
 ## DONE — audit log (collapsed; full detail in git history + ROADMAP)
+
+- **Scorer Phase 2 Slice 2 — measure real load + dim 12** (PR #24, `2026-06-19`, merged
+  `53f86b7`) — the `herd agent` daemon now MEASURES load: probes llama-server `/props`
+  (`total_slots`→`max_concurrent`) + `/slots` (busy count→`queue_depth`), best-effort
+  (failure/disabled/non-llama → None, never flips reachable). `AgentCapabilities.queue_depth`
+  → `Option<u32>` (honest unmeasured, no fake idle) + new `max_concurrent` (both serde-default
+  wire-compat). dim 12 `concurrency_saturation` = `1-queue_depth/max_concurrent`, guard `max>0`,
+  COEXISTS with dim 10 (no supersession), weight 1.0. lib 504→512. Endpoints verified vs
+  ggml-org docs. Independent review CLEAN. **Still deferred:** agent ttft (dim 11) — `/metrics`
+  has no quantiles, observe-only agent can't get a true p50.
 
 - **Scorer Phase 2 Slice 1 — live-load dims 10/11/13** (PR #23, `2026-06-19`, merged
   `90b5251`) — `queue_depth`/`ttft_p50`/`precise_vram_free` read agent telemetry already
@@ -118,11 +79,13 @@ tests anti-trivial vs Q6. OPERATOR: gates, lib/total counts. LEAD: docs (ROADMAP
 
 ## Backlog
 - **Agent ttft measurement (dim 11)** — the agent reports `ttft_p50_ms: None` today; dim 11
-  reads the field but is never fed. Probe llama-server `/metrics` (`--metrics` flag) and track
-  a rolling p50 on the agent. Lights up dim 11 the way Slice 2 lit dims 10/12.
-- **Deferred dim-3** (`prompt_size_vs_capacity`) — new `Backend.max_context_len` config +
-  proxy token estimation; switch proxy (`api/openai.rs:359`, `server.rs:1437`) from
-  `route_excluding` to `route_scored` populating `RouteContext.prompt_tokens`.
+  reads the field but is never fed. A TRUE p50 isn't reachable for an observe-only agent
+  (`/metrics` is counters/gauges, no quantiles; per-request `timings.prompt_ms` only on
+  completion responses the agent doesn't see). Realistic option: interval-MEAN TTFT from
+  `/metrics` counter deltas (needs `--metrics` + daemon delta-state), reported as an
+  approximation. Deferred pending a decision on whether the mean approximation is wanted.
+- **dim-3 agent ctx source** — extend dim 3 to agent nodes by reporting llama-server
+  `/props` `default_generation_settings.n_ctx` → `max_context_len` (Slice E does config-only).
 - **Scorer Phase 3** — per-(backend,model) `RoutingStats` (EWMA latency, error-rate).
   Open-question Q1: in-memory (recommended) vs SQLite persistence — decide before building.
 - **Scorer Phase 4** — locality/cost/capability (dims 18–23).

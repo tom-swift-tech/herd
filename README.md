@@ -523,7 +523,7 @@ server:
   rate_limit: 0               # Requests/sec (0 = unlimited)
 
 routing:
-  strategy: "model_aware"  # priority | model_aware | least_busy | weighted_round_robin
+  strategy: "model_aware"  # priority | model_aware | least_busy | weighted_round_robin | scored
   timeout: 120s
   retry_count: 2
   default_keep_alive: "-1"  # inject into every Ollama request

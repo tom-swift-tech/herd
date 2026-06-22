@@ -42,12 +42,37 @@ server:
 # === ROUTING ===
 
 routing:
-  strategy: "model_aware"        # Routing algorithm: priority | model_aware | least_busy | weighted_round_robin
+  strategy: "model_aware"        # Routing algorithm: priority | model_aware | least_busy | weighted_round_robin | scored
   timeout: "120s"                # Per-request timeout for backend calls (supports s, ms, m, h)
   retry_count: 2                 # Retries on backend failure before returning an error
   default_keep_alive: "-1"       # Injected into every /api/generate and /api/chat request body.
                                  # "-1" = never unload; "5m" = 5 minutes; "0" = unload immediately.
                                  # Overrides whatever the client sent. Not injected on /v1/* paths.
+
+  # === SCORED ROUTING ===
+  # The `scored` strategy (strategy: "scored") ranks eligible backends by a weighted,
+  # multi-dimensional score (GATE eliminates unhealthy/excluded/model-absent backends,
+  # then SCORE ranks the rest) instead of a single axis. Dimensions with no available
+  # source for a given backend drop out neutrally (never a penalty). Omit the block to
+  # use the defaults below. A weight of 0 disables that dimension.
+  #
+  # scored:
+  #   model_gate: "relaxed"          # "relaxed" (fall back to healthy set if a model is
+  #                                  # loaded nowhere) or "strict" (503 instead)
+  #   weights:
+  #     model_resident: 5.0          # prefer backends with the requested model loaded
+  #     model_fits_vram: 2.0         # prefer backends with VRAM headroom for the model
+  #     prompt_size_vs_capacity: 1.0 # prefer windows that fit the prompt (needs max_context_len)
+  #     gpu_utilization: 3.0         # prefer idle GPUs (needs gpu metrics)
+  #     vram_headroom: 2.0           # prefer more free VRAM (gpu-metrics derived)
+  #     gpu_temperature: 1.0         # prefer cooler GPUs
+  #     operator_priority: 2.0       # honor the per-backend `priority` field
+  #     tag_affinity: 1.0            # prefer backends matching requested X-Herd-Tags
+  #     backend_type_affinity: 0.0   # prefer a backend type (off by default)
+  #     queue_depth: 2.0             # prefer shorter request queues (agent telemetry)
+  #     ttft_p50: 3.0                # prefer faster time-to-first-token (not yet measured)
+  #     concurrency_saturation: 1.0  # prefer backends with free concurrency slots (agent telemetry)
+  #     precise_vram_free: 2.0       # prefer more measured free VRAM (agent telemetry)
 
   # === AUTO MODE ===
   # LLM-based request classification. When model is "auto" or omitted, Herd calls
@@ -150,6 +175,10 @@ backends:
       - "glm-4.7-flash:latest"
     health_check_path: "/api/version"  # Custom health-check path (default: /api/version)
     # health_check_status: 200   # Expected HTTP status for health checks (default: 200)
+    # max_context_len: 32768     # Context-window size (tokens) this backend serves.
+                                 # Feeds the `scored` router's prompt_size_vs_capacity
+                                 # dimension (prefers backends whose window fits the
+                                 # prompt). Omit to leave that dimension neutral.
 
   - name: "minipc-4080"
     url: "http://100.81.153.82:11434"
@@ -185,6 +214,8 @@ backends:
   #   tags:
   #     - "gpu"
   #     - "high-vram"
+  #   max_context_len: 32768           # ctx window served (tokens); feeds the scored
+  #                                    # router's prompt_size_vs_capacity dimension
   #   # health_check_path defaults to /health for llama-server (vs /api/version for ollama)
   #   # Model discovery uses /v1/models instead of /api/tags
 

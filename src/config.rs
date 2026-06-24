@@ -270,14 +270,15 @@ pub struct ScoredWeights {
     pub concurrency_saturation: f64,
     #[serde(default = "w_precise_vram_free")]
     pub precise_vram_free: f64,
-    // Groups E/F (Phase 3–4; recognized, inert in Phase 1)
-    #[serde(default = "w_zero")]
+    // Group E — history & stability (Phase 3). Active defaults: latency and
+    // reliability signals carry high weight; throughput moderate; stability lower.
+    #[serde(default = "w_ewma_latency")]
     pub ewma_latency: f64,
-    #[serde(default = "w_zero")]
+    #[serde(default = "w_recent_error_rate")]
     pub recent_error_rate: f64,
-    #[serde(default = "w_zero")]
+    #[serde(default = "w_recent_success_throughput")]
     pub recent_success_throughput: f64,
-    #[serde(default = "w_zero")]
+    #[serde(default = "w_flap_stability")]
     pub flap_stability: f64,
     #[serde(default = "w_zero")]
     pub session_stickiness: f64,
@@ -309,10 +310,10 @@ impl Default for ScoredWeights {
             ttft_p50: w_ttft_p50(),
             concurrency_saturation: w_concurrency_saturation(),
             precise_vram_free: w_precise_vram_free(),
-            ewma_latency: w_zero(),
-            recent_error_rate: w_zero(),
-            recent_success_throughput: w_zero(),
-            flap_stability: w_zero(),
+            ewma_latency: w_ewma_latency(),
+            recent_error_rate: w_recent_error_rate(),
+            recent_success_throughput: w_recent_success_throughput(),
+            flap_stability: w_flap_stability(),
             session_stickiness: w_zero(),
             network_locality: w_zero(),
             power_cost: w_zero(),
@@ -362,6 +363,22 @@ fn w_concurrency_saturation() -> f64 {
 }
 fn w_precise_vram_free() -> f64 {
     2.0
+}
+// Group E — history & stability (Phase 3).
+// Latency + error rate: high weight (3.0 each) — the primary reliability signal.
+// Throughput: moderate (2.0) — useful when latency is similar.
+// Flap stability: lower (1.0) — flapping matters but is rarer.
+fn w_ewma_latency() -> f64 {
+    3.0
+}
+fn w_recent_error_rate() -> f64 {
+    3.0
+}
+fn w_recent_success_throughput() -> f64 {
+    2.0
+}
+fn w_flap_stability() -> f64 {
+    1.0
 }
 fn w_zero() -> f64 {
     0.0

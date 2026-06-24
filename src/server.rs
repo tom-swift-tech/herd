@@ -4,6 +4,7 @@ use crate::analytics::{Analytics, RequestLog};
 use crate::api::{admin, agent, openai};
 use crate::backend::{BackendPool, HealthChecker, ModelDiscovery, ModelWarmer};
 use crate::config::{parse_duration, Config};
+use crate::router::routing_stats::RoutingStats;
 use crate::router::{create_router, Router};
 use anyhow::Result;
 use chrono::Timelike;
@@ -151,6 +152,9 @@ pub struct AppState {
     pub routing_timeout_ms: Arc<AtomicU64>,
     pub routing_retry_count: Arc<AtomicU32>,
     pub config_path: Option<PathBuf>,
+    /// Phase-3 per-(backend,model) EWMA history store.
+    /// Updated on the post-request hook; read by `ScoredRouter` on the scoring path.
+    pub routing_stats: Arc<RoutingStats>,
 }
 
 impl AppState {
@@ -252,11 +256,12 @@ impl AppState {
             }
         }
 
-        // Swap router (new router shares the same pool data)
+        // Swap router (new router shares the same pool data and routing_stats store)
         let new_router = create_router(
             new_config.routing.strategy.clone(),
             (*self.pool).clone(),
             &new_config.routing,
+            Arc::clone(&self.routing_stats),
         );
         *self.router.write().await = new_router;
 
@@ -409,11 +414,16 @@ impl Server {
             }
         });
 
+        // Create the Phase-3 EWMA history store — shared by the router and the
+        // post-request hooks in openai.rs and server.rs.
+        let routing_stats = Arc::new(RoutingStats::new());
+
         // Create router
         let router = create_router(
             self.config.routing.strategy.clone(),
             pool.clone(),
             &self.config.routing,
+            Arc::clone(&routing_stats),
         );
 
         // Wrap in Arc
@@ -511,6 +521,7 @@ impl Server {
             routing_timeout_ms: Arc::new(AtomicU64::new(routing_timeout.as_millis() as u64)),
             routing_retry_count: Arc::new(AtomicU32::new(self.config.routing.retry_count)),
             config_path: self.config_path.clone(),
+            routing_stats,
         };
 
         // Start session reaper and audit log cleanup (every 5 minutes)
@@ -1600,6 +1611,21 @@ async fn proxy_handler(
                 .record_request(&log.backend, &log.status, log.duration_ms)
                 .await;
 
+            // Phase-3: update per-(backend,model) EWMA history store.
+            // Called unconditionally so error requests feed the error-rate ring.
+            // `tokens_out` may be None (streaming / error paths); tps is derived
+            // from it inside `update` only when available.
+            self.state
+                .routing_stats
+                .update(
+                    &log.backend,
+                    self.model_name.as_deref().unwrap_or(""),
+                    log.duration_ms,
+                    log.status == "error",
+                    usage.tokens_out,
+                )
+                .await;
+
             if let (Some(tin), Some(tout)) = (usage.tokens_in, usage.tokens_out) {
                 self.state
                     .metrics
@@ -2331,10 +2357,12 @@ mod tests {
             initial.circuit_breaker.failure_threshold,
             parse_duration(&initial.circuit_breaker.recovery_time).unwrap(),
         ));
+        let routing_stats = Arc::new(RoutingStats::new());
         let router = create_router(
             initial.routing.strategy.clone(),
             (*pool).clone(),
             &initial.routing,
+            Arc::clone(&routing_stats),
         );
 
         let state = AppState {
@@ -2380,6 +2408,7 @@ mod tests {
             routing_timeout_ms: Arc::new(AtomicU64::new(1_000)),
             routing_retry_count: Arc::new(AtomicU32::new(1)),
             config_path: Some(temp_path.clone()),
+            routing_stats,
         };
 
         let message = state.reload_config().await.unwrap();

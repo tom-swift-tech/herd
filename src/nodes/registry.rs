@@ -32,6 +32,13 @@ pub struct AgentCapabilities {
     /// unavailable. `#[serde(default)]` keeps pre-Slice-2 agents wire-compatible.
     #[serde(default)]
     pub max_concurrent: Option<u32>,
+    /// Served context-window size from llama-server `/props`
+    /// `default_generation_settings.n_ctx`. `None` for Ollama, openai-compat,
+    /// or when the probe could not read the field.
+    /// `#[serde(default)]` → older agents that don't send this field
+    /// deserialize to `None` (wire-compatible).
+    #[serde(default)]
+    pub context_len: Option<u32>,
     #[serde(default)]
     pub rpc_capable: bool,
     #[serde(default)]
@@ -343,6 +350,7 @@ mod tests {
             queue_depth: Some(0),
             ttft_p50_ms: Some(42),
             max_concurrent: Some(4),
+            context_len: None,
             rpc_capable: false,
             rpc_port: None,
             agent_version: "1.2.0".to_string(),

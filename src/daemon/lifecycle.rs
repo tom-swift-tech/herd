@@ -46,6 +46,11 @@ pub struct ProbeOutcome {
     /// Concurrency limit the backend launched with (llama-server `/props`
     /// `total_slots`). `None` when unavailable.
     pub max_concurrent: Option<u32>,
+    /// Context-window size reported by llama-server `/props`
+    /// `default_generation_settings.n_ctx`. `None` for Ollama,
+    /// openai-compat, or any probe failure — best-effort, never affects
+    /// reachability.
+    pub context_len: Option<u32>,
 }
 
 /// Ollama `/api/ps` response (currently loaded models).
@@ -76,11 +81,23 @@ struct OpenAIModel {
     id: String,
 }
 
-/// llama-server `/props` (subset): `total_slots` is the `--parallel` limit.
+/// `default_generation_settings` block inside a llama-server `/props` response.
+/// Only the fields Herd reads are listed; the server may send many more.
+#[derive(Debug, Deserialize, Default)]
+struct LlamaGenSettings {
+    /// The context-window size the server was launched with.
+    #[serde(default)]
+    n_ctx: Option<u32>,
+}
+
+/// llama-server `/props` (subset): `total_slots` is the `--parallel` limit;
+/// `default_generation_settings.n_ctx` is the served context-window size.
 #[derive(Debug, Deserialize)]
 struct LlamaProps {
     #[serde(default)]
     total_slots: Option<u32>,
+    #[serde(default)]
+    default_generation_settings: LlamaGenSettings,
 }
 
 /// llama-server `/slots` entry (subset): `is_processing` marks a busy slot.
@@ -113,6 +130,16 @@ pub fn parse_openai_models(body: &str) -> Option<Vec<String>> {
 /// Parse a llama-server `/props` body into its `total_slots` (concurrency limit).
 pub fn parse_llama_total_slots(body: &str) -> Option<u32> {
     serde_json::from_str::<LlamaProps>(body).ok()?.total_slots
+}
+
+/// Parse a llama-server `/props` body into the served context-window size
+/// (`default_generation_settings.n_ctx`). Returns `None` when the field is
+/// absent or the body is malformed — caller treats absence as neutral.
+pub fn parse_llama_ctx_len(body: &str) -> Option<u32> {
+    serde_json::from_str::<LlamaProps>(body)
+        .ok()?
+        .default_generation_settings
+        .n_ctx
 }
 
 /// Parse a llama-server `/slots` body into the count of busy slots. `[]` →
@@ -163,36 +190,43 @@ impl LocalProbe {
         parse_openai_models(&body)
     }
 
-    /// Best-effort llama-server load probe: `max_concurrent` from `/props`
-    /// (`total_slots`) and `queue_depth` from `/slots` (busy count). Each is
+    /// Best-effort llama-server load probe: `max_concurrent` and `context_len`
+    /// from `/props`, `queue_depth` from `/slots` (busy count). Each is
     /// independent — a missing or disabled endpoint yields `None` for just that
     /// value and never affects reachability.
-    async fn probe_llama_load(&self) -> (Option<u32>, Option<u32>) {
-        let max_concurrent = self
-            .get_body("/props")
-            .await
-            .and_then(|b| parse_llama_total_slots(&b));
+    ///
+    /// Returns `(queue_depth, max_concurrent, context_len)`.
+    async fn probe_llama_load(&self) -> (Option<u32>, Option<u32>, Option<u32>) {
+        let props_body = self.get_body("/props").await;
+        let max_concurrent = props_body.as_deref().and_then(parse_llama_total_slots);
+        let context_len = props_body.as_deref().and_then(parse_llama_ctx_len);
         let queue_depth = self
             .get_body("/slots")
             .await
             .and_then(|b| parse_llama_busy_slots(&b));
-        (queue_depth, max_concurrent)
+        (queue_depth, max_concurrent, context_len)
     }
 
     pub async fn probe(&self) -> ProbeOutcome {
         match self.override_backend {
             Some(BackendType::Ollama) => {
-                // Ollama exposes no slot/concurrency telemetry → load stays None.
-                self.outcome(BackendType::Ollama, self.probe_ollama().await, None, None)
+                // Ollama exposes no slot/concurrency/context telemetry → all stay None.
+                self.outcome(
+                    BackendType::Ollama,
+                    self.probe_ollama().await,
+                    None,
+                    None,
+                    None,
+                )
             }
             Some(backend @ (BackendType::LlamaServer | BackendType::OpenAICompat)) => {
                 let models = self.probe_openai().await;
-                let (queue_depth, max_concurrent) = if models.is_some() {
+                let (queue_depth, max_concurrent, context_len) = if models.is_some() {
                     self.probe_llama_load().await
                 } else {
-                    (None, None)
+                    (None, None, None)
                 };
-                self.outcome(backend, models, queue_depth, max_concurrent)
+                self.outcome(backend, models, queue_depth, max_concurrent, context_len)
             }
             None => {
                 if let Some(models) = self.probe_ollama().await {
@@ -202,19 +236,21 @@ impl LocalProbe {
                         reachable: true,
                         queue_depth: None,
                         max_concurrent: None,
+                        context_len: None,
                     };
                 }
                 let models = self.probe_openai().await;
-                let (queue_depth, max_concurrent) = if models.is_some() {
+                let (queue_depth, max_concurrent, context_len) = if models.is_some() {
                     self.probe_llama_load().await
                 } else {
-                    (None, None)
+                    (None, None, None)
                 };
                 self.outcome(
                     BackendType::LlamaServer,
                     models,
                     queue_depth,
                     max_concurrent,
+                    context_len,
                 )
             }
         }
@@ -226,6 +262,7 @@ impl LocalProbe {
         models: Option<Vec<String>>,
         queue_depth: Option<u32>,
         max_concurrent: Option<u32>,
+        context_len: Option<u32>,
     ) -> ProbeOutcome {
         match models {
             Some(models_loaded) => ProbeOutcome {
@@ -234,6 +271,7 @@ impl LocalProbe {
                 reachable: true,
                 queue_depth,
                 max_concurrent,
+                context_len,
             },
             None => ProbeOutcome {
                 backend,
@@ -241,6 +279,7 @@ impl LocalProbe {
                 reachable: false,
                 queue_depth: None,
                 max_concurrent: None,
+                context_len: None,
             },
         }
     }
@@ -309,9 +348,10 @@ mod tests {
         assert!(!outcome.reachable);
         assert!(outcome.models_loaded.is_empty());
         assert_eq!(outcome.backend, BackendType::LlamaServer);
-        // Unmeasured load must be None, never a fake 0.
+        // Unmeasured load and context_len must be None, never a fake 0.
         assert_eq!(outcome.queue_depth, None);
         assert_eq!(outcome.max_concurrent, None);
+        assert_eq!(outcome.context_len, None);
     }
 
     #[test]
@@ -353,5 +393,50 @@ mod tests {
             None
         );
         assert_eq!(parse_llama_busy_slots("not json"), None);
+    }
+
+    #[test]
+    fn parses_ctx_len_from_props() {
+        // Full /props body with default_generation_settings.n_ctx present.
+        let body = r#"{
+            "total_slots": 4,
+            "model_path": "qwen3-32b.gguf",
+            "default_generation_settings": {
+                "n_ctx": 32768,
+                "temperature": 0.8
+            }
+        }"#;
+        assert_eq!(parse_llama_ctx_len(body), Some(32768));
+    }
+
+    #[test]
+    fn ctx_len_absent_when_field_missing() {
+        // /props without default_generation_settings → None (old server).
+        let body = r#"{"total_slots":4,"model_path":"m.gguf","is_sleeping":false}"#;
+        assert_eq!(parse_llama_ctx_len(body), None);
+    }
+
+    #[test]
+    fn ctx_len_absent_when_n_ctx_missing_from_settings() {
+        // default_generation_settings present but n_ctx absent.
+        let body = r#"{"total_slots":2,"default_generation_settings":{"temperature":0.7}}"#;
+        assert_eq!(parse_llama_ctx_len(body), None);
+    }
+
+    #[test]
+    fn ctx_len_absent_on_malformed_body() {
+        assert_eq!(parse_llama_ctx_len("not json"), None);
+        assert_eq!(parse_llama_ctx_len(""), None);
+    }
+
+    #[test]
+    fn props_body_populates_both_slots_and_ctx_len() {
+        // Both total_slots and n_ctx coexist; each parser is independent.
+        let body = r#"{
+            "total_slots": 8,
+            "default_generation_settings": { "n_ctx": 131072 }
+        }"#;
+        assert_eq!(parse_llama_total_slots(body), Some(8));
+        assert_eq!(parse_llama_ctx_len(body), Some(131_072));
     }
 }

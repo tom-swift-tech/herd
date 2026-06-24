@@ -217,6 +217,7 @@ impl SnapshotBuilder {
         &self.node_id
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn snapshot(
         &self,
         backend: BackendType,
@@ -225,6 +226,7 @@ impl SnapshotBuilder {
         models_loaded: Vec<String>,
         queue_depth: Option<u32>,
         max_concurrent: Option<u32>,
+        context_len: Option<u32>,
     ) -> AgentCapabilities {
         AgentCapabilities {
             node_id: self.node_id.clone(),
@@ -240,6 +242,9 @@ impl SnapshotBuilder {
             queue_depth,
             ttft_p50_ms: None, // deferred — needs --metrics + p50 windowing
             max_concurrent,
+            // Context-window size from llama-server /props; None for Ollama
+            // and openai-compat (dim 3 absent → neutral, never penalized).
+            context_len,
             rpc_capable: false, // v1.4 (pipeline parallel)
             rpc_port: None,
             agent_version: AGENT_VERSION.to_string(),
@@ -358,6 +363,7 @@ mod tests {
             vec!["qwen3-32b".into()],
             Some(2),
             Some(4),
+            Some(32_768),
         );
         assert_eq!(caps.vram_free_mb, 32607);
         assert_eq!(caps.vram_total_mb, 32607);
@@ -366,6 +372,7 @@ mod tests {
         assert_eq!(caps.agent_version, AGENT_VERSION);
         assert_eq!(caps.queue_depth, Some(2));
         assert_eq!(caps.max_concurrent, Some(4));
+        assert_eq!(caps.context_len, Some(32_768));
         assert!(!caps.rpc_capable);
         assert_eq!(caps.os.as_deref(), Some(std::env::consts::OS));
         assert_eq!(caps.arch.as_deref(), Some(std::env::consts::ARCH));
@@ -381,12 +388,14 @@ mod tests {
             vec![],
             None,
             None,
+            None,
         );
         assert_eq!(caps.vram_total_mb, 0);
         assert_eq!(caps.vram_free_mb, 0);
         assert!(caps.gpu_model.is_none());
-        // Ollama can't report load → honest None, not a fake 0.
+        // Ollama can't report load or context window → honest None, not a fake 0.
         assert_eq!(caps.queue_depth, None);
         assert_eq!(caps.max_concurrent, None);
+        assert_eq!(caps.context_len, None);
     }
 }

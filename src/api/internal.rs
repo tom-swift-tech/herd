@@ -501,6 +501,7 @@ mod tests {
             queue_depth: Some(0),
             ttft_p50_ms: Some(42),
             max_concurrent: None,
+            context_len: None,
             rpc_capable: false,
             rpc_port: None,
             agent_version: version.to_string(),

@@ -74,6 +74,7 @@ fn test_snapshot(node_id: &str) -> herd::nodes::AgentCapabilities {
         vec!["qwen3-32b.gguf".into()],
         Some(1),
         Some(4),
+        None,
     )
 }
 

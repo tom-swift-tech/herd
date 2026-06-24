@@ -152,6 +152,7 @@ pub async fn run(args: AgentArgs) -> anyhow::Result<()> {
             local.models_loaded,
             local.queue_depth,
             local.max_concurrent,
+            local.context_len,
         );
 
         let outcome = heartbeat.send(&caps, false).await;

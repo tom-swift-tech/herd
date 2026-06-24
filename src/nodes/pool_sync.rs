@@ -68,12 +68,17 @@ impl AgentPoolSync {
                 backend: caps.backend,
                 priority: 50, // house default for agent nodes
                 tags: Vec::new(),
+                max_context_len: caps.context_len,
                 ..Default::default()
             };
 
             if let Some(mut st) = pool.get(&name).await {
                 // Update existing entry — refresh config, models, health, VRAM, and live telemetry.
                 st.config = backend;
+                // Propagate the reported context-window size so dim 3 remains
+                // current across backend restarts (e.g. a model reload that
+                // changes --ctx-size).
+                st.config.max_context_len = caps.context_len;
                 st.models = caps.models_loaded.clone();
                 st.healthy = true; // fresh ⇒ alive
                 if caps.vram_total_mb > 0 {
@@ -130,6 +135,7 @@ mod tests {
             queue_depth: Some(3),
             ttft_p50_ms: Some(42),
             max_concurrent: Some(8),
+            context_len: None,
             rpc_capable: false,
             rpc_port: None,
             agent_version: "1.2.0".to_string(),
@@ -456,6 +462,87 @@ mod tests {
         assert_eq!(
             enrolled_entry.max_concurrent, None,
             "enrolled max_concurrent must be None"
+        );
+    }
+
+    /// Test 8: An agent with context_len set propagates it to
+    /// BackendState.config.max_context_len via the add branch.
+    #[tokio::test]
+    async fn agent_add_propagates_context_len_to_max_context_len() {
+        let reg = NodeRegistry::new(Duration::from_secs(30));
+        let pool = Arc::new(BackendPool::new(vec![], 3, Duration::from_secs(30)));
+
+        let mut caps = sample_caps("ctx-node");
+        caps.context_len = Some(32_768);
+        reg.heartbeat(caps).await.unwrap();
+        AgentPoolSync::reconcile(&reg, &pool).await;
+
+        let entry = pool.get("agent:ctx-node").await.unwrap();
+        assert_eq!(
+            entry.config.max_context_len,
+            Some(32_768),
+            "max_context_len must be populated from context_len on add"
+        );
+    }
+
+    /// Test 9: An existing agent entry has max_context_len refreshed via the
+    /// update branch when a new context_len arrives (e.g. after backend restart
+    /// with a different --ctx-size).
+    #[tokio::test]
+    async fn agent_update_refreshes_max_context_len() {
+        let reg = NodeRegistry::new(Duration::from_secs(30));
+        let pool = Arc::new(BackendPool::new(vec![], 3, Duration::from_secs(30)));
+
+        // First beat: no context_len yet.
+        let caps1 = sample_caps("ctx-update");
+        reg.heartbeat(caps1).await.unwrap();
+        AgentPoolSync::reconcile(&reg, &pool).await;
+
+        let entry = pool.get("agent:ctx-update").await.unwrap();
+        assert_eq!(
+            entry.config.max_context_len, None,
+            "max_context_len must be None before any context_len reported"
+        );
+
+        // Second beat: context_len now available.
+        let mut caps2 = sample_caps("ctx-update");
+        caps2.context_len = Some(65_536);
+        reg.heartbeat(caps2).await.unwrap();
+        AgentPoolSync::reconcile(&reg, &pool).await;
+
+        let entry = pool.get("agent:ctx-update").await.unwrap();
+        assert_eq!(
+            entry.config.max_context_len,
+            Some(65_536),
+            "max_context_len must be refreshed on update branch"
+        );
+    }
+
+    /// Test 10: A static or enrolled entry leaves max_context_len unaffected by
+    /// reconcile (it is agent-only; static entries keep their config as-is).
+    #[tokio::test]
+    async fn static_entry_max_context_len_unchanged_by_reconcile() {
+        let reg = NodeRegistry::new(Duration::from_secs(30));
+        let pool = Arc::new(BackendPool::new(vec![], 3, Duration::from_secs(30)));
+
+        pool.add(Backend {
+            name: "static-ctx".to_string(),
+            url: "http://static:8080".to_string(),
+            priority: 100,
+            max_context_len: Some(4096),
+            ..Default::default()
+        })
+        .await;
+
+        // Reconcile with a live agent — static entry must be untouched.
+        reg.heartbeat(sample_caps("other")).await.unwrap();
+        AgentPoolSync::reconcile(&reg, &pool).await;
+
+        let entry = pool.get("static-ctx").await.unwrap();
+        assert_eq!(
+            entry.config.max_context_len,
+            Some(4096),
+            "static max_context_len must not be altered by agent reconcile"
         );
     }
 }

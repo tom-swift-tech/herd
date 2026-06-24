@@ -364,6 +364,7 @@ mod tests {
             queue_depth: Some(0),
             ttft_p50_ms: None,
             max_concurrent: None,
+            context_len: None,
             rpc_capable: false,
             rpc_port: None,
             agent_version: "1.2.0".to_string(),

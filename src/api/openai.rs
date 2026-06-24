@@ -504,6 +504,17 @@ pub async fn chat_completions(
                 .metrics
                 .record_request(&log.backend, &log.status, log.duration_ms)
                 .await;
+            // Phase-3: feed the error ring even when all retries fail.
+            state
+                .routing_stats
+                .update(
+                    &log.backend,
+                    log.model.as_deref().unwrap_or(""),
+                    log.duration_ms,
+                    true, // all-retries-failed → error
+                    None,
+                )
+                .await;
             let _ = state.analytics.log_request(log).await;
 
             return Err(openai_error(
@@ -586,6 +597,17 @@ pub async fn chat_completions(
             .metrics
             .record_request(&log.backend, &log.status, log.duration_ms)
             .await;
+        // Phase-3: streaming path — tokens_out not available; feeds latency + error ring.
+        state
+            .routing_stats
+            .update(
+                &log.backend,
+                log.model.as_deref().unwrap_or(""),
+                log.duration_ms,
+                log.status == "error",
+                None, // tokens not extracted from streaming SSE
+            )
+            .await;
         if let Err(e) = state.analytics.log_request(log).await {
             tracing::error!("Failed to log request: {}", e);
         }
@@ -642,6 +664,18 @@ pub async fn chat_completions(
         state
             .metrics
             .record_request(&log.backend, &log.status, duration_ms)
+            .await;
+        // Phase-3: non-streaming path — tokens_out available when the backend
+        // returned a usage block; feeds latency EWMA, tps EWMA, and error ring.
+        state
+            .routing_stats
+            .update(
+                &log.backend,
+                log.model.as_deref().unwrap_or(""),
+                duration_ms,
+                log.status == "error",
+                tokens_out,
+            )
             .await;
         if let (Some(tin), Some(tout)) = (tokens_in, tokens_out) {
             state

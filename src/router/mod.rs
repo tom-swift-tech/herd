@@ -2,14 +2,17 @@ pub mod deployment;
 pub mod least_busy;
 pub mod model_aware;
 pub mod priority;
+pub mod routing_stats;
 pub mod scored;
 pub mod weighted_round_robin;
 
 use crate::backend::BackendPool;
 use crate::config::{RoutingConfig, RoutingStrategy};
+use crate::router::routing_stats::RoutingStats;
 use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 /// Optional request context for score-aware routing.
 /// All fields are optional; a `None` field makes its dependent dimension
@@ -103,12 +106,16 @@ impl Router for RouterEnum {
 }
 
 /// Construct the router for the given strategy.
+///
 /// `routing` is passed so the Scored arm can read `routing.scored`; legacy arms
 /// ignore it — no behaviour change for Priority/ModelAware/LeastBusy/WRR.
+/// `routing_stats` is the shared Phase-3 EWMA history store; it is only wired
+/// into the `Scored` arm. Legacy routers ignore it.
 pub fn create_router(
     strategy: RoutingStrategy,
     pool: BackendPool,
     routing: &RoutingConfig,
+    routing_stats: Arc<RoutingStats>,
 ) -> RouterEnum {
     match strategy {
         RoutingStrategy::Priority => RouterEnum::Priority(priority::PriorityRouter::new(pool)),
@@ -119,8 +126,10 @@ pub fn create_router(
         RoutingStrategy::WeightedRoundRobin => RouterEnum::WeightedRoundRobin(
             weighted_round_robin::WeightedRoundRobinRouter::new(pool),
         ),
-        RoutingStrategy::Scored => {
-            RouterEnum::Scored(scored::ScoredRouter::new(pool, &routing.scored))
-        }
+        RoutingStrategy::Scored => RouterEnum::Scored(scored::ScoredRouter::new(
+            pool,
+            &routing.scored,
+            routing_stats,
+        )),
     }
 }

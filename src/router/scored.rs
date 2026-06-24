@@ -2,14 +2,17 @@
 ///
 /// GATE → SCORE → SELECT pipeline over 23 dimensions. Active: dims 1–9 (Phase 1)
 /// plus dims 10–13 (Phase 2 — live load & latency from agent telemetry; dim 11
-/// `ttft_p50` reads agent caps but the agent does not yet measure it). Dims 14–23
-/// remain absent/neutral until Phase 3/4 populate their sources.
+/// `ttft_p50` reads agent caps but the agent does not yet measure it). Dims 14–17
+/// (Phase 3) read per-(backend,model) EWMA history from `RoutingStats`.
+/// Dims 18–23 remain absent/neutral until Phase 4.
 use crate::backend::{pool::filter_healthy, BackendPool};
 use crate::config::{BackendType, ModelGate, ScoredConfig, ScoredWeights};
+use crate::router::routing_stats::{BackendModelStats, RoutingStats, MIN_SAMPLES};
 use crate::router::{RouteContext, RoutedBackend, Router};
 use anyhow::Result;
 use async_trait::async_trait;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
 use tracing::debug;
 
 // ── Normalization constants ──────────────────────────────────────────────────
@@ -29,6 +32,10 @@ const QUEUE_REF: f64 = 8.0;
 const TTFT_REF: f64 = 2000.0;
 /// Scale factor for quantizing scores to i64 comparison keys.
 const SCORE_SCALE: f64 = 1_000_000.0;
+
+// ── Phase-3 normalization re-exports (mirrors routing_stats constants) ───────
+// Using the canonical values from routing_stats rather than duplicating them.
+use crate::router::routing_stats::{FLAP_REF, LAT_REF, TPS_REF};
 
 // ── Dimension catalog ────────────────────────────────────────────────────────
 
@@ -131,7 +138,7 @@ impl Dimension {
 
 // ── Router struct ────────────────────────────────────────────────────────────
 
-/// Scored router: GATE → SCORE (dims 1–9 active) → SELECT.
+/// Scored router: GATE → SCORE (dims 1–17 active where data available) → SELECT.
 #[derive(Clone)]
 pub struct ScoredRouter {
     pool: BackendPool,
@@ -139,10 +146,13 @@ pub struct ScoredRouter {
     weights: [f64; DIM_COUNT],
     model_gate: ModelGate,
     prefer_backend_type: Option<BackendType>,
+    /// Shared Phase-3 EWMA history store. One read-lock snapshot is taken per
+    /// routing call; no lock is held across the score/select steps.
+    routing_stats: Arc<RoutingStats>,
 }
 
 impl ScoredRouter {
-    pub fn new(pool: BackendPool, config: &ScoredConfig) -> Self {
+    pub fn new(pool: BackendPool, config: &ScoredConfig, routing_stats: Arc<RoutingStats>) -> Self {
         let w = &config.weights;
         let weights = weights_array(w);
         Self {
@@ -150,6 +160,7 @@ impl ScoredRouter {
             weights,
             model_gate: config.model_gate,
             prefer_backend_type: config.prefer_backend_type,
+            routing_stats,
         }
     }
 }
@@ -203,11 +214,13 @@ struct CandidateRaw {
 /// Compute raw norms for all 23 dimensions for a single candidate.
 ///
 /// Dims 10, 11, 13 (Phase 2 Slice 1) read agent live-load telemetry when present.
-/// Dims 12, 14–23: their sources are `None`/absent, so `present0` is `false` for
-/// each → neutral/weight-dropped. No scoring.
+/// Dims 14–17 (Phase 3) read from the EWMA history snapshot when `stats` is
+/// `Some` AND `stats.samples >= MIN_SAMPLES`.
+/// Dims 12, 18–23: their sources are `None`/absent, so `present0` is `false` →
+/// neutral/weight-dropped.
 // Each parameter is a distinct, independent scoring input (candidate, request,
-// fleet-relative bounds); grouping them into a struct would obscure more than it
-// clarifies for this private pure fn.
+// fleet-relative bounds, history snapshot); grouping them into a struct would
+// obscure more than it clarifies for this private pure fn.
 #[allow(clippy::too_many_arguments)]
 fn compute_raw(
     b: &crate::backend::pool::BackendState,
@@ -218,6 +231,7 @@ fn compute_raw(
     pmin: u32,
     pmax: u32,
     prompt_tokens: Option<u32>,
+    stats: Option<&BackendModelStats>,
 ) -> CandidateRaw {
     let mut norms = [0.0f64; DIM_COUNT];
     let mut present0 = [false; DIM_COUNT];
@@ -390,7 +404,34 @@ fn compute_raw(
         }
     }
 
-    // ── Dims 14–23: Phase 3 / 4 — absent until those phases ──────────────────
+    // ── Dims 14–17: Phase 3 — per-(backend,model) EWMA history ──────────────
+    // Present only when stats is Some AND samples >= MIN_SAMPLES (cold-start
+    // gating). Under-sampled or missing history → not present → neutral 0.5,
+    // weight-dropped — never a penalty for new/restarted backends.
+    if let Some(s) = stats.filter(|s| s.samples >= MIN_SAMPLES) {
+        // Dim 14: ewma_latency — lower latency is better.
+        // n = clamp(1 - ewma_ms / LAT_REF, 0, 1)
+        present0[Dimension::EwmaLatency.idx()] = true;
+        norms[Dimension::EwmaLatency.idx()] = (1.0 - s.ewma_latency_ms / LAT_REF).clamp(0.0, 1.0);
+
+        // Dim 15: recent_error_rate — lower error rate is better.
+        // n = 1 - error_rate  (error_rate ∈ [0,1])
+        present0[Dimension::RecentErrorRate.idx()] = true;
+        norms[Dimension::RecentErrorRate.idx()] = 1.0 - s.error_rate();
+
+        // Dim 16: recent_success_throughput — higher tps is better.
+        // n = clamp(ewma_tps / TPS_REF, 0, 1)
+        present0[Dimension::RecentSuccessThroughput.idx()] = true;
+        norms[Dimension::RecentSuccessThroughput.idx()] = (s.ewma_tps / TPS_REF).clamp(0.0, 1.0);
+
+        // Dim 17: flap_stability — fewer transitions is better.
+        // n = 1 - clamp(health_transitions / FLAP_REF, 0, 1)
+        present0[Dimension::FlapStability.idx()] = true;
+        norms[Dimension::FlapStability.idx()] =
+            1.0 - (s.health_transitions as f64 / FLAP_REF).clamp(0.0, 1.0);
+    }
+
+    // ── Dims 18–23: Phase 4 — absent until that phase ────────────────────────
     // Their sources are None/absent → present0 stays false → neutral, weight-dropped.
 
     CandidateRaw { norms, present0 }
@@ -469,6 +510,14 @@ impl Router for ScoredRouter {
 
         // ── SCORE: compute raw norms (present₀) ──────────────────────────────
 
+        // Phase-3: take ONE snapshot of the EWMA history store before scoring.
+        // This is the only lock acquisition on the Phase-3 path; no lock is held
+        // across the score/select loop. The snapshot is an owned BTreeMap so the
+        // read guard is released immediately after the clone.
+        // No .await occurs between here and the returned RoutedBackend.
+        let stats_snap: BTreeMap<(String, String), BackendModelStats> =
+            self.routing_stats.snapshot_all().await;
+
         // Dim 7 (operator_priority) is fleet-relative: need pmin/pmax first.
         let (pmin, pmax) = candidates.iter().fold((u32::MAX, u32::MIN), |(lo, hi), b| {
             (lo.min(b.config.priority), hi.max(b.config.priority))
@@ -478,6 +527,13 @@ impl Router for ScoredRouter {
         let raws: Vec<CandidateRaw> = candidates
             .iter()
             .map(|b| {
+                // Look up this candidate's Phase-3 stats from the snapshot.
+                // model_key is the originally requested model string — the same key
+                // used when recording outcomes on the post-request hook.
+                let model_key = model.unwrap_or("");
+                let candidate_stats = stats_snap
+                    .get(&(b.config.name.clone(), model_key.to_string()))
+                    .filter(|s| s.samples >= MIN_SAMPLES);
                 compute_raw(
                     b,
                     model,
@@ -487,6 +543,7 @@ impl Router for ScoredRouter {
                     pmin,
                     pmax,
                     ctx.prompt_tokens,
+                    candidate_stats,
                 )
             })
             .collect();
@@ -703,6 +760,7 @@ mod tests {
     use super::*;
     use crate::backend::{pool::BackendState, BackendPool, GpuMetrics};
     use crate::config::{Backend, ModelGate, ScoredConfig, ScoredWeights};
+    use crate::router::routing_stats::RoutingStats;
     use std::collections::HashSet;
     use std::time::{Duration, Instant};
 
@@ -751,6 +809,12 @@ mod tests {
         ScoredConfig::default()
     }
 
+    /// Build a `ScoredRouter` with an empty (cold-start) `RoutingStats`.
+    /// Existing tests that don't exercise Phase-3 dims use this helper.
+    fn make_router(pool: BackendPool, cfg: &ScoredConfig) -> ScoredRouter {
+        ScoredRouter::new(pool, cfg, Arc::new(RoutingStats::new()))
+    }
+
     // ── Test 1 & determinism: same pool + request → same result every time ──
 
     #[tokio::test]
@@ -774,7 +838,7 @@ mod tests {
         });
 
         let pool = pool_from_states(vec![state_a, state_b]);
-        let router = ScoredRouter::new(pool, &default_scored_config());
+        let router = make_router(pool, &default_scored_config());
 
         let result = router
             .route_scored(
@@ -808,7 +872,7 @@ mod tests {
         });
 
         let pool = pool_from_states(vec![state_a, state_b]);
-        let router = ScoredRouter::new(pool, &default_scored_config());
+        let router = make_router(pool, &default_scored_config());
         let exc = HashSet::new();
         let ctx = RouteContext::default();
 
@@ -844,11 +908,11 @@ mod tests {
         let pool2 = pool_from_states(vec![sb, sa]);
 
         let cfg = default_scored_config();
-        let r1 = ScoredRouter::new(pool1, &cfg)
+        let r1 = make_router(pool1, &cfg)
             .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
             .await
             .unwrap();
-        let r2 = ScoredRouter::new(pool2, &cfg)
+        let r2 = make_router(pool2, &cfg)
             .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
             .await
             .unwrap();
@@ -883,7 +947,7 @@ mod tests {
         let mut cfg = default_scored_config();
         cfg.model_gate = ModelGate::Strict;
         let pool = pool_from_states(vec![state_x, state_y]);
-        let router = ScoredRouter::new(pool, &cfg);
+        let router = make_router(pool, &cfg);
 
         let result = router
             .route_scored(
@@ -905,7 +969,7 @@ mod tests {
         state_bad.models = vec!["m".to_string()];
 
         let pool = pool_from_states(vec![state_good, state_bad]);
-        let router = ScoredRouter::new(pool, &default_scored_config());
+        let router = make_router(pool, &default_scored_config());
 
         let result = router
             .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
@@ -964,7 +1028,7 @@ mod tests {
         // C has no gpu_metrics.
 
         let pool = pool_from_states(vec![sa, sb, sc]);
-        let result = ScoredRouter::new(pool, &cfg)
+        let result = make_router(pool, &cfg)
             .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
             .await
             .unwrap();
@@ -1006,7 +1070,7 @@ mod tests {
         // B has no gpu_metrics. Pᵢ = {A} → single-member → trivially uniform → dropped.
         // Both score 0.5 → name asc: "a-bad-temp" < "b-no-metrics" → A wins on name.
         let pool = pool_from_states(vec![sa, sb]);
-        let result = ScoredRouter::new(pool, &cfg)
+        let result = make_router(pool, &cfg)
             .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
             .await
             .unwrap();
@@ -1028,11 +1092,11 @@ mod tests {
         let pool2 = pool_from_states(vec![state_b, state_a]);
         let cfg = default_scored_config();
 
-        let r1 = ScoredRouter::new(pool1, &cfg)
+        let r1 = make_router(pool1, &cfg)
             .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
             .await
             .unwrap();
-        let r2 = ScoredRouter::new(pool2, &cfg)
+        let r2 = make_router(pool2, &cfg)
             .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
             .await
             .unwrap();
@@ -1068,7 +1132,7 @@ mod tests {
         };
 
         let pool = pool_from_states(vec![lo, hi]);
-        let result = ScoredRouter::new(pool, &cfg)
+        let result = make_router(pool, &cfg)
             .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
             .await
             .unwrap();
@@ -1080,7 +1144,7 @@ mod tests {
     #[tokio::test]
     async fn returns_err_on_empty_pool() {
         let pool = pool_from_states(vec![]);
-        let router = ScoredRouter::new(pool, &default_scored_config());
+        let router = make_router(pool, &default_scored_config());
         let result = router
             .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
             .await;
@@ -1092,7 +1156,7 @@ mod tests {
         let mut s = make_state("sick", 50, false);
         s.models = vec!["m".to_string()];
         let pool = pool_from_states(vec![s]);
-        let router = ScoredRouter::new(pool, &default_scored_config());
+        let router = make_router(pool, &default_scored_config());
         let result = router
             .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
             .await;
@@ -1105,7 +1169,7 @@ mod tests {
         let pool = pool_from_states(vec![s]);
         let mut cfg = default_scored_config();
         cfg.model_gate = ModelGate::Strict;
-        let result = ScoredRouter::new(pool, &cfg)
+        let result = make_router(pool, &cfg)
             .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
             .await;
         assert!(result.is_err());
@@ -1120,7 +1184,7 @@ mod tests {
         let pool = pool_from_states(vec![s]);
         let mut cfg = default_scored_config();
         cfg.model_gate = ModelGate::Relaxed;
-        let result = ScoredRouter::new(pool, &cfg)
+        let result = make_router(pool, &cfg)
             .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
             .await;
         assert!(result.is_ok());
@@ -1157,14 +1221,14 @@ mod tests {
         cfg_with_phase2.weights.ttft_p50 = 100.0;
         cfg_with_phase2.weights.precise_vram_free = 100.0;
 
-        let r1 = ScoredRouter::new(
+        let r1 = make_router(
             pool_from_states(vec![s1.clone(), s2.clone()]),
             &cfg_no_phase2,
         )
         .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
         .await
         .unwrap();
-        let r2 = ScoredRouter::new(pool_from_states(vec![s1, s2]), &cfg_with_phase2)
+        let r2 = make_router(pool_from_states(vec![s1, s2]), &cfg_with_phase2)
             .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
             .await
             .unwrap();
@@ -1213,7 +1277,7 @@ mod tests {
         };
 
         let pool = pool_from_states(vec![s1, s2]);
-        let result = ScoredRouter::new(pool, &cfg)
+        let result = make_router(pool, &cfg)
             .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
             .await
             .unwrap();
@@ -1253,7 +1317,7 @@ mod tests {
             temperature: temp,
         });
         let pool2 = pool_from_states(vec![sv1, sv2]);
-        let result2 = ScoredRouter::new(pool2, &cfg_no_temp)
+        let result2 = make_router(pool2, &cfg_no_temp)
             .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
             .await
             .unwrap();
@@ -1277,7 +1341,7 @@ mod tests {
         }
 
         let pool = pool_from_states(vec![s1, s2, s3]);
-        let result = ScoredRouter::new(pool, &default_scored_config())
+        let result = make_router(pool, &default_scored_config())
             .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
             .await;
         // Must not panic; winner is "alpha" (lexicographically smallest).
@@ -1338,7 +1402,7 @@ mod tests {
         });
 
         let pool = pool_from_states(vec![sa, sb, sc]);
-        let result = ScoredRouter::new(pool, &cfg)
+        let result = make_router(pool, &cfg)
             .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
             .await
             .unwrap();
@@ -1411,7 +1475,7 @@ mod tests {
         idle.queue_depth = Some(0); // empty → 1.0
 
         let pool = pool_from_states(vec![busy, idle]);
-        let router = ScoredRouter::new(pool, &default_scored_config());
+        let router = make_router(pool, &default_scored_config());
         let result = router
             .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
             .await
@@ -1440,7 +1504,7 @@ mod tests {
                                     // silent leaves queue_depth = None (genuinely absent)
 
         let pool = pool_from_states(vec![busy, silent, idle]);
-        let router = ScoredRouter::new(pool, &default_scored_config());
+        let router = make_router(pool, &default_scored_config());
         let result = router
             .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
             .await
@@ -1463,7 +1527,7 @@ mod tests {
         fast.ttft_p50_ms = Some(100); // → 0.95
 
         let pool = pool_from_states(vec![slow, fast]);
-        let router = ScoredRouter::new(pool, &default_scored_config());
+        let router = make_router(pool, &default_scored_config());
         let result = router
             .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
             .await
@@ -1499,7 +1563,7 @@ mod tests {
         zeta.vram_free_mb = Some(7000);
 
         let pool = pool_from_states(vec![alpha, zeta]);
-        let router = ScoredRouter::new(pool, &default_scored_config());
+        let router = make_router(pool, &default_scored_config());
         let result = router
             .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
             .await
@@ -1528,7 +1592,7 @@ mod tests {
         agent.gpu_metrics = Some(gm.clone());
         agent.vram_total_mb = Some(8000);
         agent.vram_free_mb = Some(4000);
-        let raw_a = compute_raw(&agent, None, None, false, None, 50, 50, None);
+        let raw_a = compute_raw(&agent, None, None, false, None, 50, 50, None, None);
         assert!(
             raw_a.present0[Dimension::PreciseVramFree.idx()],
             "agent dim 13 must be present"
@@ -1541,7 +1605,7 @@ mod tests {
         // Static node: gpu_metrics only, no agent telemetry.
         let mut stat = make_state("static", 50, true);
         stat.gpu_metrics = Some(gm);
-        let raw_s = compute_raw(&stat, None, None, false, None, 50, 50, None);
+        let raw_s = compute_raw(&stat, None, None, false, None, 50, 50, None, None);
         assert!(
             !raw_s.present0[Dimension::PreciseVramFree.idx()],
             "static dim 13 must be absent"
@@ -1572,7 +1636,7 @@ mod tests {
         roomy.max_concurrent = Some(16);
 
         let pool = pool_from_states(vec![tight, roomy]);
-        let router = ScoredRouter::new(pool, &default_scored_config());
+        let router = make_router(pool, &default_scored_config());
         let result = router
             .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
             .await
@@ -1593,7 +1657,7 @@ mod tests {
         let mut ok = make_state("ok", 50, true);
         ok.queue_depth = Some(3);
         ok.max_concurrent = Some(8);
-        let raw = compute_raw(&ok, None, None, false, None, 50, 50, None);
+        let raw = compute_raw(&ok, None, None, false, None, 50, 50, None, None);
         assert!(
             raw.present0[dim12],
             "dim 12 present when both known and max>0"
@@ -1607,7 +1671,7 @@ mod tests {
         let mut zero_cap = make_state("zerocap", 50, true);
         zero_cap.queue_depth = Some(3);
         zero_cap.max_concurrent = Some(0);
-        let raw = compute_raw(&zero_cap, None, None, false, None, 50, 50, None);
+        let raw = compute_raw(&zero_cap, None, None, false, None, 50, 50, None, None);
         assert!(
             !raw.present0[dim12],
             "Some(0) capacity → dim 12 absent (guard)"
@@ -1616,7 +1680,7 @@ mod tests {
         // Missing max_concurrent → dim 12 absent (dim 10 unaffected).
         let mut no_cap = make_state("nocap", 50, true);
         no_cap.queue_depth = Some(3);
-        let raw = compute_raw(&no_cap, None, None, false, None, 50, 50, None);
+        let raw = compute_raw(&no_cap, None, None, false, None, 50, 50, None, None);
         assert!(!raw.present0[dim12], "no max_concurrent → dim 12 absent");
         assert!(
             raw.present0[dim10],
@@ -1639,7 +1703,7 @@ mod tests {
         large.config.max_context_len = Some(32768);
 
         let pool = pool_from_states(vec![small, large]);
-        let router = ScoredRouter::new(pool, &default_scored_config());
+        let router = make_router(pool, &default_scored_config());
         let ctx = RouteContext {
             prompt_tokens: Some(4000),
             requested_ctx_len: None,
@@ -1673,6 +1737,7 @@ mod tests {
             50,
             50,
             Some(500),
+            None,
         );
         assert!(raw.present0[dim3]);
         assert!((raw.norms[dim3] - 1.0).abs() < 1e-9, "≤50% window → 1.0");
@@ -1687,6 +1752,7 @@ mod tests {
             50,
             50,
             Some(750),
+            None,
         );
         assert!((raw.norms[dim3] - 0.5).abs() < 1e-9, "75% window → 0.5");
 
@@ -1700,16 +1766,361 @@ mod tests {
             50,
             50,
             Some(1000),
+            None,
         );
         assert!((raw.norms[dim3]).abs() < 1e-9, "≥100% window → 0.0");
 
         // No prompt_tokens → absent even with a window configured.
-        let raw = compute_raw(&with_window(1000), None, None, false, None, 50, 50, None);
+        let raw = compute_raw(
+            &with_window(1000),
+            None,
+            None,
+            false,
+            None,
+            50,
+            50,
+            None,
+            None,
+        );
         assert!(!raw.present0[dim3], "no prompt_tokens → dim 3 absent");
 
         // No max_context_len → absent even with a prompt size.
         let no_window = make_state("nw", 50, true);
-        let raw = compute_raw(&no_window, None, None, false, None, 50, 50, Some(500));
+        let raw = compute_raw(&no_window, None, None, false, None, 50, 50, Some(500), None);
         assert!(!raw.present0[dim3], "no max_context_len → dim 3 absent");
+    }
+
+    // ── Phase 3: dims 14–17 via compute_raw directly ─────────────────────────
+
+    /// Helper: build a warm BackendModelStats (samples >= MIN_SAMPLES).
+    fn warm_stats(
+        ewma_latency_ms: f64,
+        ewma_tps: f64,
+        error_rate_bits: u32, // raw u32 packed into err_window
+        health_transitions: u32,
+    ) -> BackendModelStats {
+        BackendModelStats {
+            ewma_latency_ms,
+            ewma_tps,
+            err_window: error_rate_bits,
+            samples: MIN_SAMPLES,
+            health_transitions,
+            last_update_tick: 1,
+        }
+    }
+
+    /// Dims 14–17 are all present when stats is Some and samples >= MIN_SAMPLES,
+    /// and absent (not present → neutral 0.5, weight-dropped) when None or cold.
+    #[test]
+    fn phase3_dims_present_when_warm_absent_when_cold() {
+        let s = make_state("b", 50, true);
+
+        // Warm stats: all four dims should be present.
+        let st = warm_stats(1000.0, 50.0, 0, 0);
+        let raw = compute_raw(&s, None, None, false, None, 50, 50, None, Some(&st));
+        assert!(
+            raw.present0[Dimension::EwmaLatency.idx()],
+            "dim 14 must be present with warm stats"
+        );
+        assert!(
+            raw.present0[Dimension::RecentErrorRate.idx()],
+            "dim 15 must be present with warm stats"
+        );
+        assert!(
+            raw.present0[Dimension::RecentSuccessThroughput.idx()],
+            "dim 16 must be present with warm stats"
+        );
+        assert!(
+            raw.present0[Dimension::FlapStability.idx()],
+            "dim 17 must be present with warm stats"
+        );
+
+        // Cold (None): all four dims absent.
+        let raw_cold = compute_raw(&s, None, None, false, None, 50, 50, None, None);
+        assert!(
+            !raw_cold.present0[Dimension::EwmaLatency.idx()],
+            "dim 14 absent without stats"
+        );
+        assert!(
+            !raw_cold.present0[Dimension::RecentErrorRate.idx()],
+            "dim 15 absent without stats"
+        );
+        assert!(
+            !raw_cold.present0[Dimension::RecentSuccessThroughput.idx()],
+            "dim 16 absent without stats"
+        );
+        assert!(
+            !raw_cold.present0[Dimension::FlapStability.idx()],
+            "dim 17 absent without stats"
+        );
+
+        // Under-sampled (samples < MIN_SAMPLES): treated as cold → absent.
+        let mut under = st.clone();
+        under.samples = MIN_SAMPLES - 1;
+        let raw_under = compute_raw(&s, None, None, false, None, 50, 50, None, Some(&under));
+        assert!(
+            !raw_under.present0[Dimension::EwmaLatency.idx()],
+            "dim 14 absent when under-sampled"
+        );
+    }
+
+    /// Dim 14 formula: n = clamp(1 - ewma_ms / LAT_REF, 0, 1).
+    /// Low-latency backend out-scores high-latency one.
+    #[test]
+    fn dim14_ewma_latency_formula() {
+        use crate::router::routing_stats::LAT_REF;
+        let s = make_state("b", 50, true);
+
+        // Half the reference latency → 0.5 norm.
+        let st = warm_stats(LAT_REF / 2.0, 0.0, 0, 0);
+        let raw = compute_raw(&s, None, None, false, None, 50, 50, None, Some(&st));
+        let n14 = raw.norms[Dimension::EwmaLatency.idx()];
+        assert!((n14 - 0.5).abs() < 1e-9, "LAT_REF/2 → 0.5, got {}", n14);
+
+        // Near-zero latency → ~1.0.
+        let st_fast = warm_stats(1.0, 0.0, 0, 0);
+        let raw_fast = compute_raw(&s, None, None, false, None, 50, 50, None, Some(&st_fast));
+        assert!(
+            raw_fast.norms[Dimension::EwmaLatency.idx()] > 0.99,
+            "1ms latency → near 1.0"
+        );
+
+        // Latency at or above LAT_REF → 0.0.
+        let st_slow = warm_stats(LAT_REF, 0.0, 0, 0);
+        let raw_slow = compute_raw(&s, None, None, false, None, 50, 50, None, Some(&st_slow));
+        assert!(
+            raw_slow.norms[Dimension::EwmaLatency.idx()] <= 0.0,
+            "LAT_REF ms → 0.0"
+        );
+    }
+
+    /// Dim 15 formula: n = 1 - error_rate. Low error rate → high norm.
+    #[test]
+    fn dim15_error_rate_formula() {
+        let s = make_state("b", 50, true);
+
+        // All successes (err_window = 0) → error_rate = 0 → n = 1.0.
+        let st_clean = warm_stats(100.0, 0.0, 0b0000_0000, 0);
+        let raw_clean = compute_raw(&s, None, None, false, None, 50, 50, None, Some(&st_clean));
+        assert!(
+            (raw_clean.norms[Dimension::RecentErrorRate.idx()] - 1.0).abs() < 1e-9,
+            "all success → dim 15 = 1.0"
+        );
+
+        // Half errors (alternating bits for 32 samples) → rate 0.5 → n = 0.5.
+        // 0xAAAAAAAA = 0b10101010... (16 of 32 bits set)
+        let mut half = warm_stats(100.0, 0.0, 0xAAAA_AAAA, 0);
+        half.samples = 32; // exactly 32 observations so denominator is 32.
+        let raw_half = compute_raw(&s, None, None, false, None, 50, 50, None, Some(&half));
+        assert!(
+            (raw_half.norms[Dimension::RecentErrorRate.idx()] - 0.5).abs() < 1e-9,
+            "50% errors → dim 15 = 0.5, got {}",
+            raw_half.norms[Dimension::RecentErrorRate.idx()]
+        );
+    }
+
+    /// Dim 16 formula: n = clamp(ewma_tps / TPS_REF, 0, 1).
+    #[test]
+    fn dim16_throughput_formula() {
+        use crate::router::routing_stats::TPS_REF;
+        let s = make_state("b", 50, true);
+
+        // Half TPS_REF → 0.5.
+        let st = warm_stats(100.0, TPS_REF / 2.0, 0, 0);
+        let raw = compute_raw(&s, None, None, false, None, 50, 50, None, Some(&st));
+        assert!(
+            (raw.norms[Dimension::RecentSuccessThroughput.idx()] - 0.5).abs() < 1e-9,
+            "TPS_REF/2 → 0.5"
+        );
+
+        // At or above TPS_REF → 1.0.
+        let st_max = warm_stats(100.0, TPS_REF, 0, 0);
+        let raw_max = compute_raw(&s, None, None, false, None, 50, 50, None, Some(&st_max));
+        assert!(
+            (raw_max.norms[Dimension::RecentSuccessThroughput.idx()] - 1.0).abs() < 1e-9,
+            "TPS_REF → 1.0"
+        );
+    }
+
+    /// Dim 17 formula: n = 1 - clamp(transitions / FLAP_REF, 0, 1).
+    #[test]
+    fn dim17_flap_stability_formula() {
+        use crate::router::routing_stats::FLAP_REF;
+        let s = make_state("b", 50, true);
+
+        // 0 transitions → 1.0.
+        let st_stable = warm_stats(100.0, 0.0, 0, 0);
+        let raw_stable = compute_raw(&s, None, None, false, None, 50, 50, None, Some(&st_stable));
+        assert!(
+            (raw_stable.norms[Dimension::FlapStability.idx()] - 1.0).abs() < 1e-9,
+            "0 transitions → 1.0"
+        );
+
+        // FLAP_REF transitions → 0.0.
+        let st_flappy = warm_stats(100.0, 0.0, 0, FLAP_REF as u32);
+        let raw_flappy = compute_raw(&s, None, None, false, None, 50, 50, None, Some(&st_flappy));
+        assert!(
+            raw_flappy.norms[Dimension::FlapStability.idx()] <= 0.0,
+            "FLAP_REF transitions → 0.0"
+        );
+    }
+
+    // ── Phase 3: integration — history dim decides the route ──────────────────
+
+    /// Two warm candidates differ only on ewma_latency (dim 14); the lower-latency
+    /// one wins. Anti-trivial: with equal stats or without history the two tie by
+    /// name and "alpha" wins — so "zeta" winning proves dim 14 decided.
+    #[tokio::test]
+    async fn phase3_low_latency_backend_wins() {
+        use crate::router::routing_stats::{RoutingStats, MIN_SAMPLES};
+
+        let mut fast_node = make_state("zeta", 50, true);
+        let mut slow_node = make_state("alpha", 50, true);
+        fast_node.models = vec!["m".to_string()];
+        slow_node.models = vec!["m".to_string()];
+
+        let pool = pool_from_states(vec![slow_node, fast_node]);
+
+        // Weight only ewma_latency so it's the sole discriminator.
+        let cfg = ScoredConfig {
+            weights: ScoredWeights {
+                model_resident: 0.0,
+                model_fits_vram: 0.0,
+                prompt_size_vs_capacity: 0.0,
+                gpu_utilization: 0.0,
+                vram_headroom: 0.0,
+                gpu_temperature: 0.0,
+                operator_priority: 0.0,
+                tag_affinity: 0.0,
+                backend_type_affinity: 0.0,
+                ewma_latency: 5.0,
+                ..ScoredWeights::default()
+            },
+            ..default_scored_config()
+        };
+
+        // Seed the store: alpha is slow, zeta is fast.
+        let rs = Arc::new(RoutingStats::new());
+        // "alpha" backend: high latency (4500 ms → norm ≈ 0.1)
+        // "zeta" backend: low latency (500 ms → norm = 0.9)
+        for _ in 0..MIN_SAMPLES {
+            rs.update("alpha", "m", 4500, false, None).await;
+            rs.update("zeta", "m", 500, false, None).await;
+        }
+
+        let router = ScoredRouter::new(pool, &cfg, Arc::clone(&rs));
+        let result = router
+            .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            result.name, "zeta",
+            "lower ewma_latency must win: fast zeta beats slow alpha"
+        );
+    }
+
+    /// Cold-start neutrality: a backend with no history is not penalized to 0
+    /// and remains selectable. With only ewma_latency weighted and one warm
+    /// (medium-latency) candidate and one cold candidate, the two should not
+    /// have the cold one excluded — it competes on name/priority tiebreak
+    /// (not scored to 0). This test asserts the cold backend CAN win when it
+    /// has the alphabetically smaller name (the tiebreak), proving neutrality.
+    #[tokio::test]
+    async fn phase3_cold_start_neutrality() {
+        use crate::router::routing_stats::{RoutingStats, MIN_SAMPLES};
+
+        let mut warm_node = make_state("zzz-warm", 50, true);
+        let mut cold_node = make_state("aaa-cold", 50, true);
+        warm_node.models = vec!["m".to_string()];
+        cold_node.models = vec!["m".to_string()];
+
+        let pool = pool_from_states(vec![warm_node, cold_node]);
+
+        let cfg = ScoredConfig {
+            weights: ScoredWeights {
+                model_resident: 0.0,
+                model_fits_vram: 0.0,
+                prompt_size_vs_capacity: 0.0,
+                gpu_utilization: 0.0,
+                vram_headroom: 0.0,
+                gpu_temperature: 0.0,
+                operator_priority: 0.0,
+                tag_affinity: 0.0,
+                backend_type_affinity: 0.0,
+                ewma_latency: 5.0,
+                ..ScoredWeights::default()
+            },
+            ..default_scored_config()
+        };
+
+        let rs = Arc::new(RoutingStats::new());
+        // Only "zzz-warm" has history; "aaa-cold" is cold (no entries).
+        for _ in 0..MIN_SAMPLES {
+            rs.update("zzz-warm", "m", 2000, false, None).await;
+        }
+
+        let router = ScoredRouter::new(pool, &cfg, Arc::clone(&rs));
+        let result = router
+            .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
+            .await
+            .unwrap();
+        // Both candidates: "zzz-warm" has dim 14 present (n ≈ 0.6), "aaa-cold"
+        // is cold so dim 14 absent → weight-dropped → effectively 0.5/0.
+        // The dim is present on only ONE candidate → single-member Pᵢ →
+        // call-uniform-drop pre-pass drops it → both score 0.5 → name tiebreak:
+        // "aaa-cold" < "zzz-warm" → "aaa-cold" wins.
+        // (This is exactly the missing-value-neutrality contract for Phase 3.)
+        assert_eq!(
+            result.name, "aaa-cold",
+            "cold backend (no history) must not be penalized; name tiebreak decides"
+        );
+    }
+
+    /// Determinism: same RoutingStats snapshot + same pool → same result twice.
+    #[tokio::test]
+    async fn phase3_determinism() {
+        use crate::router::routing_stats::{RoutingStats, MIN_SAMPLES};
+
+        let mut n1 = make_state("node-a", 50, true);
+        let mut n2 = make_state("node-b", 50, true);
+        n1.models = vec!["m".to_string()];
+        n2.models = vec!["m".to_string()];
+
+        let rs = Arc::new(RoutingStats::new());
+        for _ in 0..MIN_SAMPLES {
+            rs.update("node-a", "m", 4000, false, None).await;
+            rs.update("node-b", "m", 500, false, None).await;
+        }
+
+        let cfg = ScoredConfig {
+            weights: ScoredWeights {
+                model_resident: 0.0,
+                model_fits_vram: 0.0,
+                prompt_size_vs_capacity: 0.0,
+                gpu_utilization: 0.0,
+                vram_headroom: 0.0,
+                gpu_temperature: 0.0,
+                operator_priority: 0.0,
+                tag_affinity: 0.0,
+                backend_type_affinity: 0.0,
+                ewma_latency: 5.0,
+                ..ScoredWeights::default()
+            },
+            ..default_scored_config()
+        };
+
+        let pool = pool_from_states(vec![n1, n2]);
+        let router = ScoredRouter::new(pool, &cfg, Arc::clone(&rs));
+
+        let r1 = router
+            .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
+            .await
+            .unwrap();
+        let r2 = router
+            .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
+            .await
+            .unwrap();
+        assert_eq!(r1.name, r2.name, "same stats + same pool → same route");
+        assert_eq!(r1.name, "node-b", "lower latency backend must win");
     }
 }

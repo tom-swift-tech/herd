@@ -5,6 +5,12 @@ use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::RwLock;
 
+/// Per-backend cap on the `last_served` map (dim 23 warm-recency). A real
+/// backend hosts at most a few dozen distinct models, so this never triggers in
+/// normal operation; it bounds growth if a relaxed-gate fleet is fed arbitrary
+/// model strings. Mirrors `RoutingStats`' size-cap-with-LRU-eviction approach.
+const MAX_LAST_SERVED: usize = 256;
+
 #[derive(Debug, Clone)]
 pub struct BackendState {
     pub config: Backend,
@@ -297,6 +303,20 @@ impl BackendPool {
         }
         let mut backends = self.backends.write().await;
         if let Some(backend) = backends.iter_mut().find(|b| b.config.name == name) {
+            // Bound the map: at capacity, evict the least-recently-served entry
+            // before inserting a NEW model (re-stamping an existing one is free).
+            if backend.last_served.len() >= MAX_LAST_SERVED
+                && !backend.last_served.contains_key(model)
+            {
+                if let Some(oldest) = backend
+                    .last_served
+                    .iter()
+                    .min_by_key(|(_, t)| **t)
+                    .map(|(k, _)| k.clone())
+                {
+                    backend.last_served.remove(&oldest);
+                }
+            }
             backend
                 .last_served
                 .insert(model.to_string(), Instant::now());
@@ -448,6 +468,41 @@ mod tests {
 
         // Unknown backend is a no-op (no panic).
         pool.record_served("nope", "llama3:8b").await;
+    }
+
+    #[tokio::test]
+    async fn record_served_bounds_map_with_lru_eviction() {
+        let pool = BackendPool::new(vec![], 3, Duration::from_secs(60));
+        pool.add(make_backend("gpu1", 100)).await;
+
+        // The first model served is the oldest; it must be the eviction victim.
+        pool.record_served("gpu1", "oldest").await;
+        // Guarantee a strictly-older instant so the LRU victim is unambiguous
+        // (avoids a same-tick tie with the next insert).
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        // Fill to capacity with distinct models (oldest is now entry 0 of CAP+1).
+        for i in 0..super::MAX_LAST_SERVED {
+            pool.record_served("gpu1", &format!("m{i}")).await;
+        }
+
+        let state = pool.get("gpu1").await.unwrap();
+        assert_eq!(
+            state.last_served.len(),
+            super::MAX_LAST_SERVED,
+            "map must be capped at MAX_LAST_SERVED"
+        );
+        assert!(
+            !state.last_served.contains_key("oldest"),
+            "least-recently-served entry must be evicted"
+        );
+
+        // Re-stamping an EXISTING model must not evict (no net growth).
+        pool.record_served("gpu1", "m0").await;
+        assert_eq!(
+            pool.get("gpu1").await.unwrap().last_served.len(),
+            super::MAX_LAST_SERVED,
+            "re-stamping an existing model does not grow or evict"
+        );
     }
 
     #[tokio::test]

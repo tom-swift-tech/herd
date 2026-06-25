@@ -673,6 +673,23 @@ decision that can reshape scope, so it is flagged to the Director in open-questi
 Policy/affinity layer: session stickiness (agent sessions), locality tiers, power/cost
 weights, RPC-shard capability, GPU-class affinity, warm-model recency.
 
+Landing incrementally by data-source cost (Slice A → D):
+
+> **Slice A — dims 19 + 20 (config-only).** `Backend` gains `locality: Option<LocalityTier>`
+> (`local`/`lan`/`tailnet`/`wan`) and `power_cost: Option<f64>`. dim 19 maps the tier
+> (`local 1.0 / lan 0.8 / tailnet 0.6 / wan 0.4`); dim 20 = `clamp(1 - cost/COST_REF, 0, 1)`
+> with `COST_REF = 100`. Both present iff configured (absent → neutral, weight-dropped) and
+> stay **opt-in** (`w_zero` default — locality/cost are deployment value-judgments, not
+> universally-good defaults). No protocol field, no stateful plumbing.
+>
+> **Remaining:** dim 23 (`warm_model_recency`, stateful — per-(backend,model) last-served
+> time on `BackendState`); dim 18 (`session_stickiness`, architectural — needs a
+> session→backend ledger + a session key on the scoring path + routing agent turns through
+> the scorer); dim 22 (`gpu_class_affinity`, needs a model→preferred-class source). dim 21
+> (`rpc_shard_capability`) is **deferred to v1.3** — inert until a "request needs sharding"
+> signal exists (Q6 drops a uniform-0.5 dim every call), which depends on the llama.cpp RPC
+> tensor-sharding integration.
+
 ---
 
 ## Scoring Math

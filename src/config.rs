@@ -461,6 +461,37 @@ impl std::fmt::Display for BackendType {
     }
 }
 
+/// Network locality tier for a backend, relative to the gateway. Feeds the
+/// scored router's `network_locality` dimension (dim 19): closer backends are
+/// preferred so the proxy hop adds the least latency. `None` on a `Backend` →
+/// that dimension is absent for it (neutral, weight-dropped).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LocalityTier {
+    /// Same host as the gateway (loopback / unix socket).
+    #[serde(rename = "local")]
+    Local,
+    /// Same LAN segment.
+    #[serde(rename = "lan")]
+    Lan,
+    /// Reachable over a Tailscale / WireGuard tailnet.
+    #[serde(rename = "tailnet")]
+    Tailnet,
+    /// Public internet / WAN.
+    #[serde(rename = "wan")]
+    Wan,
+}
+
+impl std::fmt::Display for LocalityTier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LocalityTier::Local => write!(f, "local"),
+            LocalityTier::Lan => write!(f, "lan"),
+            LocalityTier::Tailnet => write!(f, "tailnet"),
+            LocalityTier::Wan => write!(f, "wan"),
+        }
+    }
+}
+
 fn default_strategy() -> RoutingStrategy {
     RoutingStrategy::ModelAware
 }
@@ -507,6 +538,19 @@ pub struct Backend {
     /// that dimension is absent for this backend (neutral, weight-dropped).
     #[serde(default)]
     pub max_context_len: Option<u32>,
+
+    /// Network locality tier relative to the gateway. Feeds the scored router's
+    /// `network_locality` dimension (dim 19); `None` (the default) → that
+    /// dimension is absent for this backend (neutral, weight-dropped).
+    #[serde(default)]
+    pub locality: Option<LocalityTier>,
+
+    /// Relative cost/power weight for this backend (e.g. watts, or $/1k tokens);
+    /// lower is cheaper. Feeds the scored router's `power_cost` dimension
+    /// (dim 20); `None` (the default) → that dimension is absent for this
+    /// backend (neutral, weight-dropped).
+    #[serde(default)]
+    pub power_cost: Option<f64>,
 }
 
 impl Backend {
@@ -534,6 +578,8 @@ impl Default for Backend {
             health_check_status: None,
             tags: Vec::new(),
             max_context_len: None,
+            locality: None,
+            power_cost: None,
         }
     }
 }

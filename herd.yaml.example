@@ -73,6 +73,12 @@ routing:
   #     ttft_p50: 3.0                # prefer faster time-to-first-token (not yet measured)
   #     concurrency_saturation: 1.0  # prefer backends with free concurrency slots (agent telemetry)
   #     precise_vram_free: 2.0       # prefer more measured free VRAM (agent telemetry)
+  #     # History dims 14–17 (ewma_latency, recent_error_rate, recent_success_throughput,
+  #     # flap_stability) keep sensible non-zero defaults — omit to use them.
+  #     # Policy dims below are OPT-IN (default 0); turn on per fleet. They read the
+  #     # matching per-backend fields (locality / power_cost) shown in the backends block.
+  #     network_locality: 2.0        # prefer closer backends (needs per-backend `locality`)
+  #     power_cost: 1.0              # prefer cheaper/lower-power (needs per-backend `power_cost`)
 
   # === AUTO MODE ===
   # LLM-based request classification. When model is "auto" or omitted, Herd calls
@@ -179,6 +185,11 @@ backends:
                                  # Feeds the `scored` router's prompt_size_vs_capacity
                                  # dimension (prefers backends whose window fits the
                                  # prompt). Omit to leave that dimension neutral.
+    # locality: "local"          # Network tier vs the gateway: local | lan | tailnet | wan.
+                                 # Feeds the scored router's network_locality dim (opt-in;
+                                 # set the weight above). Omit to leave it neutral.
+    # power_cost: 10             # Relative cost/power weight (watts or $/1k-tok); lower =
+                                 # preferred. Feeds the power_cost dim (opt-in). Omit = neutral.
 
   - name: "minipc-4080"
     url: "http://100.81.153.82:11434"

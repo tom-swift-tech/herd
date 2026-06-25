@@ -89,6 +89,7 @@ impl AgentPoolSync {
                 st.ttft_p50_ms = caps.ttft_p50_ms;
                 st.vram_free_mb = Some(caps.vram_free_mb);
                 st.max_concurrent = caps.max_concurrent;
+                st.gpu_model = caps.gpu_model.clone();
                 pool.update(st).await;
             } else {
                 // New entry: add, then set models, VRAM, and live telemetry.
@@ -103,6 +104,7 @@ impl AgentPoolSync {
                     caps.ttft_p50_ms,
                     caps.vram_free_mb,
                     caps.max_concurrent,
+                    caps.gpu_model.clone(),
                 )
                 .await;
                 tracing::info!("Added agent backend {} to pool ({})", name, caps.address);

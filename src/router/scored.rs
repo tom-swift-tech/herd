@@ -4,10 +4,11 @@
 /// plus dims 10–13 (Phase 2 — live load & latency from agent telemetry; dim 11
 /// `ttft_p50` reads agent caps but the agent does not yet measure it). Dims 14–17
 /// (Phase 3) read per-(backend,model) EWMA history from `RoutingStats`.
-/// Phase 4 (policy/affinity) is landing incrementally: dims 18 (`session_stickiness`,
-/// from the `SessionAffinity` store), 19 (`network_locality`), 20 (`power_cost`,
-/// config-only) and 23 (`warm_model_recency`, from per-(backend,model) last-served
-/// time on `BackendState`) are active; dims 21, 22 remain absent until their slices.
+/// Phase 4 (policy/affinity): dims 18 (`session_stickiness`, from the
+/// `SessionAffinity` store), 19 (`network_locality`), 20 (`power_cost`, config),
+/// 22 (`gpu_class_affinity`, model-size→GPU-tier) and 23 (`warm_model_recency`,
+/// last-served time on `BackendState`) are active. Only dim 21
+/// (`rpc_shard_capability`) remains — deferred to v1.3 with the llama.cpp RPC work.
 use crate::backend::{pool::filter_healthy, BackendPool};
 use crate::config::{BackendType, ModelGate, ScoredConfig, ScoredWeights};
 use crate::router::routing_stats::{BackendModelStats, RoutingStats, MIN_SAMPLES};
@@ -50,6 +51,90 @@ const SCORE_SCALE: f64 = 1_000_000.0;
 // Using the canonical values from routing_stats rather than duplicating them.
 use crate::router::routing_stats::{FLAP_REF, LAT_REF, TPS_REF};
 
+// ── GPU-class affinity (dim 22) ──────────────────────────────────────────────
+
+/// Coarse GPU capability tier. Ordered: `Entry` < `Mid` < `HighEnd`. dim 22
+/// scores by the tier *distance* between what a model wants and what a backend
+/// has, so the exact tier values only matter relative to each other.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GpuClass {
+    Entry = 0,
+    Mid = 1,
+    HighEnd = 2,
+}
+
+/// Infer the GPU tier a model "wants" from the parameter count in its name.
+/// `>= 30B` → HighEnd, `8B..30B` → Mid, `< 8B` → Entry. `None` when no size token
+/// is parseable (→ dim 22 absent for that request, neutral).
+///
+/// NOTE: the size→tier thresholds here are a deployment judgment — tune them to
+/// your fleet's GPUs.
+fn model_gpu_class(model: &str) -> Option<GpuClass> {
+    let b = parse_param_billions(model)?;
+    Some(if b >= 30.0 {
+        GpuClass::HighEnd
+    } else if b >= 8.0 {
+        GpuClass::Mid
+    } else {
+        GpuClass::Entry
+    })
+}
+
+/// Parse a parameter count in billions from a model name: the last `<number>b`
+/// token (e.g. `"qwen2.5-coder:32b"` → `32.0`, `"deepseek-r1:1.5b"` → `1.5`,
+/// `"qwen3-235b-a22b"` → `22.0` active params). `None` when absent (e.g. frontier
+/// names like `"gpt-4"`).
+fn parse_param_billions(model: &str) -> Option<f64> {
+    let s = model.to_ascii_lowercase();
+    let b = s.as_bytes();
+    let mut best = None;
+    let mut i = 0;
+    while i < b.len() {
+        if b[i].is_ascii_digit() {
+            let start = i;
+            while i < b.len() && (b[i].is_ascii_digit() || b[i] == b'.') {
+                i += 1;
+            }
+            // A number immediately followed by 'b' is a parameter-count token.
+            if i < b.len() && b[i] == b'b' {
+                if let Ok(v) = s[start..i].parse::<f64>() {
+                    best = Some(v); // keep the last match
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    best
+}
+
+/// Classify a backend GPU into a tier from its model string (substring match on
+/// common cards). `None` when unrecognized → dim 22 absent (never a penalty for
+/// an unknown GPU). NOTE: this card list is fleet-specific — extend it for the
+/// hardware you actually run.
+fn backend_gpu_class(gpu_model: &str) -> Option<GpuClass> {
+    let g = gpu_model.to_ascii_lowercase();
+    const HIGH_END: &[&str] = &[
+        "5090", "4090", "3090", "a100", "h100", "h200", "a6000", "6000 ada", "l40", "mi300",
+        "mi250",
+    ];
+    const MID: &[&str] = &[
+        "5080", "5070", "4080", "4070", "3080", "3070", "7900", "a5000", "a4000",
+    ];
+    const ENTRY: &[&str] = &[
+        "5060", "4060", "4050", "3060", "3050", "2060", "1660", "1650",
+    ];
+    if HIGH_END.iter().any(|k| g.contains(k)) {
+        Some(GpuClass::HighEnd)
+    } else if MID.iter().any(|k| g.contains(k)) {
+        Some(GpuClass::Mid)
+    } else if ENTRY.iter().any(|k| g.contains(k)) {
+        Some(GpuClass::Entry)
+    } else {
+        None
+    }
+}
+
 // ── Dimension catalog ────────────────────────────────────────────────────────
 
 /// Fixed-order catalog of all 23 dimensions (catalog order = array index).
@@ -76,7 +161,7 @@ pub enum Dimension {
     RecentErrorRate = 14,
     RecentSuccessThroughput = 15,
     FlapStability = 16,
-    // Phase 4 — dims 18/19/20/23 active; 21, 22 absent until their slices
+    // Phase 4 — dims 18/19/20/22/23 active; only dim 21 absent (deferred to v1.3)
     SessionStickiness = 17,
     NetworkLocality = 18,
     PowerCost = 19,
@@ -510,8 +595,29 @@ fn compute_raw(
         norms[dim] = if last == b.config.name { 1.0 } else { 0.5 };
     }
 
-    // ── Dims 21, 22: Phase 4 — absent until their slices ─────────────────────
-    // rpc_shard_capability (21), gpu_class_affinity (22): sources None/absent →
+    // ── Dim 22: gpu_class_affinity — Phase 4 ─────────────────────────────────
+    // Match the model's demanded GPU tier (inferred from its parameter count)
+    // against this candidate's GPU tier. Present iff BOTH are known: exact tier →
+    // 1.0, one tier off → 0.7, two off → 0.5. Either unknown → absent (neutral).
+    // Distinct from VRAM dims (4/13): those measure whether a model FITS; this
+    // measures whether the placement is APPROPRIATE (don't tie up a 5090 with a
+    // 1B model when an entry GPU would do).
+    if let (Some(have), Some(want)) = (
+        b.gpu_model.as_deref().and_then(backend_gpu_class),
+        model.and_then(model_gpu_class),
+    ) {
+        let dim = Dimension::GpuClassAffinity.idx();
+        present0[dim] = true;
+        let dist = (have as i32 - want as i32).unsigned_abs();
+        norms[dim] = match dist {
+            0 => 1.0,
+            1 => 0.7,
+            _ => 0.5,
+        };
+    }
+
+    // ── Dim 21: rpc_shard_capability — Phase 4, deferred to v1.3 ──────────────
+    // Inert until a "request needs sharding" signal exists; source absent →
     // present0 stays false.
 
     CandidateRaw { norms, present0 }
@@ -887,6 +993,7 @@ mod tests {
             ttft_p50_ms: None,
             vram_free_mb: None,
             max_concurrent: None,
+            gpu_model: None,
             last_served: std::collections::BTreeMap::new(),
         }
     }
@@ -2269,6 +2376,117 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.name, "zeta", "session's last backend must win");
+    }
+
+    // ── Phase 4 Slice D: gpu_class_affinity (dim 22) ─────────────────────────
+
+    #[test]
+    fn parse_param_billions_extracts_size() {
+        assert_eq!(parse_param_billions("qwen2.5-coder:32b"), Some(32.0));
+        assert_eq!(parse_param_billions("llama-3-8b"), Some(8.0));
+        assert_eq!(parse_param_billions("deepseek-r1:1.5b"), Some(1.5));
+        // MoE name → last <num>b token is the active-param count.
+        assert_eq!(parse_param_billions("qwen3-235b-a22b"), Some(22.0));
+        // No size token (frontier-style names).
+        assert_eq!(parse_param_billions("gpt-4"), None);
+        assert_eq!(parse_param_billions("claude-opus"), None);
+    }
+
+    #[test]
+    fn gpu_class_mappings() {
+        assert!(matches!(model_gpu_class("x:70b"), Some(GpuClass::HighEnd)));
+        assert!(matches!(model_gpu_class("x:13b"), Some(GpuClass::Mid)));
+        assert!(matches!(model_gpu_class("x:7b"), Some(GpuClass::Entry)));
+        assert!(model_gpu_class("gpt-4").is_none());
+
+        assert!(matches!(
+            backend_gpu_class("NVIDIA GeForce RTX 5090"),
+            Some(GpuClass::HighEnd)
+        ));
+        assert!(matches!(backend_gpu_class("RTX 4070"), Some(GpuClass::Mid)));
+        assert!(matches!(
+            backend_gpu_class("RTX 4060"),
+            Some(GpuClass::Entry)
+        ));
+        assert!(backend_gpu_class("Some Mystery GPU").is_none());
+    }
+
+    /// dim 22 — tier-distance norm: exact 1.0, one off 0.7, two off 0.5; absent
+    /// when the GPU or the model size is unknown. Tested directly on `compute_raw`.
+    #[test]
+    fn gpu_class_affinity_norm_and_absence_in_compute_raw() {
+        let dim = Dimension::GpuClassAffinity.idx();
+        let now = Instant::now();
+        let with_gpu = |g: &str| {
+            let mut s = make_state("b", 50, true);
+            s.gpu_model = Some(g.to_string());
+            s
+        };
+        let raw_for = |s: &BackendState, model: &str| {
+            compute_raw(
+                s,
+                Some(model),
+                None,
+                false,
+                None,
+                50,
+                50,
+                None,
+                None,
+                now,
+                None,
+            )
+        };
+
+        // 70B (HighEnd) on a 5090 (HighEnd) → exact → 1.0.
+        let raw = raw_for(&with_gpu("RTX 5090"), "llama:70b");
+        assert!(raw.present0[dim]);
+        assert!((raw.norms[dim] - 1.0).abs() < 1e-9, "exact tier → 1.0");
+
+        // 70B (HighEnd) on a 4070 (Mid) → one tier off → 0.7.
+        let raw = raw_for(&with_gpu("RTX 4070"), "llama:70b");
+        assert!((raw.norms[dim] - 0.7).abs() < 1e-9, "one tier off → 0.7");
+
+        // 70B (HighEnd) on a 4060 (Entry) → two tiers off → 0.5.
+        let raw = raw_for(&with_gpu("RTX 4060"), "llama:70b");
+        assert!((raw.norms[dim] - 0.5).abs() < 1e-9, "two tiers off → 0.5");
+
+        // Unknown GPU / unparseable size / no gpu_model → absent.
+        assert!(!raw_for(&with_gpu("Mystery GPU"), "llama:70b").present0[dim]);
+        assert!(!raw_for(&with_gpu("RTX 5090"), "gpt-4").present0[dim]);
+        assert!(!raw_for(&make_state("b", 50, true), "llama:70b").present0[dim]);
+    }
+
+    /// dim 22 end-to-end — a small model prefers the appropriately-sized GPU.
+    /// Anti-trivial: the entry-class node is "zeta", the high-end node "alpha"; a
+    /// "zeta" win proves dim 22 steered the 7B model to the entry GPU (and kept
+    /// the 5090 free). Weight opt-in.
+    #[tokio::test]
+    async fn gpu_class_affinity_best_match_wins() {
+        let mut big = make_state("alpha", 50, true);
+        let mut small = make_state("zeta", 50, true);
+        big.models = vec!["m:7b".to_string()];
+        small.models = vec!["m:7b".to_string()];
+        big.gpu_model = Some("RTX 5090".to_string()); // HighEnd
+        small.gpu_model = Some("RTX 4060".to_string()); // Entry
+
+        let mut cfg = ScoredConfig::default();
+        cfg.weights.gpu_class_affinity = 100.0;
+        let pool = pool_from_states(vec![big, small]);
+        let router = make_router(pool, &cfg);
+        let result = router
+            .route_scored(
+                Some("m:7b"),
+                None,
+                &HashSet::new(),
+                &RouteContext::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.name, "zeta",
+            "7B model should prefer the entry-class GPU"
+        );
     }
 
     // ── Phase 2: prompt_size_vs_capacity (dim 3) ─────────────────────────────

@@ -682,10 +682,19 @@ Landing incrementally by data-source cost (Slice A → D):
 > stay **opt-in** (`w_zero` default — locality/cost are deployment value-judgments, not
 > universally-good defaults). No protocol field, no stateful plumbing.
 >
-> **Remaining:** dim 23 (`warm_model_recency`, stateful — per-(backend,model) last-served
-> time on `BackendState`); dim 18 (`session_stickiness`, architectural — needs a
-> session→backend ledger + a session key on the scoring path + routing agent turns through
-> the scorer); dim 22 (`gpu_class_affinity`, needs a model→preferred-class source). dim 21
+> **Slice B — dim 23 `warm_model_recency` (stateful).** `BackendState` gains
+> `last_served: BTreeMap<String, Instant>` (model → last-served wall-clock). Stamped by
+> `BackendPool::record_served` from BOTH the `ModelWarmer` (on warm success) and the proxy
+> post-request hooks (on a successful served request — this also covers llama-server nodes
+> the warmer skips). `compute_raw` takes a `now: Instant` captured once per routing call;
+> dim 23 = `clamp(1 - age_secs/WARM_REF, 0, 1)` (`WARM_REF = 300`), present iff a model is
+> requested, `0.5` when that model was never served on the backend (unknown, not a penalty).
+> Opt-in (`w_zero`). Time-based `age_secs` chosen over the spec's `turns_since` (no global
+> turn counter exists; time is the same `Instant` source the pool already uses).
+>
+> **Remaining:** dim 18 (`session_stickiness`, architectural — needs a session→backend
+> ledger + a session key on the scoring path + routing agent turns through the scorer);
+> dim 22 (`gpu_class_affinity`, needs a model→preferred-class source). dim 21
 > (`rpc_shard_capability`) is **deferred to v1.3** — inert until a "request needs sharding"
 > signal exists (Q6 drops a uniform-0.5 dim every call), which depends on the llama.cpp RPC
 > tensor-sharding integration.

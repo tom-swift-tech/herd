@@ -4,8 +4,9 @@
 /// plus dims 10–13 (Phase 2 — live load & latency from agent telemetry; dim 11
 /// `ttft_p50` reads agent caps but the agent does not yet measure it). Dims 14–17
 /// (Phase 3) read per-(backend,model) EWMA history from `RoutingStats`.
-/// Phase 4 (policy/affinity) is landing incrementally: dims 19 (`network_locality`)
-/// and 20 (`power_cost`) are active (config-only); dims 18, 21–23 remain
+/// Phase 4 (policy/affinity) is landing incrementally: dims 19 (`network_locality`),
+/// 20 (`power_cost`, config-only) and 23 (`warm_model_recency`, from per-(backend,
+/// model) last-served time on `BackendState`) are active; dims 18, 21, 22 remain
 /// absent/neutral until their slices.
 use crate::backend::{pool::filter_healthy, BackendPool};
 use crate::config::{BackendType, ModelGate, ScoredConfig, ScoredWeights};
@@ -15,6 +16,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::debug;
 
 // ── Normalization constants ──────────────────────────────────────────────────
@@ -36,6 +38,10 @@ const TTFT_REF: f64 = 2000.0;
 /// this normalizes to 0.0 (most expensive), a zero-cost backend to 1.0. Same
 /// arbitrary unit the operator uses for `Backend.power_cost` (watts, $/1k tok…).
 const COST_REF: f64 = 100.0;
+/// Reference age (seconds) for dim 23 (`warm_model_recency`); a model served
+/// just now normalizes to 1.0, one served `WARM_REF`+ seconds ago to 0.0.
+/// ~5 min ≈ Ollama's default keep-alive window before a model is evicted.
+const WARM_REF: f64 = 300.0;
 /// Scale factor for quantizing scores to i64 comparison keys.
 const SCORE_SCALE: f64 = 1_000_000.0;
 
@@ -238,6 +244,7 @@ fn compute_raw(
     pmax: u32,
     prompt_tokens: Option<u32>,
     stats: Option<&BackendModelStats>,
+    now: Instant,
 ) -> CandidateRaw {
     let mut norms = [0.0f64; DIM_COUNT];
     let mut present0 = [false; DIM_COUNT];
@@ -461,9 +468,28 @@ fn compute_raw(
         }
     }
 
-    // ── Dims 18, 21–23: Phase 4 — absent until their slices ──────────────────
-    // session_stickiness (18), rpc_shard_capability (21), gpu_class_affinity (22),
-    // warm_model_recency (23): sources None/absent → present0 stays false.
+    // ── Dim 23: warm_model_recency — Phase 4 (stateful) ──────────────────────
+    // How recently THIS backend last served the requested model (prompt/KV-cache
+    // warmth). Present iff a model is requested. Served just now → 1.0, ≥WARM_REF
+    // seconds ago → 0.0; a model never served here reads neutral 0.5 (unknown, not
+    // a penalty). When no model is requested the dimension is absent. `now` is
+    // captured once per routing call so every candidate is aged against the same
+    // instant (fair + deterministic within the call).
+    if let Some(m) = model {
+        let dim = Dimension::WarmModelRecency.idx();
+        present0[dim] = true;
+        norms[dim] = match b.last_served.get(m) {
+            Some(&t) => {
+                let age = now.saturating_duration_since(t).as_secs_f64();
+                (1.0 - age / WARM_REF).clamp(0.0, 1.0)
+            }
+            None => 0.5,
+        };
+    }
+
+    // ── Dims 18, 21, 22: Phase 4 — absent until their slices ─────────────────
+    // session_stickiness (18), rpc_shard_capability (21), gpu_class_affinity (22):
+    // sources None/absent → present0 stays false.
 
     CandidateRaw { norms, present0 }
 }
@@ -554,6 +580,10 @@ impl Router for ScoredRouter {
             (lo.min(b.config.priority), hi.max(b.config.priority))
         });
 
+        // Dim 23 (warm_model_recency) ages every candidate against ONE instant,
+        // captured here so the comparison is fair and deterministic within the call.
+        let now = Instant::now();
+
         // Per-candidate raw norms + present₀ flags.
         let raws: Vec<CandidateRaw> = candidates
             .iter()
@@ -575,6 +605,7 @@ impl Router for ScoredRouter {
                     pmax,
                     ctx.prompt_tokens,
                     candidate_stats,
+                    now,
                 )
             })
             .collect();
@@ -823,6 +854,7 @@ mod tests {
             ttft_p50_ms: None,
             vram_free_mb: None,
             max_concurrent: None,
+            last_served: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1623,7 +1655,18 @@ mod tests {
         agent.gpu_metrics = Some(gm.clone());
         agent.vram_total_mb = Some(8000);
         agent.vram_free_mb = Some(4000);
-        let raw_a = compute_raw(&agent, None, None, false, None, 50, 50, None, None);
+        let raw_a = compute_raw(
+            &agent,
+            None,
+            None,
+            false,
+            None,
+            50,
+            50,
+            None,
+            None,
+            Instant::now(),
+        );
         assert!(
             raw_a.present0[Dimension::PreciseVramFree.idx()],
             "agent dim 13 must be present"
@@ -1636,7 +1679,18 @@ mod tests {
         // Static node: gpu_metrics only, no agent telemetry.
         let mut stat = make_state("static", 50, true);
         stat.gpu_metrics = Some(gm);
-        let raw_s = compute_raw(&stat, None, None, false, None, 50, 50, None, None);
+        let raw_s = compute_raw(
+            &stat,
+            None,
+            None,
+            false,
+            None,
+            50,
+            50,
+            None,
+            None,
+            Instant::now(),
+        );
         assert!(
             !raw_s.present0[Dimension::PreciseVramFree.idx()],
             "static dim 13 must be absent"
@@ -1688,7 +1742,18 @@ mod tests {
         let mut ok = make_state("ok", 50, true);
         ok.queue_depth = Some(3);
         ok.max_concurrent = Some(8);
-        let raw = compute_raw(&ok, None, None, false, None, 50, 50, None, None);
+        let raw = compute_raw(
+            &ok,
+            None,
+            None,
+            false,
+            None,
+            50,
+            50,
+            None,
+            None,
+            Instant::now(),
+        );
         assert!(
             raw.present0[dim12],
             "dim 12 present when both known and max>0"
@@ -1702,7 +1767,18 @@ mod tests {
         let mut zero_cap = make_state("zerocap", 50, true);
         zero_cap.queue_depth = Some(3);
         zero_cap.max_concurrent = Some(0);
-        let raw = compute_raw(&zero_cap, None, None, false, None, 50, 50, None, None);
+        let raw = compute_raw(
+            &zero_cap,
+            None,
+            None,
+            false,
+            None,
+            50,
+            50,
+            None,
+            None,
+            Instant::now(),
+        );
         assert!(
             !raw.present0[dim12],
             "Some(0) capacity → dim 12 absent (guard)"
@@ -1711,7 +1787,18 @@ mod tests {
         // Missing max_concurrent → dim 12 absent (dim 10 unaffected).
         let mut no_cap = make_state("nocap", 50, true);
         no_cap.queue_depth = Some(3);
-        let raw = compute_raw(&no_cap, None, None, false, None, 50, 50, None, None);
+        let raw = compute_raw(
+            &no_cap,
+            None,
+            None,
+            false,
+            None,
+            50,
+            50,
+            None,
+            None,
+            Instant::now(),
+        );
         assert!(!raw.present0[dim12], "no max_concurrent → dim 12 absent");
         assert!(
             raw.present0[dim10],
@@ -1736,7 +1823,18 @@ mod tests {
         ] {
             let mut s = make_state("n", 50, true);
             s.config.locality = Some(tier);
-            let raw = compute_raw(&s, None, None, false, None, 50, 50, None, None);
+            let raw = compute_raw(
+                &s,
+                None,
+                None,
+                false,
+                None,
+                50,
+                50,
+                None,
+                None,
+                Instant::now(),
+            );
             assert!(raw.present0[dim], "dim 19 present when locality configured");
             assert!(
                 (raw.norms[dim] - expected).abs() < 1e-9,
@@ -1745,7 +1843,18 @@ mod tests {
         }
         // Unconfigured → absent (neutral, weight-dropped), never a penalty.
         let s = make_state("n", 50, true);
-        let raw = compute_raw(&s, None, None, false, None, 50, 50, None, None);
+        let raw = compute_raw(
+            &s,
+            None,
+            None,
+            false,
+            None,
+            50,
+            50,
+            None,
+            None,
+            Instant::now(),
+        );
         assert!(!raw.present0[dim], "dim 19 absent when locality is None");
     }
 
@@ -1761,7 +1870,18 @@ mod tests {
             s
         };
 
-        let raw = compute_raw(&with_cost(0.0), None, None, false, None, 50, 50, None, None);
+        let raw = compute_raw(
+            &with_cost(0.0),
+            None,
+            None,
+            false,
+            None,
+            50,
+            50,
+            None,
+            None,
+            Instant::now(),
+        );
         assert!(raw.present0[dim], "dim 20 present when cost configured");
         assert!((raw.norms[dim] - 1.0).abs() < 1e-9, "zero cost → 1.0");
 
@@ -1775,6 +1895,7 @@ mod tests {
             50,
             None,
             None,
+            Instant::now(),
         );
         assert!((raw.norms[dim] - 0.5).abs() < 1e-9, "half COST_REF → 0.5");
 
@@ -1789,12 +1910,24 @@ mod tests {
             50,
             None,
             None,
+            Instant::now(),
         );
         assert!((raw.norms[dim]).abs() < 1e-9, "≥COST_REF clamps to 0.0");
 
         // Unconfigured → absent (neutral, weight-dropped).
         let s = make_state("b", 50, true);
-        let raw = compute_raw(&s, None, None, false, None, 50, 50, None, None);
+        let raw = compute_raw(
+            &s,
+            None,
+            None,
+            false,
+            None,
+            50,
+            50,
+            None,
+            None,
+            Instant::now(),
+        );
         assert!(!raw.present0[dim], "dim 20 absent when power_cost is None");
     }
 
@@ -1843,6 +1976,158 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.name, "zeta", "cheaper backend must win");
+    }
+
+    // ── Phase 4 Slice B: warm_model_recency (dim 23) ─────────────────────────
+
+    /// dim 23 — recency norm from per-model last-served time. Served now → 1.0,
+    /// half WARM_REF ago → 0.5, ≥WARM_REF ago → 0.0 (clamped); a model never
+    /// served here reads neutral 0.5 (unknown, not a penalty); absent entirely
+    /// when no model is requested. Direct on `compute_raw` with a fixed `now` so
+    /// ages are deterministic.
+    #[test]
+    fn warm_model_recency_formula_and_absence_in_compute_raw() {
+        let dim = Dimension::WarmModelRecency.idx();
+        let now = Instant::now();
+        let served_ago = |secs: u64| {
+            let mut s = make_state("w", 50, true);
+            s.last_served
+                .insert("m".to_string(), now - Duration::from_secs(secs));
+            s
+        };
+
+        // Served just now → 1.0
+        let raw = compute_raw(
+            &served_ago(0),
+            Some("m"),
+            None,
+            false,
+            None,
+            50,
+            50,
+            None,
+            None,
+            now,
+        );
+        assert!(
+            raw.present0[dim],
+            "dim 23 present when a model is requested"
+        );
+        assert!((raw.norms[dim] - 1.0).abs() < 1e-9, "served now → 1.0");
+
+        // Half WARM_REF ago → 0.5
+        let raw = compute_raw(
+            &served_ago((WARM_REF / 2.0) as u64),
+            Some("m"),
+            None,
+            false,
+            None,
+            50,
+            50,
+            None,
+            None,
+            now,
+        );
+        assert!((raw.norms[dim] - 0.5).abs() < 1e-9, "half WARM_REF → 0.5");
+
+        // ≥WARM_REF ago → clamps to 0.0
+        let raw = compute_raw(
+            &served_ago(WARM_REF as u64 * 2),
+            Some("m"),
+            None,
+            false,
+            None,
+            50,
+            50,
+            None,
+            None,
+            now,
+        );
+        assert!((raw.norms[dim]).abs() < 1e-9, "≥WARM_REF → 0.0");
+
+        // Model requested but never served here → neutral 0.5 (unknown).
+        let never = make_state("w", 50, true);
+        let raw = compute_raw(
+            &never,
+            Some("m"),
+            None,
+            false,
+            None,
+            50,
+            50,
+            None,
+            None,
+            now,
+        );
+        assert!(
+            raw.present0[dim],
+            "present with a requested model even if never served"
+        );
+        assert!((raw.norms[dim] - 0.5).abs() < 1e-9, "never served → 0.5");
+
+        // A DIFFERENT model is warm, but the requested one isn't → still 0.5.
+        let mut other = make_state("w", 50, true);
+        other.last_served.insert("other".to_string(), now);
+        let raw = compute_raw(
+            &other,
+            Some("m"),
+            None,
+            false,
+            None,
+            50,
+            50,
+            None,
+            None,
+            now,
+        );
+        assert!(
+            (raw.norms[dim] - 0.5).abs() < 1e-9,
+            "a different warm model leaves the requested one at 0.5"
+        );
+
+        // No model requested → dim 23 absent (neutral, weight-dropped).
+        let raw = compute_raw(
+            &served_ago(0),
+            None,
+            None,
+            false,
+            None,
+            50,
+            50,
+            None,
+            None,
+            now,
+        );
+        assert!(
+            !raw.present0[dim],
+            "dim 23 absent when no model is requested"
+        );
+    }
+
+    /// dim 23 end-to-end — the backend that served the model more recently wins.
+    /// Anti-trivial: the stale node is "alpha", the freshly-served node "zeta"; a
+    /// "zeta" win proves dim 23 decided. Weight opt-in, set explicitly.
+    #[tokio::test]
+    async fn warm_model_recency_recent_backend_wins() {
+        let now = Instant::now();
+        let mut stale = make_state("alpha", 50, true);
+        let mut warm = make_state("zeta", 50, true);
+        stale.models = vec!["m".to_string()];
+        warm.models = vec!["m".to_string()];
+        stale
+            .last_served
+            .insert("m".to_string(), now - Duration::from_secs(280));
+        warm.last_served.insert("m".to_string(), now);
+
+        let mut cfg = ScoredConfig::default();
+        cfg.weights.warm_model_recency = 100.0;
+        let pool = pool_from_states(vec![stale, warm]);
+        let router = make_router(pool, &cfg);
+        let result = router
+            .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
+            .await
+            .unwrap();
+        assert_eq!(result.name, "zeta", "more recently served backend must win");
     }
 
     // ── Phase 2: prompt_size_vs_capacity (dim 3) ─────────────────────────────
@@ -1895,6 +2180,7 @@ mod tests {
             50,
             Some(500),
             None,
+            Instant::now(),
         );
         assert!(raw.present0[dim3]);
         assert!((raw.norms[dim3] - 1.0).abs() < 1e-9, "≤50% window → 1.0");
@@ -1910,6 +2196,7 @@ mod tests {
             50,
             Some(750),
             None,
+            Instant::now(),
         );
         assert!((raw.norms[dim3] - 0.5).abs() < 1e-9, "75% window → 0.5");
 
@@ -1924,6 +2211,7 @@ mod tests {
             50,
             Some(1000),
             None,
+            Instant::now(),
         );
         assert!((raw.norms[dim3]).abs() < 1e-9, "≥100% window → 0.0");
 
@@ -1938,12 +2226,24 @@ mod tests {
             50,
             None,
             None,
+            Instant::now(),
         );
         assert!(!raw.present0[dim3], "no prompt_tokens → dim 3 absent");
 
         // No max_context_len → absent even with a prompt size.
         let no_window = make_state("nw", 50, true);
-        let raw = compute_raw(&no_window, None, None, false, None, 50, 50, Some(500), None);
+        let raw = compute_raw(
+            &no_window,
+            None,
+            None,
+            false,
+            None,
+            50,
+            50,
+            Some(500),
+            None,
+            Instant::now(),
+        );
         assert!(!raw.present0[dim3], "no max_context_len → dim 3 absent");
     }
 
@@ -1974,7 +2274,18 @@ mod tests {
 
         // Warm stats: all four dims should be present.
         let st = warm_stats(1000.0, 50.0, 0, 0);
-        let raw = compute_raw(&s, None, None, false, None, 50, 50, None, Some(&st));
+        let raw = compute_raw(
+            &s,
+            None,
+            None,
+            false,
+            None,
+            50,
+            50,
+            None,
+            Some(&st),
+            Instant::now(),
+        );
         assert!(
             raw.present0[Dimension::EwmaLatency.idx()],
             "dim 14 must be present with warm stats"
@@ -1993,7 +2304,18 @@ mod tests {
         );
 
         // Cold (None): all four dims absent.
-        let raw_cold = compute_raw(&s, None, None, false, None, 50, 50, None, None);
+        let raw_cold = compute_raw(
+            &s,
+            None,
+            None,
+            false,
+            None,
+            50,
+            50,
+            None,
+            None,
+            Instant::now(),
+        );
         assert!(
             !raw_cold.present0[Dimension::EwmaLatency.idx()],
             "dim 14 absent without stats"
@@ -2014,7 +2336,18 @@ mod tests {
         // Under-sampled (samples < MIN_SAMPLES): treated as cold → absent.
         let mut under = st.clone();
         under.samples = MIN_SAMPLES - 1;
-        let raw_under = compute_raw(&s, None, None, false, None, 50, 50, None, Some(&under));
+        let raw_under = compute_raw(
+            &s,
+            None,
+            None,
+            false,
+            None,
+            50,
+            50,
+            None,
+            Some(&under),
+            Instant::now(),
+        );
         assert!(
             !raw_under.present0[Dimension::EwmaLatency.idx()],
             "dim 14 absent when under-sampled"
@@ -2030,13 +2363,35 @@ mod tests {
 
         // Half the reference latency → 0.5 norm.
         let st = warm_stats(LAT_REF / 2.0, 0.0, 0, 0);
-        let raw = compute_raw(&s, None, None, false, None, 50, 50, None, Some(&st));
+        let raw = compute_raw(
+            &s,
+            None,
+            None,
+            false,
+            None,
+            50,
+            50,
+            None,
+            Some(&st),
+            Instant::now(),
+        );
         let n14 = raw.norms[Dimension::EwmaLatency.idx()];
         assert!((n14 - 0.5).abs() < 1e-9, "LAT_REF/2 → 0.5, got {}", n14);
 
         // Near-zero latency → ~1.0.
         let st_fast = warm_stats(1.0, 0.0, 0, 0);
-        let raw_fast = compute_raw(&s, None, None, false, None, 50, 50, None, Some(&st_fast));
+        let raw_fast = compute_raw(
+            &s,
+            None,
+            None,
+            false,
+            None,
+            50,
+            50,
+            None,
+            Some(&st_fast),
+            Instant::now(),
+        );
         assert!(
             raw_fast.norms[Dimension::EwmaLatency.idx()] > 0.99,
             "1ms latency → near 1.0"
@@ -2044,7 +2399,18 @@ mod tests {
 
         // Latency at or above LAT_REF → 0.0.
         let st_slow = warm_stats(LAT_REF, 0.0, 0, 0);
-        let raw_slow = compute_raw(&s, None, None, false, None, 50, 50, None, Some(&st_slow));
+        let raw_slow = compute_raw(
+            &s,
+            None,
+            None,
+            false,
+            None,
+            50,
+            50,
+            None,
+            Some(&st_slow),
+            Instant::now(),
+        );
         assert!(
             raw_slow.norms[Dimension::EwmaLatency.idx()] <= 0.0,
             "LAT_REF ms → 0.0"
@@ -2058,7 +2424,18 @@ mod tests {
 
         // All successes (err_window = 0) → error_rate = 0 → n = 1.0.
         let st_clean = warm_stats(100.0, 0.0, 0b0000_0000, 0);
-        let raw_clean = compute_raw(&s, None, None, false, None, 50, 50, None, Some(&st_clean));
+        let raw_clean = compute_raw(
+            &s,
+            None,
+            None,
+            false,
+            None,
+            50,
+            50,
+            None,
+            Some(&st_clean),
+            Instant::now(),
+        );
         assert!(
             (raw_clean.norms[Dimension::RecentErrorRate.idx()] - 1.0).abs() < 1e-9,
             "all success → dim 15 = 1.0"
@@ -2068,7 +2445,18 @@ mod tests {
         // 0xAAAAAAAA = 0b10101010... (16 of 32 bits set)
         let mut half = warm_stats(100.0, 0.0, 0xAAAA_AAAA, 0);
         half.samples = 32; // exactly 32 observations so denominator is 32.
-        let raw_half = compute_raw(&s, None, None, false, None, 50, 50, None, Some(&half));
+        let raw_half = compute_raw(
+            &s,
+            None,
+            None,
+            false,
+            None,
+            50,
+            50,
+            None,
+            Some(&half),
+            Instant::now(),
+        );
         assert!(
             (raw_half.norms[Dimension::RecentErrorRate.idx()] - 0.5).abs() < 1e-9,
             "50% errors → dim 15 = 0.5, got {}",
@@ -2084,7 +2472,18 @@ mod tests {
 
         // Half TPS_REF → 0.5.
         let st = warm_stats(100.0, TPS_REF / 2.0, 0, 0);
-        let raw = compute_raw(&s, None, None, false, None, 50, 50, None, Some(&st));
+        let raw = compute_raw(
+            &s,
+            None,
+            None,
+            false,
+            None,
+            50,
+            50,
+            None,
+            Some(&st),
+            Instant::now(),
+        );
         assert!(
             (raw.norms[Dimension::RecentSuccessThroughput.idx()] - 0.5).abs() < 1e-9,
             "TPS_REF/2 → 0.5"
@@ -2092,7 +2491,18 @@ mod tests {
 
         // At or above TPS_REF → 1.0.
         let st_max = warm_stats(100.0, TPS_REF, 0, 0);
-        let raw_max = compute_raw(&s, None, None, false, None, 50, 50, None, Some(&st_max));
+        let raw_max = compute_raw(
+            &s,
+            None,
+            None,
+            false,
+            None,
+            50,
+            50,
+            None,
+            Some(&st_max),
+            Instant::now(),
+        );
         assert!(
             (raw_max.norms[Dimension::RecentSuccessThroughput.idx()] - 1.0).abs() < 1e-9,
             "TPS_REF → 1.0"
@@ -2107,7 +2517,18 @@ mod tests {
 
         // 0 transitions → 1.0.
         let st_stable = warm_stats(100.0, 0.0, 0, 0);
-        let raw_stable = compute_raw(&s, None, None, false, None, 50, 50, None, Some(&st_stable));
+        let raw_stable = compute_raw(
+            &s,
+            None,
+            None,
+            false,
+            None,
+            50,
+            50,
+            None,
+            Some(&st_stable),
+            Instant::now(),
+        );
         assert!(
             (raw_stable.norms[Dimension::FlapStability.idx()] - 1.0).abs() < 1e-9,
             "0 transitions → 1.0"
@@ -2115,7 +2536,18 @@ mod tests {
 
         // FLAP_REF transitions → 0.0.
         let st_flappy = warm_stats(100.0, 0.0, 0, FLAP_REF as u32);
-        let raw_flappy = compute_raw(&s, None, None, false, None, 50, 50, None, Some(&st_flappy));
+        let raw_flappy = compute_raw(
+            &s,
+            None,
+            None,
+            false,
+            None,
+            50,
+            50,
+            None,
+            Some(&st_flappy),
+            Instant::now(),
+        );
         assert!(
             raw_flappy.norms[Dimension::FlapStability.idx()] <= 0.0,
             "FLAP_REF transitions → 0.0"

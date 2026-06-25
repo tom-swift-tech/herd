@@ -75,10 +75,11 @@ routing:
   #     precise_vram_free: 2.0       # prefer more measured free VRAM (agent telemetry)
   #     # History dims 14–17 (ewma_latency, recent_error_rate, recent_success_throughput,
   #     # flap_stability) keep sensible non-zero defaults — omit to use them.
-  #     # Policy dims below are OPT-IN (default 0); turn on per fleet. They read the
-  #     # matching per-backend fields (locality / power_cost) shown in the backends block.
+  #     # Policy/affinity dims below are OPT-IN (default 0); turn on per fleet.
   #     network_locality: 2.0        # prefer closer backends (needs per-backend `locality`)
   #     power_cost: 1.0              # prefer cheaper/lower-power (needs per-backend `power_cost`)
+  #     warm_model_recency: 2.0      # prefer backends that served this model recently
+  #                                  # (prompt/KV-cache warmth; tracked automatically)
 
   # === AUTO MODE ===
   # LLM-based request classification. When model is "auto" or omitted, Herd calls

@@ -608,6 +608,12 @@ pub async fn chat_completions(
                 None, // tokens not extracted from streaming SSE
             )
             .await;
+        // Phase-4 dim 23: stamp warm-recency on a successful served request.
+        if log.status != "error" {
+            if let Some(m) = log.model.as_deref() {
+                state.pool.record_served(&log.backend, m).await;
+            }
+        }
         if let Err(e) = state.analytics.log_request(log).await {
             tracing::error!("Failed to log request: {}", e);
         }
@@ -677,6 +683,12 @@ pub async fn chat_completions(
                 tokens_out,
             )
             .await;
+        // Phase-4 dim 23: stamp warm-recency on a successful served request.
+        if log.status != "error" {
+            if let Some(m) = log.model.as_deref() {
+                state.pool.record_served(&log.backend, m).await;
+            }
+        }
         if let (Some(tin), Some(tout)) = (tokens_in, tokens_out) {
             state
                 .metrics

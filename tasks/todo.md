@@ -119,8 +119,19 @@ Still open (resolve at each slice's architect pass, not blocking Slice A):
       formula/absence direct, e2e recent-backend-wins, pool `record_served`). Build ✓, clippy
       `-D warnings` ✓, fmt ✓, **lib 544→547**, no lib unwrap. Docs: herd.yaml.example weight +
       spec Slice-B note. **Awaiting: commit (user said local-only for the branch).**
-- [ ] SLICE C (dim 18) — session stickiness, resolve Q-C1 first.
-- [ ] SLICE D (dim 22) — gpu-class affinity, blocked on Q-D1.
+- [x] SLICE B follow-up — `last_served` LRU cap (`MAX_LAST_SERVED=256`), commit `56c1544`.
+- [x] SLICE C (dim 18 `session_stickiness`) — Q-C1 = **all proxy traffic**. New
+      `router/session_affinity.rs` (`SessionAffinity`: session_id→backend, LRU 50k, mirrors
+      `RoutingStats`), injected into `ScoredRouter` + `create_router` (all call sites incl. 2
+      integration tests). `RouteContext.session_id` ← `X-Herd-Session` header in both proxy
+      paths; write-back on all 3 post-request hooks. `compute_raw` gains `sticky_backend:
+      Option<&str>` (resolved once/call); dim 18 = 1.0 match / 0.5 else, absent when no prior
+      backend. Opt-in. 5 tests (3 store, 2 scored). Build ✓, clippy `-D warnings` ✓, fmt ✓,
+      **lib 548→553**, integration green. Docs: skills.md X-Herd-Session, header JSON,
+      herd.yaml.example weight, spec Slice-C note.
+- [ ] SLICE D (dim 22 `gpu_class_affinity`) — Q-D1 = **infer from model size**. Parse param
+      count from model name → class tier; thread candidate gpu_model to BackendState; norm
+      1.0 exact / 0.7 same-vendor / 0.5 unknown. **NEXT.**
 
 ---
 

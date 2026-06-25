@@ -692,12 +692,18 @@ Landing incrementally by data-source cost (Slice A → D):
 > Opt-in (`w_zero`). Time-based `age_secs` chosen over the spec's `turns_since` (no global
 > turn counter exists; time is the same `Instant` source the pool already uses).
 >
-> **Remaining:** dim 18 (`session_stickiness`, architectural — needs a session→backend
-> ledger + a session key on the scoring path + routing agent turns through the scorer);
-> dim 22 (`gpu_class_affinity`, needs a model→preferred-class source). dim 21
-> (`rpc_shard_capability`) is **deferred to v1.3** — inert until a "request needs sharding"
-> signal exists (Q6 drops a uniform-0.5 dim every call), which depends on the llama.cpp RPC
-> tensor-sharding integration.
+> **Slice C — dim 18 `session_stickiness` (affinity).** New `SessionAffinity` store
+> (`session_id → backend`, LRU-bounded at 50k like `RoutingStats`), injected into
+> `ScoredRouter` and written on the post-request hooks. `RouteContext` gains `session_id`,
+> sourced from the **`X-Herd-Session`** request header in both proxy paths (all traffic, not
+> just agent sessions — Q-C1). `compute_raw` takes `sticky_backend: Option<&str>` (resolved
+> once per call); dim 18 present iff a prior backend is known for the session → the matching
+> candidate scores `1.0`, others `0.5`; unknown/new session → absent. Opt-in (`w_zero`).
+>
+> **Remaining:** dim 22 (`gpu_class_affinity`, Slice D — preferred class inferred from model
+> size, Q-D1). dim 21 (`rpc_shard_capability`) is **deferred to v1.3** — inert until a
+> "request needs sharding" signal exists (Q6 drops a uniform-0.5 dim every call), which
+> depends on the llama.cpp RPC tensor-sharding integration.
 
 ---
 

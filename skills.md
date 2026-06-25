@@ -239,6 +239,20 @@ this header, Herd only considers backends matching **all** specified tags.
 
 **Use case:** Route coding tasks to high-VRAM GPUs, research to slower but larger-context nodes.
 
+### X-Herd-Session (Conversation Stickiness)
+
+Keep a multi-turn conversation on the same backend for prompt/KV-cache warmth:
+
+```
+X-Herd-Session: my-conversation-id
+```
+
+- Only the `scored` routing strategy uses it, via the `session_stickiness` dimension
+  (opt-in — set a non-zero `session_stickiness` weight in `routing.scored.weights`).
+- Send a stable, opaque id (any string) per conversation; Herd records which backend
+  served the last turn and prefers it next time. Omit it for stateless requests.
+- Session ids are bounded internally (LRU) and never persisted to disk.
+
 ### X-Request-Id (Correlation)
 
 ```

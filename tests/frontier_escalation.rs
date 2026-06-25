@@ -22,7 +22,7 @@ use herd::{
     metrics::Metrics,
     nodes::{NodeDb, NodeRegistry},
     rate_limit::RateLimiter,
-    router::{create_router, routing_stats::RoutingStats},
+    router::{create_router, routing_stats::RoutingStats, session_affinity::SessionAffinity},
 };
 use rusqlite::Connection;
 use std::sync::Arc;
@@ -102,11 +102,13 @@ fn test_state(config: Config) -> AppState {
         std::time::Duration::from_secs(30),
     );
     let routing_stats = Arc::new(RoutingStats::new());
+    let session_affinity = Arc::new(SessionAffinity::new());
     let router = create_router(
         config.routing.strategy.clone(),
         pool.clone(),
         &config.routing,
         Arc::clone(&routing_stats),
+        Arc::clone(&session_affinity),
     );
 
     AppState {
@@ -145,6 +147,7 @@ fn test_state(config: Config) -> AppState {
         routing_retry_count: Arc::new(std::sync::atomic::AtomicU32::new(1)),
         config_path: None,
         routing_stats,
+        session_affinity,
     }
 }
 

@@ -44,7 +44,7 @@ use herd::{
     metrics::Metrics,
     providers::{cost_db::CostDb, rate_limit::ProviderRateLimiter},
     rate_limit::RateLimiter,
-    router::{create_router, routing_stats::RoutingStats},
+    router::{create_router, routing_stats::RoutingStats, session_affinity::SessionAffinity},
 };
 use rusqlite::Connection;
 use serde_json::{json, Value};
@@ -170,11 +170,13 @@ struct Gateway {
 
 fn build_state(registry: Arc<NodeRegistry>, pool: Arc<BackendPool>, config: Config) -> AppState {
     let routing_stats = Arc::new(RoutingStats::new());
+    let session_affinity = Arc::new(SessionAffinity::new());
     let router = create_router(
         config.routing.strategy.clone(),
         (*pool).clone(),
         &config.routing,
         Arc::clone(&routing_stats),
+        Arc::clone(&session_affinity),
     );
     AppState {
         pool,
@@ -216,6 +218,7 @@ fn build_state(registry: Arc<NodeRegistry>, pool: Arc<BackendPool>, config: Conf
         routing_retry_count: Arc::new(AtomicU32::new(0)),
         config_path: None,
         routing_stats,
+        session_affinity,
     }
 }
 

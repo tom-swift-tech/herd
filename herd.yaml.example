@@ -82,8 +82,9 @@ routing:
   #                                  # (prompt/KV-cache warmth; tracked automatically)
   #     session_stickiness: 3.0      # keep a conversation on its last backend
   #                                  # (needs the X-Herd-Session request header)
-  #     gpu_class_affinity: 1.0      # match model size to GPU class (small models
-  #                                  # to small GPUs; needs agent gpu_model telemetry)
+  #     gpu_class_affinity: 1.0      # match model size to GPU class by total VRAM
+  #                                  # (small models to small GPUs; heterogeneous
+  #                                  # fleets only — uniform fleets self-cancel)
 
   # === AUTO MODE ===
   # LLM-based request classification. When model is "auto" or omitted, Herd calls

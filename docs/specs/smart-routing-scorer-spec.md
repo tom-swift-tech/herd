@@ -702,11 +702,14 @@ Landing incrementally by data-source cost (Slice A → D):
 >
 > **Slice D — dim 22 `gpu_class_affinity` (capability).** Preferred GPU tier inferred from
 > the model's parameter count (Q-D1): `>=30B` → HighEnd, `8–30B` → Mid, `<8B` → Entry. The
-> candidate's GPU tier comes from `gpu_model` (threaded from `AgentCapabilities` to
-> `BackendState` via `pool_sync`, dim-12 pattern), classified by a substring card list. Norm
-> is tier *distance*: exact `1.0`, one off `0.7`, two off `0.5`; either side unknown → absent.
-> Distinct from VRAM dims (4/13) — those check FIT, this checks appropriate placement. Opt-in.
-> The size thresholds and GPU card list are deployment-tunable.
+> candidate's GPU tier comes from **total VRAM** (`BackendState.vram_total_mb`, falling back to
+> gpu-hot's `memory_total`): `>=24GB` → HighEnd, `12–24GB` → Mid, `<12GB` → Entry. VRAM chosen
+> over a GPU-name list (post-merge tuning): self-maintaining, and correctly tiers cut-down SKUs
+> a name match would miss (a "4070 Laptop" @ 8GB is Entry, not Mid). Norm is tier *distance*:
+> exact `1.0`, one off `0.7`, two off `0.5`; either side unknown → absent. Uses TOTAL VRAM
+> (capability), distinct from the FREE-VRAM dims (4/13 check FIT). Opt-in; only discriminates on
+> a heterogeneous fleet (uniform GPU tiers self-cancel via the Q6 pre-pass). Both the model-size
+> and VRAM thresholds are deployment-tunable.
 >
 > **Remaining:** dim 21 (`rpc_shard_capability`) is **deferred to v1.3** — inert until a
 > "request needs sharding" signal exists (Q6 drops a uniform-0.5 dim every call), which

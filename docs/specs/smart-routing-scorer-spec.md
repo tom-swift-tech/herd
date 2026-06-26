@@ -700,10 +700,18 @@ Landing incrementally by data-source cost (Slice A → D):
 > once per call); dim 18 present iff a prior backend is known for the session → the matching
 > candidate scores `1.0`, others `0.5`; unknown/new session → absent. Opt-in (`w_zero`).
 >
-> **Remaining:** dim 22 (`gpu_class_affinity`, Slice D — preferred class inferred from model
-> size, Q-D1). dim 21 (`rpc_shard_capability`) is **deferred to v1.3** — inert until a
+> **Slice D — dim 22 `gpu_class_affinity` (capability).** Preferred GPU tier inferred from
+> the model's parameter count (Q-D1): `>=30B` → HighEnd, `8–30B` → Mid, `<8B` → Entry. The
+> candidate's GPU tier comes from `gpu_model` (threaded from `AgentCapabilities` to
+> `BackendState` via `pool_sync`, dim-12 pattern), classified by a substring card list. Norm
+> is tier *distance*: exact `1.0`, one off `0.7`, two off `0.5`; either side unknown → absent.
+> Distinct from VRAM dims (4/13) — those check FIT, this checks appropriate placement. Opt-in.
+> The size thresholds and GPU card list are deployment-tunable.
+>
+> **Remaining:** dim 21 (`rpc_shard_capability`) is **deferred to v1.3** — inert until a
 > "request needs sharding" signal exists (Q6 drops a uniform-0.5 dim every call), which
-> depends on the llama.cpp RPC tensor-sharding integration.
+> depends on the llama.cpp RPC tensor-sharding integration. **Phase 4 is otherwise complete:
+> 22 of 23 dims live.**
 
 ---
 

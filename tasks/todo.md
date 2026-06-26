@@ -129,9 +129,16 @@ Still open (resolve at each slice's architect pass, not blocking Slice A):
       backend. Opt-in. 5 tests (3 store, 2 scored). Build ✓, clippy `-D warnings` ✓, fmt ✓,
       **lib 548→553**, integration green. Docs: skills.md X-Herd-Session, header JSON,
       herd.yaml.example weight, spec Slice-C note.
-- [ ] SLICE D (dim 22 `gpu_class_affinity`) — Q-D1 = **infer from model size**. Parse param
-      count from model name → class tier; thread candidate gpu_model to BackendState; norm
-      1.0 exact / 0.7 same-vendor / 0.5 unknown. **NEXT.**
+- [x] SLICE D (dim 22 `gpu_class_affinity`) — Q-D1 = **infer from model size**. `GpuClass`
+      tiers (Entry/Mid/HighEnd); `model_gpu_class` (param count: ≥30B HighEnd / 8–30B Mid /
+      <8B Entry) + `backend_gpu_class` (substring card list); `parse_param_billions` (last
+      `<num>b` token). `BackendState.gpu_model` threaded from `AgentCapabilities` via
+      `set_agent_telemetry` + `pool_sync` both branches. dim 22 norm = tier distance (0→1.0,
+      1→0.7, 2→0.5), absent when either side unknown. Opt-in. 4 tests. Build ✓, clippy
+      `-D warnings` ✓, fmt ✓, **lib 553→557**, integration green. Docs: herd.yaml.example
+      weight, spec Slice-D note. **Tunable:** size thresholds + GPU card list are fleet-specific.
+
+### PHASE 4 COMPLETE — 22/23 dims live. Only dim 21 (`rpc_shard_capability`) deferred to v1.3.
 
 ---
 

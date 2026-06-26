@@ -1,6 +1,6 @@
 [package]
 name = "herd"
-version = "1.2.0"
+version = "1.3.0"
 edition = "2021"
 authors = ["Swift Innovative Technologies"]
 description = "Intelligent LLM router with multi-backend GPU-aware routing"

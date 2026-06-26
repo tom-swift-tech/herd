@@ -2134,7 +2134,11 @@ mod tests {
     #[test]
     fn warm_model_recency_formula_and_absence_in_compute_raw() {
         let dim = Dimension::WarmModelRecency.idx();
-        let now = Instant::now();
+        // Reference instant is offset into the FUTURE so `now - age` stays above
+        // the monotonic clock origin and never underflows. (Windows `Instant` is
+        // QPC-since-boot; on a freshly-booted CI runner `Instant::now()` can be
+        // smaller than the ages we test, so `Instant::now() - 600s` would panic.)
+        let now = Instant::now() + Duration::from_secs(10_000);
         let served_ago = |secs: u64| {
             let mut s = make_state("w", 50, true);
             s.last_served
@@ -2256,30 +2260,33 @@ mod tests {
         );
     }
 
-    /// dim 23 end-to-end — the backend that served the model more recently wins.
-    /// Anti-trivial: the stale node is "alpha", the freshly-served node "zeta"; a
-    /// "zeta" win proves dim 23 decided. Weight opt-in, set explicitly.
+    /// dim 23 end-to-end — the backend that served the model wins over one that
+    /// hasn't. Anti-trivial: the never-served node is "alpha", the freshly-served
+    /// node "zeta"; a "zeta" win proves dim 23 decided. The loser is "never
+    /// served" (→ neutral 0.5) rather than "served long ago" so the test never
+    /// subtracts from `Instant::now()` (which can underflow the monotonic clock on
+    /// a freshly-booted CI runner). Weight opt-in, set explicitly.
     #[tokio::test]
     async fn warm_model_recency_recent_backend_wins() {
-        let now = Instant::now();
-        let mut stale = make_state("alpha", 50, true);
+        let mut cold = make_state("alpha", 50, true);
         let mut warm = make_state("zeta", 50, true);
-        stale.models = vec!["m".to_string()];
+        cold.models = vec!["m".to_string()];
         warm.models = vec!["m".to_string()];
-        stale
-            .last_served
-            .insert("m".to_string(), now - Duration::from_secs(280));
-        warm.last_served.insert("m".to_string(), now);
+        // warm just served "m" (age ≈ 0 → norm ≈ 1.0); cold never served it (0.5).
+        warm.last_served.insert("m".to_string(), Instant::now());
 
         let mut cfg = ScoredConfig::default();
         cfg.weights.warm_model_recency = 100.0;
-        let pool = pool_from_states(vec![stale, warm]);
+        let pool = pool_from_states(vec![cold, warm]);
         let router = make_router(pool, &cfg);
         let result = router
             .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
             .await
             .unwrap();
-        assert_eq!(result.name, "zeta", "more recently served backend must win");
+        assert_eq!(
+            result.name, "zeta",
+            "the backend that served the model wins"
+        );
     }
 
     // ── Phase 4 Slice C: session_stickiness (dim 18) ─────────────────────────

@@ -1626,6 +1626,13 @@ async fn proxy_handler(
                 )
                 .await;
 
+            // Phase-4 dim 23: stamp warm-recency on a successful served request.
+            if log.status != "error" {
+                if let Some(m) = self.model_name.as_deref() {
+                    self.state.pool.record_served(&log.backend, m).await;
+                }
+            }
+
             if let (Some(tin), Some(tout)) = (usage.tokens_in, usage.tokens_out) {
                 self.state
                     .metrics

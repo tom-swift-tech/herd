@@ -54,12 +54,15 @@ impl ModelWarmer {
                     let model = model.clone();
                     let name = name.clone();
                     let permit = semaphore.clone();
+                    let pool = pool.clone();
                     tokio::spawn(async move {
                         let _permit = permit.acquire().await.expect("semaphore closed");
                         if let Err(e) = client.post(&url).json(&payload).send().await {
                             tracing::warn!("Warmer failed for {} on {}: {}", model, name, e);
                         } else {
                             tracing::debug!("Warmed {} on {}", model, name);
+                            // Stamp warm-recency (dim 23) on success.
+                            pool.record_served(&name, &model).await;
                         }
                     });
                 }

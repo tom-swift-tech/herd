@@ -107,7 +107,18 @@ Still open (resolve at each slice's architect pass, not blocking Slice A):
       2 anti-trivial e2e). Build ✓, clippy `-D warnings` ✓, fmt ✓, **lib 540→544**. Docs:
       herd.yaml example (weights + per-backend fields), spec Slice-A note. No lib unwrap.
       **Awaiting: commit + push + PR (user confirm).**
-- [ ] SLICE B (dim 23) — warm-recency, resolve Q-B1/B2 first.
+- [x] SLICE B (dim 23 `warm_model_recency`) — built on the locked decisions:
+      Q-B1 = `last_served: BTreeMap<String, Instant>` on `BackendState` (read from existing
+      pool snapshot, no new lock); Q-B2 = time-based `n = clamp(1 - age_secs/WARM_REF, 0, 1)`,
+      `WARM_REF=300`, `0.5` when requested model never served here, absent when no model
+      requested; Q-B3 = stamp on BOTH `ModelWarmer` success AND every successful served
+      request via new `BackendPool::record_served` (3 hooks: openai.rs streaming+non-streaming,
+      server.rs proxy; serve-path writer also covers llama-server nodes the warmer skips).
+      `compute_raw` gained a `now: Instant` arg (captured once per call → fair + deterministic;
+      dim 23 stays weight-0 opt-in so default determinism tests unaffected). 3 tests (dim-23
+      formula/absence direct, e2e recent-backend-wins, pool `record_served`). Build ✓, clippy
+      `-D warnings` ✓, fmt ✓, **lib 544→547**, no lib unwrap. Docs: herd.yaml.example weight +
+      spec Slice-B note. **Awaiting: commit (user said local-only for the branch).**
 - [ ] SLICE C (dim 18) — session stickiness, resolve Q-C1 first.
 - [ ] SLICE D (dim 22) — gpu-class affinity, blocked on Q-D1.
 

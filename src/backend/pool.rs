@@ -1,9 +1,15 @@
 use crate::config::Backend;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::RwLock;
+
+/// Per-backend cap on the `last_served` map (dim 23 warm-recency). A real
+/// backend hosts at most a few dozen distinct models, so this never triggers in
+/// normal operation; it bounds growth if a relaxed-gate fleet is fed arbitrary
+/// model strings. Mirrors `RoutingStats`' size-cap-with-LRU-eviction approach.
+const MAX_LAST_SERVED: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct BackendState {
@@ -27,6 +33,12 @@ pub struct BackendState {
     pub vram_free_mb: Option<u64>,
     /// Max concurrent requests the backend will accept. None — no source field yet (future phase).
     pub max_concurrent: Option<u32>,
+    /// Per-model last-served wall-clock instant (model name → when this backend
+    /// last successfully served or warmed it). Feeds the scored router's
+    /// `warm_model_recency` dimension (dim 23). Empty until the warmer or a
+    /// served request stamps it; a model absent from the map reads as "never
+    /// served here" (neutral 0.5), never a penalty.
+    pub last_served: BTreeMap<String, Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +99,7 @@ impl BackendPool {
                 ttft_p50_ms: None,
                 vram_free_mb: None,
                 max_concurrent: None,
+                last_served: BTreeMap::new(),
             })
             .collect();
 
@@ -279,6 +292,37 @@ impl BackendPool {
         }
     }
 
+    /// Record that `name` just successfully served (or warmed) `model`, stamping
+    /// the wall-clock instant. Feeds the scored router's `warm_model_recency`
+    /// dimension. Called from the warmer (on warm success) and the proxy
+    /// post-request hooks (on a successful served request). No-op for an unknown
+    /// backend name or an empty model string.
+    pub async fn record_served(&self, name: &str, model: &str) {
+        if model.is_empty() {
+            return;
+        }
+        let mut backends = self.backends.write().await;
+        if let Some(backend) = backends.iter_mut().find(|b| b.config.name == name) {
+            // Bound the map: at capacity, evict the least-recently-served entry
+            // before inserting a NEW model (re-stamping an existing one is free).
+            if backend.last_served.len() >= MAX_LAST_SERVED
+                && !backend.last_served.contains_key(model)
+            {
+                if let Some(oldest) = backend
+                    .last_served
+                    .iter()
+                    .min_by_key(|(_, t)| **t)
+                    .map(|(k, _)| k.clone())
+                {
+                    backend.last_served.remove(&oldest);
+                }
+            }
+            backend
+                .last_served
+                .insert(model.to_string(), Instant::now());
+        }
+    }
+
     pub async fn set_vram(&self, name: &str, vram_mb: u64) {
         let mut backends = self.backends.write().await;
         if let Some(backend) = backends.iter_mut().find(|b| b.config.name == name) {
@@ -331,6 +375,7 @@ impl BackendPool {
             ttft_p50_ms: None,
             vram_free_mb: None,
             max_concurrent: None,
+            last_served: BTreeMap::new(),
         });
     }
 
@@ -398,6 +443,66 @@ mod tests {
         // Removing non-existent returns false
         let removed = pool.remove("gpu1").await;
         assert!(!removed);
+    }
+
+    #[tokio::test]
+    async fn record_served_stamps_last_served() {
+        let pool = BackendPool::new(vec![], 3, Duration::from_secs(60));
+        pool.add(make_backend("gpu1", 100)).await;
+
+        // Initially empty.
+        assert!(pool.get("gpu1").await.unwrap().last_served.is_empty());
+
+        // Stamps the model with a recent instant.
+        pool.record_served("gpu1", "llama3:8b").await;
+        let state = pool.get("gpu1").await.unwrap();
+        let t = state
+            .last_served
+            .get("llama3:8b")
+            .expect("model should be stamped");
+        assert!(t.elapsed() < Duration::from_secs(5), "stamp should be ~now");
+
+        // Empty model name is a no-op (no spurious "" key).
+        pool.record_served("gpu1", "").await;
+        assert!(!pool.get("gpu1").await.unwrap().last_served.contains_key(""));
+
+        // Unknown backend is a no-op (no panic).
+        pool.record_served("nope", "llama3:8b").await;
+    }
+
+    #[tokio::test]
+    async fn record_served_bounds_map_with_lru_eviction() {
+        let pool = BackendPool::new(vec![], 3, Duration::from_secs(60));
+        pool.add(make_backend("gpu1", 100)).await;
+
+        // The first model served is the oldest; it must be the eviction victim.
+        pool.record_served("gpu1", "oldest").await;
+        // Guarantee a strictly-older instant so the LRU victim is unambiguous
+        // (avoids a same-tick tie with the next insert).
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        // Fill to capacity with distinct models (oldest is now entry 0 of CAP+1).
+        for i in 0..super::MAX_LAST_SERVED {
+            pool.record_served("gpu1", &format!("m{i}")).await;
+        }
+
+        let state = pool.get("gpu1").await.unwrap();
+        assert_eq!(
+            state.last_served.len(),
+            super::MAX_LAST_SERVED,
+            "map must be capped at MAX_LAST_SERVED"
+        );
+        assert!(
+            !state.last_served.contains_key("oldest"),
+            "least-recently-served entry must be evicted"
+        );
+
+        // Re-stamping an EXISTING model must not evict (no net growth).
+        pool.record_served("gpu1", "m0").await;
+        assert_eq!(
+            pool.get("gpu1").await.unwrap().last_served.len(),
+            super::MAX_LAST_SERVED,
+            "re-stamping an existing model does not grow or evict"
+        );
     }
 
     #[tokio::test]

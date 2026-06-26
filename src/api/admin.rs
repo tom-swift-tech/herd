@@ -133,6 +133,8 @@ pub async fn add_backend(
         health_check_status: None,
         tags: req.tags,
         max_context_len: None,
+        locality: None,
+        power_cost: None,
     };
 
     state.pool.add(backend).await;

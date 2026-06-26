@@ -4,7 +4,9 @@
 /// plus dims 10–13 (Phase 2 — live load & latency from agent telemetry; dim 11
 /// `ttft_p50` reads agent caps but the agent does not yet measure it). Dims 14–17
 /// (Phase 3) read per-(backend,model) EWMA history from `RoutingStats`.
-/// Dims 18–23 remain absent/neutral until Phase 4.
+/// Phase 4 (policy/affinity) is landing incrementally: dims 19 (`network_locality`)
+/// and 20 (`power_cost`) are active (config-only); dims 18, 21–23 remain
+/// absent/neutral until their slices.
 use crate::backend::{pool::filter_healthy, BackendPool};
 use crate::config::{BackendType, ModelGate, ScoredConfig, ScoredWeights};
 use crate::router::routing_stats::{BackendModelStats, RoutingStats, MIN_SAMPLES};
@@ -30,6 +32,10 @@ const QUEUE_REF: f64 = 8.0;
 /// Reference TTFT (ms) for dim 11 (`ttft_p50`); at/above this a backend
 /// normalizes to 0.0, instant first token to 1.0.
 const TTFT_REF: f64 = 2000.0;
+/// Reference cost/power weight for dim 20 (`power_cost`); a backend at/above
+/// this normalizes to 0.0 (most expensive), a zero-cost backend to 1.0. Same
+/// arbitrary unit the operator uses for `Backend.power_cost` (watts, $/1k tok…).
+const COST_REF: f64 = 100.0;
 /// Scale factor for quantizing scores to i64 comparison keys.
 const SCORE_SCALE: f64 = 1_000_000.0;
 
@@ -63,7 +69,7 @@ pub enum Dimension {
     RecentErrorRate = 14,
     RecentSuccessThroughput = 15,
     FlapStability = 16,
-    // Phase 4 — always absent in Phase 1
+    // Phase 4 — dims 19/20 active (config-only); 18, 21–23 absent until their slices
     SessionStickiness = 17,
     NetworkLocality = 18,
     PowerCost = 19,
@@ -431,8 +437,33 @@ fn compute_raw(
             1.0 - (s.health_transitions as f64 / FLAP_REF).clamp(0.0, 1.0);
     }
 
-    // ── Dims 18–23: Phase 4 — absent until that phase ────────────────────────
-    // Their sources are None/absent → present0 stays false → neutral, weight-dropped.
+    // ── Dim 19: network_locality — Phase 4 (config-only) ─────────────────────
+    // Closer backends are preferred (less proxy-hop latency). Present iff the
+    // operator configured a tier; absent → neutral 0.5, weight-dropped.
+    if let Some(tier) = b.config.locality {
+        present0[Dimension::NetworkLocality.idx()] = true;
+        norms[Dimension::NetworkLocality.idx()] = match tier {
+            crate::config::LocalityTier::Local => 1.0,
+            crate::config::LocalityTier::Lan => 0.8,
+            crate::config::LocalityTier::Tailnet => 0.6,
+            crate::config::LocalityTier::Wan => 0.4,
+        };
+    }
+
+    // ── Dim 20: power_cost — Phase 4 (config-only) ───────────────────────────
+    // Cheaper/lower-power backends preferred. n = clamp(1 - cost/COST_REF, 0, 1):
+    // a zero-cost backend → 1.0, one at/above COST_REF → 0.0. Present iff the
+    // operator configured a cost AND COST_REF > 0 (guard div-by-zero).
+    if let Some(cost) = b.config.power_cost {
+        if COST_REF > 0.0 {
+            present0[Dimension::PowerCost.idx()] = true;
+            norms[Dimension::PowerCost.idx()] = (1.0 - cost / COST_REF).clamp(0.0, 1.0);
+        }
+    }
+
+    // ── Dims 18, 21–23: Phase 4 — absent until their slices ──────────────────
+    // session_stickiness (18), rpc_shard_capability (21), gpu_class_affinity (22),
+    // warm_model_recency (23): sources None/absent → present0 stays false.
 
     CandidateRaw { norms, present0 }
 }
@@ -1686,6 +1717,132 @@ mod tests {
             raw.present0[dim10],
             "dim 10 still present without max_concurrent"
         );
+    }
+
+    // ── Phase 4 Slice A: network_locality (dim 19) & power_cost (dim 20) ──────
+
+    /// dim 19 — exact tier map (local 1.0 / lan 0.8 / tailnet 0.6 / wan 0.4),
+    /// present iff the operator configured a locality; absent (neutral, never a
+    /// penalty) when None. Tested directly on `compute_raw`.
+    #[test]
+    fn network_locality_tier_map_in_compute_raw() {
+        use crate::config::LocalityTier;
+        let dim = Dimension::NetworkLocality.idx();
+        for (tier, expected) in [
+            (LocalityTier::Local, 1.0_f64),
+            (LocalityTier::Lan, 0.8),
+            (LocalityTier::Tailnet, 0.6),
+            (LocalityTier::Wan, 0.4),
+        ] {
+            let mut s = make_state("n", 50, true);
+            s.config.locality = Some(tier);
+            let raw = compute_raw(&s, None, None, false, None, 50, 50, None, None);
+            assert!(raw.present0[dim], "dim 19 present when locality configured");
+            assert!(
+                (raw.norms[dim] - expected).abs() < 1e-9,
+                "tier {tier} → {expected}"
+            );
+        }
+        // Unconfigured → absent (neutral, weight-dropped), never a penalty.
+        let s = make_state("n", 50, true);
+        let raw = compute_raw(&s, None, None, false, None, 50, 50, None, None);
+        assert!(!raw.present0[dim], "dim 19 absent when locality is None");
+    }
+
+    /// dim 20 — n = clamp(1 - cost/COST_REF, 0, 1): zero-cost → 1.0, COST_REF/2 →
+    /// 0.5, ≥COST_REF → 0.0 (clamped). Present iff `power_cost` configured;
+    /// absent (neutral) when None. Tested directly on `compute_raw`.
+    #[test]
+    fn power_cost_formula_and_absence_in_compute_raw() {
+        let dim = Dimension::PowerCost.idx();
+        let with_cost = |c: f64| {
+            let mut s = make_state("b", 50, true);
+            s.config.power_cost = Some(c);
+            s
+        };
+
+        let raw = compute_raw(&with_cost(0.0), None, None, false, None, 50, 50, None, None);
+        assert!(raw.present0[dim], "dim 20 present when cost configured");
+        assert!((raw.norms[dim] - 1.0).abs() < 1e-9, "zero cost → 1.0");
+
+        let raw = compute_raw(
+            &with_cost(COST_REF / 2.0),
+            None,
+            None,
+            false,
+            None,
+            50,
+            50,
+            None,
+            None,
+        );
+        assert!((raw.norms[dim] - 0.5).abs() < 1e-9, "half COST_REF → 0.5");
+
+        // Above COST_REF clamps to 0.0 (never negative).
+        let raw = compute_raw(
+            &with_cost(COST_REF * 2.0),
+            None,
+            None,
+            false,
+            None,
+            50,
+            50,
+            None,
+            None,
+        );
+        assert!((raw.norms[dim]).abs() < 1e-9, "≥COST_REF clamps to 0.0");
+
+        // Unconfigured → absent (neutral, weight-dropped).
+        let s = make_state("b", 50, true);
+        let raw = compute_raw(&s, None, None, false, None, 50, 50, None, None);
+        assert!(!raw.present0[dim], "dim 20 absent when power_cost is None");
+    }
+
+    /// dim 19 end-to-end — the closer backend wins. Anti-trivial: the WAN node is
+    /// named "alpha" (would win the name tie-break) and the local node "zeta"; a
+    /// "zeta" win proves dim 19 decided, not the tie-break. Weight opt-in (default
+    /// is `w_zero`), so the test sets it explicitly.
+    #[tokio::test]
+    async fn network_locality_closer_backend_wins() {
+        use crate::config::LocalityTier;
+        let mut far = make_state("alpha", 50, true);
+        let mut near = make_state("zeta", 50, true);
+        far.models = vec!["m".to_string()];
+        near.models = vec!["m".to_string()];
+        far.config.locality = Some(LocalityTier::Wan);
+        near.config.locality = Some(LocalityTier::Local);
+
+        let mut cfg = ScoredConfig::default();
+        cfg.weights.network_locality = 100.0;
+        let pool = pool_from_states(vec![far, near]);
+        let router = make_router(pool, &cfg);
+        let result = router
+            .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
+            .await
+            .unwrap();
+        assert_eq!(result.name, "zeta", "closer (local) backend must win");
+    }
+
+    /// dim 20 end-to-end — the cheaper backend wins. Anti-trivial: the expensive
+    /// node is "alpha", the cheap node "zeta"; a "zeta" win proves dim 20 decided.
+    #[tokio::test]
+    async fn power_cost_cheaper_backend_wins() {
+        let mut pricey = make_state("alpha", 50, true);
+        let mut cheap = make_state("zeta", 50, true);
+        pricey.models = vec!["m".to_string()];
+        cheap.models = vec!["m".to_string()];
+        pricey.config.power_cost = Some(90.0);
+        cheap.config.power_cost = Some(10.0);
+
+        let mut cfg = ScoredConfig::default();
+        cfg.weights.power_cost = 100.0;
+        let pool = pool_from_states(vec![pricey, cheap]);
+        let router = make_router(pool, &cfg);
+        let result = router
+            .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
+            .await
+            .unwrap();
+        assert_eq!(result.name, "zeta", "cheaper backend must win");
     }
 
     // ── Phase 2: prompt_size_vs_capacity (dim 3) ─────────────────────────────

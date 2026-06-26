@@ -5,6 +5,7 @@ use crate::api::{admin, agent, openai};
 use crate::backend::{BackendPool, HealthChecker, ModelDiscovery, ModelWarmer};
 use crate::config::{parse_duration, Config};
 use crate::router::routing_stats::RoutingStats;
+use crate::router::session_affinity::SessionAffinity;
 use crate::router::{create_router, Router};
 use anyhow::Result;
 use chrono::Timelike;
@@ -155,6 +156,9 @@ pub struct AppState {
     /// Phase-3 per-(backend,model) EWMA history store.
     /// Updated on the post-request hook; read by `ScoredRouter` on the scoring path.
     pub routing_stats: Arc<RoutingStats>,
+    /// Phase-4 session→backend affinity store (dim 18).
+    /// Updated on the post-request hook; read by `ScoredRouter` on the scoring path.
+    pub session_affinity: Arc<SessionAffinity>,
 }
 
 impl AppState {
@@ -256,12 +260,14 @@ impl AppState {
             }
         }
 
-        // Swap router (new router shares the same pool data and routing_stats store)
+        // Swap router (new router shares the same pool data, routing_stats, and
+        // session_affinity stores)
         let new_router = create_router(
             new_config.routing.strategy.clone(),
             (*self.pool).clone(),
             &new_config.routing,
             Arc::clone(&self.routing_stats),
+            Arc::clone(&self.session_affinity),
         );
         *self.router.write().await = new_router;
 
@@ -414,9 +420,11 @@ impl Server {
             }
         });
 
-        // Create the Phase-3 EWMA history store — shared by the router and the
-        // post-request hooks in openai.rs and server.rs.
+        // Create the Phase-3 EWMA history store and Phase-4 session-affinity store
+        // — both shared by the router and the post-request hooks in openai.rs and
+        // server.rs.
         let routing_stats = Arc::new(RoutingStats::new());
+        let session_affinity = Arc::new(SessionAffinity::new());
 
         // Create router
         let router = create_router(
@@ -424,6 +432,7 @@ impl Server {
             pool.clone(),
             &self.config.routing,
             Arc::clone(&routing_stats),
+            Arc::clone(&session_affinity),
         );
 
         // Wrap in Arc
@@ -522,6 +531,7 @@ impl Server {
             routing_retry_count: Arc::new(AtomicU32::new(self.config.routing.retry_count)),
             config_path: self.config_path.clone(),
             routing_stats,
+            session_affinity,
         };
 
         // Start session reaper and audit log cleanup (every 5 minutes)
@@ -1448,11 +1458,19 @@ async fn proxy_handler(
         }
     }
 
+    // Session id (X-Herd-Session) for the scored router's dim 18 stickiness.
+    let session_id: Option<String> = headers
+        .get("x-herd-session")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty());
+
     // Estimate prompt size once (pre-routing) for the scored router's dim 3.
     // No-op for the other routing strategies (their route_scored is ctx-blind).
     let route_ctx = crate::router::RouteContext {
         prompt_tokens: crate::api::openai::estimate_prompt_tokens(&body_bytes),
         requested_ctx_len: None,
+        session_id: session_id.clone(),
     };
 
     for _ in 0..=state.retry_count() {
@@ -1577,6 +1595,7 @@ async fn proxy_handler(
         auto_tier: Option<String>,
         auto_capability: Option<String>,
         auto_model: Option<String>,
+        session_id: Option<String>,
         start: std::time::Instant,
     }
 
@@ -1630,6 +1649,10 @@ async fn proxy_handler(
             if log.status != "error" {
                 if let Some(m) = self.model_name.as_deref() {
                     self.state.pool.record_served(&log.backend, m).await;
+                }
+                // Phase-4 dim 18: record this session's backend for next-turn stickiness.
+                if let Some(sid) = self.session_id.as_deref() {
+                    self.state.session_affinity.record(sid, &log.backend).await;
                 }
             }
 
@@ -1796,6 +1819,7 @@ async fn proxy_handler(
                     auto_tier: auto_tier.clone(),
                     auto_capability: auto_capability.clone(),
                     auto_model: auto_model.clone(),
+                    session_id: session_id.clone(),
                     start,
                 };
                 tokio::spawn(async move {
@@ -1829,6 +1853,7 @@ async fn proxy_handler(
                     auto_tier,
                     auto_capability,
                     auto_model,
+                    session_id: session_id.clone(),
                     start,
                 };
                 ctx.log_and_record(status, usage).await;
@@ -1853,6 +1878,7 @@ async fn proxy_handler(
                 auto_tier,
                 auto_capability,
                 auto_model,
+                session_id: session_id.clone(),
                 start,
             };
             ctx.log_and_record(status, TokenUsage::default()).await;
@@ -2262,6 +2288,7 @@ async fn skills_handler(
         },
         "headers": {
             "X-Herd-Tags": "Comma-separated tags to target specific backends (e.g. 'gpu,fast')",
+            "X-Herd-Session": "Opaque session id; the scored router prefers the backend that served this session's last turn (prompt-cache warmth)",
             "X-Request-Id": "Correlation ID — send your own or Herd generates a UUID v4",
             "X-API-Key": "Required for admin endpoints only",
             "Authorization: Bearer <HERD_AGENT_TOKEN>": "Required for /api/internal/nodes/* endpoints"
@@ -2365,11 +2392,13 @@ mod tests {
             parse_duration(&initial.circuit_breaker.recovery_time).unwrap(),
         ));
         let routing_stats = Arc::new(RoutingStats::new());
+        let session_affinity = Arc::new(SessionAffinity::new());
         let router = create_router(
             initial.routing.strategy.clone(),
             (*pool).clone(),
             &initial.routing,
             Arc::clone(&routing_stats),
+            Arc::clone(&session_affinity),
         );
 
         let state = AppState {
@@ -2416,6 +2445,7 @@ mod tests {
             routing_retry_count: Arc::new(AtomicU32::new(1)),
             config_path: Some(temp_path.clone()),
             routing_stats,
+            session_affinity,
         };
 
         let message = state.reload_config().await.unwrap();

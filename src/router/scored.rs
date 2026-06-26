@@ -4,13 +4,14 @@
 /// plus dims 10–13 (Phase 2 — live load & latency from agent telemetry; dim 11
 /// `ttft_p50` reads agent caps but the agent does not yet measure it). Dims 14–17
 /// (Phase 3) read per-(backend,model) EWMA history from `RoutingStats`.
-/// Phase 4 (policy/affinity) is landing incrementally: dims 19 (`network_locality`),
-/// 20 (`power_cost`, config-only) and 23 (`warm_model_recency`, from per-(backend,
-/// model) last-served time on `BackendState`) are active; dims 18, 21, 22 remain
-/// absent/neutral until their slices.
+/// Phase 4 (policy/affinity) is landing incrementally: dims 18 (`session_stickiness`,
+/// from the `SessionAffinity` store), 19 (`network_locality`), 20 (`power_cost`,
+/// config-only) and 23 (`warm_model_recency`, from per-(backend,model) last-served
+/// time on `BackendState`) are active; dims 21, 22 remain absent until their slices.
 use crate::backend::{pool::filter_healthy, BackendPool};
 use crate::config::{BackendType, ModelGate, ScoredConfig, ScoredWeights};
 use crate::router::routing_stats::{BackendModelStats, RoutingStats, MIN_SAMPLES};
+use crate::router::session_affinity::SessionAffinity;
 use crate::router::{RouteContext, RoutedBackend, Router};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -75,7 +76,7 @@ pub enum Dimension {
     RecentErrorRate = 14,
     RecentSuccessThroughput = 15,
     FlapStability = 16,
-    // Phase 4 — dims 19/20 active (config-only); 18, 21–23 absent until their slices
+    // Phase 4 — dims 18/19/20/23 active; 21, 22 absent until their slices
     SessionStickiness = 17,
     NetworkLocality = 18,
     PowerCost = 19,
@@ -161,10 +162,18 @@ pub struct ScoredRouter {
     /// Shared Phase-3 EWMA history store. One read-lock snapshot is taken per
     /// routing call; no lock is held across the score/select steps.
     routing_stats: Arc<RoutingStats>,
+    /// Shared Phase-4 session→backend affinity store (dim 18). Read once per
+    /// routing call, only when the request carries a session id.
+    session_affinity: Arc<SessionAffinity>,
 }
 
 impl ScoredRouter {
-    pub fn new(pool: BackendPool, config: &ScoredConfig, routing_stats: Arc<RoutingStats>) -> Self {
+    pub fn new(
+        pool: BackendPool,
+        config: &ScoredConfig,
+        routing_stats: Arc<RoutingStats>,
+        session_affinity: Arc<SessionAffinity>,
+    ) -> Self {
         let w = &config.weights;
         let weights = weights_array(w);
         Self {
@@ -173,6 +182,7 @@ impl ScoredRouter {
             model_gate: config.model_gate,
             prefer_backend_type: config.prefer_backend_type,
             routing_stats,
+            session_affinity,
         }
     }
 }
@@ -245,6 +255,7 @@ fn compute_raw(
     prompt_tokens: Option<u32>,
     stats: Option<&BackendModelStats>,
     now: Instant,
+    sticky_backend: Option<&str>,
 ) -> CandidateRaw {
     let mut norms = [0.0f64; DIM_COUNT];
     let mut present0 = [false; DIM_COUNT];
@@ -487,9 +498,21 @@ fn compute_raw(
         };
     }
 
-    // ── Dims 18, 21, 22: Phase 4 — absent until their slices ─────────────────
-    // session_stickiness (18), rpc_shard_capability (21), gpu_class_affinity (22):
-    // sources None/absent → present0 stays false.
+    // ── Dim 18: session_stickiness — Phase 4 (affinity) ──────────────────────
+    // Prefer the backend that served this session's last turn (prompt/KV-cache
+    // warmth). Present iff a prior backend is known for the session (the request
+    // carried a session id AND it has history): the matching candidate scores
+    // 1.0, all others 0.5. A new/unknown session → `sticky_backend` is None → dim
+    // absent (a brand-new session would make every candidate uniform-0.5 anyway).
+    if let Some(last) = sticky_backend {
+        let dim = Dimension::SessionStickiness.idx();
+        present0[dim] = true;
+        norms[dim] = if last == b.config.name { 1.0 } else { 0.5 };
+    }
+
+    // ── Dims 21, 22: Phase 4 — absent until their slices ─────────────────────
+    // rpc_shard_capability (21), gpu_class_affinity (22): sources None/absent →
+    // present0 stays false.
 
     CandidateRaw { norms, present0 }
 }
@@ -584,6 +607,15 @@ impl Router for ScoredRouter {
         // captured here so the comparison is fair and deterministic within the call.
         let now = Instant::now();
 
+        // Dim 18 (session_stickiness): resolve the session's last backend ONCE,
+        // only when the request carries a session id. Same value for every
+        // candidate; the matching one scores 1.0. None → dim absent.
+        let sticky_backend: Option<String> = match ctx.session_id.as_deref() {
+            Some(sid) => self.session_affinity.get(sid).await,
+            None => None,
+        };
+        let sticky_backend = sticky_backend.as_deref();
+
         // Per-candidate raw norms + present₀ flags.
         let raws: Vec<CandidateRaw> = candidates
             .iter()
@@ -606,6 +638,7 @@ impl Router for ScoredRouter {
                     ctx.prompt_tokens,
                     candidate_stats,
                     now,
+                    sticky_backend,
                 )
             })
             .collect();
@@ -875,7 +908,12 @@ mod tests {
     /// Build a `ScoredRouter` with an empty (cold-start) `RoutingStats`.
     /// Existing tests that don't exercise Phase-3 dims use this helper.
     fn make_router(pool: BackendPool, cfg: &ScoredConfig) -> ScoredRouter {
-        ScoredRouter::new(pool, cfg, Arc::new(RoutingStats::new()))
+        ScoredRouter::new(
+            pool,
+            cfg,
+            Arc::new(RoutingStats::new()),
+            Arc::new(SessionAffinity::new()),
+        )
     }
 
     // ── Test 1 & determinism: same pool + request → same result every time ──
@@ -1666,6 +1704,7 @@ mod tests {
             None,
             None,
             Instant::now(),
+            None,
         );
         assert!(
             raw_a.present0[Dimension::PreciseVramFree.idx()],
@@ -1690,6 +1729,7 @@ mod tests {
             None,
             None,
             Instant::now(),
+            None,
         );
         assert!(
             !raw_s.present0[Dimension::PreciseVramFree.idx()],
@@ -1753,6 +1793,7 @@ mod tests {
             None,
             None,
             Instant::now(),
+            None,
         );
         assert!(
             raw.present0[dim12],
@@ -1778,6 +1819,7 @@ mod tests {
             None,
             None,
             Instant::now(),
+            None,
         );
         assert!(
             !raw.present0[dim12],
@@ -1798,6 +1840,7 @@ mod tests {
             None,
             None,
             Instant::now(),
+            None,
         );
         assert!(!raw.present0[dim12], "no max_concurrent → dim 12 absent");
         assert!(
@@ -1834,6 +1877,7 @@ mod tests {
                 None,
                 None,
                 Instant::now(),
+                None,
             );
             assert!(raw.present0[dim], "dim 19 present when locality configured");
             assert!(
@@ -1854,6 +1898,7 @@ mod tests {
             None,
             None,
             Instant::now(),
+            None,
         );
         assert!(!raw.present0[dim], "dim 19 absent when locality is None");
     }
@@ -1881,6 +1926,7 @@ mod tests {
             None,
             None,
             Instant::now(),
+            None,
         );
         assert!(raw.present0[dim], "dim 20 present when cost configured");
         assert!((raw.norms[dim] - 1.0).abs() < 1e-9, "zero cost → 1.0");
@@ -1896,6 +1942,7 @@ mod tests {
             None,
             None,
             Instant::now(),
+            None,
         );
         assert!((raw.norms[dim] - 0.5).abs() < 1e-9, "half COST_REF → 0.5");
 
@@ -1911,6 +1958,7 @@ mod tests {
             None,
             None,
             Instant::now(),
+            None,
         );
         assert!((raw.norms[dim]).abs() < 1e-9, "≥COST_REF clamps to 0.0");
 
@@ -1927,6 +1975,7 @@ mod tests {
             None,
             None,
             Instant::now(),
+            None,
         );
         assert!(!raw.present0[dim], "dim 20 absent when power_cost is None");
     }
@@ -2008,6 +2057,7 @@ mod tests {
             None,
             None,
             now,
+            None,
         );
         assert!(
             raw.present0[dim],
@@ -2027,6 +2077,7 @@ mod tests {
             None,
             None,
             now,
+            None,
         );
         assert!((raw.norms[dim] - 0.5).abs() < 1e-9, "half WARM_REF → 0.5");
 
@@ -2042,6 +2093,7 @@ mod tests {
             None,
             None,
             now,
+            None,
         );
         assert!((raw.norms[dim]).abs() < 1e-9, "≥WARM_REF → 0.0");
 
@@ -2058,6 +2110,7 @@ mod tests {
             None,
             None,
             now,
+            None,
         );
         assert!(
             raw.present0[dim],
@@ -2079,6 +2132,7 @@ mod tests {
             None,
             None,
             now,
+            None,
         );
         assert!(
             (raw.norms[dim] - 0.5).abs() < 1e-9,
@@ -2097,6 +2151,7 @@ mod tests {
             None,
             None,
             now,
+            None,
         );
         assert!(
             !raw.present0[dim],
@@ -2130,6 +2185,92 @@ mod tests {
         assert_eq!(result.name, "zeta", "more recently served backend must win");
     }
 
+    // ── Phase 4 Slice C: session_stickiness (dim 18) ─────────────────────────
+
+    /// dim 18 — present iff a prior backend is known for the session. The matching
+    /// candidate scores 1.0, all others 0.5; an unknown session (None sticky) →
+    /// absent (neutral). Tested directly on `compute_raw`.
+    #[test]
+    fn session_stickiness_norm_and_absence_in_compute_raw() {
+        let dim = Dimension::SessionStickiness.idx();
+        let now = Instant::now();
+        let b = make_state("beta", 50, true);
+
+        // Sticky to THIS backend → 1.0.
+        let raw = compute_raw(
+            &b,
+            None,
+            None,
+            false,
+            None,
+            50,
+            50,
+            None,
+            None,
+            now,
+            Some("beta"),
+        );
+        assert!(raw.present0[dim], "present when a sticky backend is known");
+        assert!(
+            (raw.norms[dim] - 1.0).abs() < 1e-9,
+            "matching backend → 1.0"
+        );
+
+        // Sticky to ANOTHER backend → 0.5.
+        let raw = compute_raw(
+            &b,
+            None,
+            None,
+            false,
+            None,
+            50,
+            50,
+            None,
+            None,
+            now,
+            Some("other"),
+        );
+        assert!(raw.present0[dim]);
+        assert!(
+            (raw.norms[dim] - 0.5).abs() < 1e-9,
+            "non-matching backend → 0.5"
+        );
+
+        // No sticky backend (new/unknown session) → absent.
+        let raw = compute_raw(&b, None, None, false, None, 50, 50, None, None, now, None);
+        assert!(!raw.present0[dim], "absent when no sticky backend is known");
+    }
+
+    /// dim 18 end-to-end — the session's last backend wins. Anti-trivial: the
+    /// sticky backend is "zeta" (loses the name tie-break to "alpha"); a "zeta"
+    /// win proves dim 18 decided. Affinity store pre-seeded; weight opt-in.
+    #[tokio::test]
+    async fn session_stickiness_sticky_backend_wins() {
+        let mut a = make_state("alpha", 50, true);
+        let mut z = make_state("zeta", 50, true);
+        a.models = vec!["m".to_string()];
+        z.models = vec!["m".to_string()];
+
+        let affinity = Arc::new(SessionAffinity::new());
+        affinity.record("sess-1", "zeta").await;
+
+        let mut cfg = ScoredConfig::default();
+        cfg.weights.session_stickiness = 100.0;
+        let pool = pool_from_states(vec![a, z]);
+        let router = ScoredRouter::new(pool, &cfg, Arc::new(RoutingStats::new()), affinity);
+
+        let ctx = RouteContext {
+            prompt_tokens: None,
+            requested_ctx_len: None,
+            session_id: Some("sess-1".to_string()),
+        };
+        let result = router
+            .route_scored(Some("m"), None, &HashSet::new(), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(result.name, "zeta", "session's last backend must win");
+    }
+
     // ── Phase 2: prompt_size_vs_capacity (dim 3) ─────────────────────────────
 
     /// dim 3 — given the same prompt, the backend with the LARGER context window
@@ -2149,6 +2290,7 @@ mod tests {
         let ctx = RouteContext {
             prompt_tokens: Some(4000),
             requested_ctx_len: None,
+            session_id: None,
         };
         let result = router
             .route_scored(Some("m"), None, &HashSet::new(), &ctx)
@@ -2181,6 +2323,7 @@ mod tests {
             Some(500),
             None,
             Instant::now(),
+            None,
         );
         assert!(raw.present0[dim3]);
         assert!((raw.norms[dim3] - 1.0).abs() < 1e-9, "≤50% window → 1.0");
@@ -2197,6 +2340,7 @@ mod tests {
             Some(750),
             None,
             Instant::now(),
+            None,
         );
         assert!((raw.norms[dim3] - 0.5).abs() < 1e-9, "75% window → 0.5");
 
@@ -2212,6 +2356,7 @@ mod tests {
             Some(1000),
             None,
             Instant::now(),
+            None,
         );
         assert!((raw.norms[dim3]).abs() < 1e-9, "≥100% window → 0.0");
 
@@ -2227,6 +2372,7 @@ mod tests {
             None,
             None,
             Instant::now(),
+            None,
         );
         assert!(!raw.present0[dim3], "no prompt_tokens → dim 3 absent");
 
@@ -2243,6 +2389,7 @@ mod tests {
             Some(500),
             None,
             Instant::now(),
+            None,
         );
         assert!(!raw.present0[dim3], "no max_context_len → dim 3 absent");
     }
@@ -2285,6 +2432,7 @@ mod tests {
             None,
             Some(&st),
             Instant::now(),
+            None,
         );
         assert!(
             raw.present0[Dimension::EwmaLatency.idx()],
@@ -2315,6 +2463,7 @@ mod tests {
             None,
             None,
             Instant::now(),
+            None,
         );
         assert!(
             !raw_cold.present0[Dimension::EwmaLatency.idx()],
@@ -2347,6 +2496,7 @@ mod tests {
             None,
             Some(&under),
             Instant::now(),
+            None,
         );
         assert!(
             !raw_under.present0[Dimension::EwmaLatency.idx()],
@@ -2374,6 +2524,7 @@ mod tests {
             None,
             Some(&st),
             Instant::now(),
+            None,
         );
         let n14 = raw.norms[Dimension::EwmaLatency.idx()];
         assert!((n14 - 0.5).abs() < 1e-9, "LAT_REF/2 → 0.5, got {}", n14);
@@ -2391,6 +2542,7 @@ mod tests {
             None,
             Some(&st_fast),
             Instant::now(),
+            None,
         );
         assert!(
             raw_fast.norms[Dimension::EwmaLatency.idx()] > 0.99,
@@ -2410,6 +2562,7 @@ mod tests {
             None,
             Some(&st_slow),
             Instant::now(),
+            None,
         );
         assert!(
             raw_slow.norms[Dimension::EwmaLatency.idx()] <= 0.0,
@@ -2435,6 +2588,7 @@ mod tests {
             None,
             Some(&st_clean),
             Instant::now(),
+            None,
         );
         assert!(
             (raw_clean.norms[Dimension::RecentErrorRate.idx()] - 1.0).abs() < 1e-9,
@@ -2456,6 +2610,7 @@ mod tests {
             None,
             Some(&half),
             Instant::now(),
+            None,
         );
         assert!(
             (raw_half.norms[Dimension::RecentErrorRate.idx()] - 0.5).abs() < 1e-9,
@@ -2483,6 +2638,7 @@ mod tests {
             None,
             Some(&st),
             Instant::now(),
+            None,
         );
         assert!(
             (raw.norms[Dimension::RecentSuccessThroughput.idx()] - 0.5).abs() < 1e-9,
@@ -2502,6 +2658,7 @@ mod tests {
             None,
             Some(&st_max),
             Instant::now(),
+            None,
         );
         assert!(
             (raw_max.norms[Dimension::RecentSuccessThroughput.idx()] - 1.0).abs() < 1e-9,
@@ -2528,6 +2685,7 @@ mod tests {
             None,
             Some(&st_stable),
             Instant::now(),
+            None,
         );
         assert!(
             (raw_stable.norms[Dimension::FlapStability.idx()] - 1.0).abs() < 1e-9,
@@ -2547,6 +2705,7 @@ mod tests {
             None,
             Some(&st_flappy),
             Instant::now(),
+            None,
         );
         assert!(
             raw_flappy.norms[Dimension::FlapStability.idx()] <= 0.0,
@@ -2597,7 +2756,12 @@ mod tests {
             rs.update("zeta", "m", 500, false, None).await;
         }
 
-        let router = ScoredRouter::new(pool, &cfg, Arc::clone(&rs));
+        let router = ScoredRouter::new(
+            pool,
+            &cfg,
+            Arc::clone(&rs),
+            Arc::new(SessionAffinity::new()),
+        );
         let result = router
             .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
             .await
@@ -2648,7 +2812,12 @@ mod tests {
             rs.update("zzz-warm", "m", 2000, false, None).await;
         }
 
-        let router = ScoredRouter::new(pool, &cfg, Arc::clone(&rs));
+        let router = ScoredRouter::new(
+            pool,
+            &cfg,
+            Arc::clone(&rs),
+            Arc::new(SessionAffinity::new()),
+        );
         let result = router
             .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())
             .await
@@ -2699,7 +2868,12 @@ mod tests {
         };
 
         let pool = pool_from_states(vec![n1, n2]);
-        let router = ScoredRouter::new(pool, &cfg, Arc::clone(&rs));
+        let router = ScoredRouter::new(
+            pool,
+            &cfg,
+            Arc::clone(&rs),
+            Arc::new(SessionAffinity::new()),
+        );
 
         let r1 = router
             .route_scored(Some("m"), None, &HashSet::new(), &RouteContext::default())

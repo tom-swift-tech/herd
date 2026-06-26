@@ -387,11 +387,19 @@ pub async fn chat_completions(
 
     let forward_body = rewrite_request_model(&body_bytes, model_name.as_deref());
 
+    // Session id (X-Herd-Session) for the scored router's dim 18 stickiness.
+    let session_id: Option<String> = headers
+        .get("x-herd-session")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty());
+
     // Estimate prompt size once (pre-routing) for the scored router's dim 3.
     // Ignored by the other routing strategies (their route_scored is ctx-blind).
     let route_ctx = crate::router::RouteContext {
         prompt_tokens: estimate_prompt_tokens(&body_bytes),
         requested_ctx_len: None,
+        session_id: session_id.clone(),
     };
 
     for _ in 0..=state.retry_count() {
@@ -613,6 +621,10 @@ pub async fn chat_completions(
             if let Some(m) = log.model.as_deref() {
                 state.pool.record_served(&log.backend, m).await;
             }
+            // Phase-4 dim 18: record this session's backend for next-turn stickiness.
+            if let Some(sid) = session_id.as_deref() {
+                state.session_affinity.record(sid, &log.backend).await;
+            }
         }
         if let Err(e) = state.analytics.log_request(log).await {
             tracing::error!("Failed to log request: {}", e);
@@ -687,6 +699,10 @@ pub async fn chat_completions(
         if log.status != "error" {
             if let Some(m) = log.model.as_deref() {
                 state.pool.record_served(&log.backend, m).await;
+            }
+            // Phase-4 dim 18: record this session's backend for next-turn stickiness.
+            if let Some(sid) = session_id.as_deref() {
+                state.session_affinity.record(sid, &log.backend).await;
             }
         }
         if let (Some(tin), Some(tout)) = (tokens_in, tokens_out) {

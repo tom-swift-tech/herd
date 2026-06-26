@@ -4,11 +4,13 @@ pub mod model_aware;
 pub mod priority;
 pub mod routing_stats;
 pub mod scored;
+pub mod session_affinity;
 pub mod weighted_round_robin;
 
 use crate::backend::BackendPool;
 use crate::config::{RoutingConfig, RoutingStrategy};
 use crate::router::routing_stats::RoutingStats;
+use crate::router::session_affinity::SessionAffinity;
 use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::HashSet;
@@ -23,6 +25,10 @@ pub struct RouteContext {
     pub prompt_tokens: Option<u32>,
     /// Requested context-window length, if the request carried one (e.g. num_ctx).
     pub requested_ctx_len: Option<u32>,
+    /// Caller session id (`X-Herd-Session` header), if present. Feeds dim 18
+    /// (`session_stickiness`): the scorer prefers the backend that served this
+    /// session's last turn. `None` → that dimension is absent (neutral).
+    pub session_id: Option<String>,
 }
 
 #[async_trait]
@@ -109,13 +115,15 @@ impl Router for RouterEnum {
 ///
 /// `routing` is passed so the Scored arm can read `routing.scored`; legacy arms
 /// ignore it — no behaviour change for Priority/ModelAware/LeastBusy/WRR.
-/// `routing_stats` is the shared Phase-3 EWMA history store; it is only wired
-/// into the `Scored` arm. Legacy routers ignore it.
+/// `routing_stats` is the shared Phase-3 EWMA history store and `session_affinity`
+/// the Phase-4 session→backend store; both are only wired into the `Scored` arm.
+/// Legacy routers ignore them.
 pub fn create_router(
     strategy: RoutingStrategy,
     pool: BackendPool,
     routing: &RoutingConfig,
     routing_stats: Arc<RoutingStats>,
+    session_affinity: Arc<SessionAffinity>,
 ) -> RouterEnum {
     match strategy {
         RoutingStrategy::Priority => RouterEnum::Priority(priority::PriorityRouter::new(pool)),
@@ -130,6 +138,7 @@ pub fn create_router(
             pool,
             &routing.scored,
             routing_stats,
+            session_affinity,
         )),
     }
 }

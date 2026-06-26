@@ -711,7 +711,7 @@ Landing incrementally by data-source cost (Slice A → D):
 > a heterogeneous fleet (uniform GPU tiers self-cancel via the Q6 pre-pass). Both the model-size
 > and VRAM thresholds are deployment-tunable.
 >
-> **Remaining:** dim 21 (`rpc_shard_capability`) is **deferred to v1.3** — inert until a
+> **Remaining:** dim 21 (`rpc_shard_capability`) is **deferred to v1.4** — inert until a
 > "request needs sharding" signal exists (Q6 drops a uniform-0.5 dim every call), which
 > depends on the llama.cpp RPC tensor-sharding integration. **Phase 4 is otherwise complete:
 > 22 of 23 dims live.**

@@ -108,30 +108,18 @@ fn parse_param_billions(model: &str) -> Option<f64> {
     best
 }
 
-/// Classify a backend GPU into a tier from its model string (substring match on
-/// common cards). `None` when unrecognized → dim 22 absent (never a penalty for
-/// an unknown GPU). NOTE: this card list is fleet-specific — extend it for the
-/// hardware you actually run.
-fn backend_gpu_class(gpu_model: &str) -> Option<GpuClass> {
-    let g = gpu_model.to_ascii_lowercase();
-    const HIGH_END: &[&str] = &[
-        "5090", "4090", "3090", "a100", "h100", "h200", "a6000", "6000 ada", "l40", "mi300",
-        "mi250",
-    ];
-    const MID: &[&str] = &[
-        "5080", "5070", "4080", "4070", "3080", "3070", "7900", "a5000", "a4000",
-    ];
-    const ENTRY: &[&str] = &[
-        "5060", "4060", "4050", "3060", "3050", "2060", "1660", "1650",
-    ];
-    if HIGH_END.iter().any(|k| g.contains(k)) {
-        Some(GpuClass::HighEnd)
-    } else if MID.iter().any(|k| g.contains(k)) {
-        Some(GpuClass::Mid)
-    } else if ENTRY.iter().any(|k| g.contains(k)) {
-        Some(GpuClass::Entry)
+/// Classify a backend GPU tier from its **total VRAM** (MB): `>= 24GB` → HighEnd,
+/// `12–24GB` → Mid, `< 12GB` → Entry. Total VRAM is the objective capability
+/// signal — self-maintaining (no per-card upkeep) and immune to SKU-name
+/// ambiguity (a "4070 Laptop" @ 8GB correctly tiers Entry, not Mid). Thresholds
+/// are deployment-tunable; defaults assume a consumer/prosumer NVIDIA fleet.
+fn vram_gpu_class(vram_mb: u64) -> GpuClass {
+    if vram_mb >= 24_000 {
+        GpuClass::HighEnd
+    } else if vram_mb >= 12_000 {
+        GpuClass::Mid
     } else {
-        None
+        GpuClass::Entry
     }
 }
 
@@ -597,15 +585,18 @@ fn compute_raw(
 
     // ── Dim 22: gpu_class_affinity — Phase 4 ─────────────────────────────────
     // Match the model's demanded GPU tier (inferred from its parameter count)
-    // against this candidate's GPU tier. Present iff BOTH are known: exact tier →
-    // 1.0, one tier off → 0.7, two off → 0.5. Either unknown → absent (neutral).
-    // Distinct from VRAM dims (4/13): those measure whether a model FITS; this
-    // measures whether the placement is APPROPRIATE (don't tie up a 5090 with a
-    // 1B model when an entry GPU would do).
-    if let (Some(have), Some(want)) = (
-        b.gpu_model.as_deref().and_then(backend_gpu_class),
-        model.and_then(model_gpu_class),
-    ) {
+    // against this candidate's GPU tier (from total VRAM). Present iff BOTH are
+    // known: exact tier → 1.0, one tier off → 0.7, two off → 0.5. Either unknown →
+    // absent (neutral). Backend tier reads `vram_total_mb` (agent telemetry),
+    // falling back to gpu-hot's `memory_total` for static backends. Uses TOTAL
+    // VRAM (capability), distinct from the FREE-VRAM dims (4/13 measure whether a
+    // model FITS now); dim 22 measures whether the placement is APPROPRIATE (don't
+    // tie up a 32GB card with a 1B model when an entry GPU would do).
+    let total_vram_mb = b
+        .vram_total_mb
+        .or_else(|| b.gpu_metrics.as_ref().map(|g| g.memory_total));
+    if let (Some(vram), Some(want)) = (total_vram_mb, model.and_then(model_gpu_class)) {
+        let have = vram_gpu_class(vram);
         let dim = Dimension::GpuClassAffinity.idx();
         present0[dim] = true;
         let dist = (have as i32 - want as i32).unsigned_abs();
@@ -993,7 +984,6 @@ mod tests {
             ttft_p50_ms: None,
             vram_free_mb: None,
             max_concurrent: None,
-            gpu_model: None,
             last_served: std::collections::BTreeMap::new(),
         }
     }
@@ -2399,16 +2389,13 @@ mod tests {
         assert!(matches!(model_gpu_class("x:7b"), Some(GpuClass::Entry)));
         assert!(model_gpu_class("gpt-4").is_none());
 
-        assert!(matches!(
-            backend_gpu_class("NVIDIA GeForce RTX 5090"),
-            Some(GpuClass::HighEnd)
-        ));
-        assert!(matches!(backend_gpu_class("RTX 4070"), Some(GpuClass::Mid)));
-        assert!(matches!(
-            backend_gpu_class("RTX 4060"),
-            Some(GpuClass::Entry)
-        ));
-        assert!(backend_gpu_class("Some Mystery GPU").is_none());
+        // Backend tier from total VRAM (MB). The 4070-Laptop @ 8GB case is the
+        // whole point: a name list would call it "Mid" (4070), VRAM tiers it Entry.
+        assert!(matches!(vram_gpu_class(32_768), GpuClass::HighEnd)); // 5090 32GB
+        assert!(matches!(vram_gpu_class(24_564), GpuClass::HighEnd)); // 4090 24GB
+        assert!(matches!(vram_gpu_class(16_376), GpuClass::Mid)); // 4080 16GB
+        assert!(matches!(vram_gpu_class(12_288), GpuClass::Mid)); // 4070 12GB
+        assert!(matches!(vram_gpu_class(8_188), GpuClass::Entry)); // 4070 Laptop 8GB
     }
 
     /// dim 22 — tier-distance norm: exact 1.0, one off 0.7, two off 0.5; absent
@@ -2417,9 +2404,9 @@ mod tests {
     fn gpu_class_affinity_norm_and_absence_in_compute_raw() {
         let dim = Dimension::GpuClassAffinity.idx();
         let now = Instant::now();
-        let with_gpu = |g: &str| {
+        let with_vram = |mb: u64| {
             let mut s = make_state("b", 50, true);
-            s.gpu_model = Some(g.to_string());
+            s.vram_total_mb = Some(mb);
             s
         };
         let raw_for = |s: &BackendState, model: &str| {
@@ -2438,22 +2425,21 @@ mod tests {
             )
         };
 
-        // 70B (HighEnd) on a 5090 (HighEnd) → exact → 1.0.
-        let raw = raw_for(&with_gpu("RTX 5090"), "llama:70b");
+        // 70B (HighEnd) on a 32GB card (HighEnd) → exact → 1.0.
+        let raw = raw_for(&with_vram(32_768), "llama:70b");
         assert!(raw.present0[dim]);
         assert!((raw.norms[dim] - 1.0).abs() < 1e-9, "exact tier → 1.0");
 
-        // 70B (HighEnd) on a 4070 (Mid) → one tier off → 0.7.
-        let raw = raw_for(&with_gpu("RTX 4070"), "llama:70b");
+        // 70B (HighEnd) on a 12GB card (Mid) → one tier off → 0.7.
+        let raw = raw_for(&with_vram(12_288), "llama:70b");
         assert!((raw.norms[dim] - 0.7).abs() < 1e-9, "one tier off → 0.7");
 
-        // 70B (HighEnd) on a 4060 (Entry) → two tiers off → 0.5.
-        let raw = raw_for(&with_gpu("RTX 4060"), "llama:70b");
+        // 70B (HighEnd) on an 8GB card (Entry) → two tiers off → 0.5.
+        let raw = raw_for(&with_vram(8_188), "llama:70b");
         assert!((raw.norms[dim] - 0.5).abs() < 1e-9, "two tiers off → 0.5");
 
-        // Unknown GPU / unparseable size / no gpu_model → absent.
-        assert!(!raw_for(&with_gpu("Mystery GPU"), "llama:70b").present0[dim]);
-        assert!(!raw_for(&with_gpu("RTX 5090"), "gpt-4").present0[dim]);
+        // No VRAM known / unparseable model size → absent.
+        assert!(!raw_for(&with_vram(32_768), "gpt-4").present0[dim]);
         assert!(!raw_for(&make_state("b", 50, true), "llama:70b").present0[dim]);
     }
 
@@ -2467,8 +2453,8 @@ mod tests {
         let mut small = make_state("zeta", 50, true);
         big.models = vec!["m:7b".to_string()];
         small.models = vec!["m:7b".to_string()];
-        big.gpu_model = Some("RTX 5090".to_string()); // HighEnd
-        small.gpu_model = Some("RTX 4060".to_string()); // Entry
+        big.vram_total_mb = Some(32_768); // 32GB → HighEnd
+        small.vram_total_mb = Some(8_188); // 8GB → Entry
 
         let mut cfg = ScoredConfig::default();
         cfg.weights.gpu_class_affinity = 100.0;

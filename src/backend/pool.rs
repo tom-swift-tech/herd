@@ -33,10 +33,6 @@ pub struct BackendState {
     pub vram_free_mb: Option<u64>,
     /// Max concurrent requests the backend will accept. None — no source field yet (future phase).
     pub max_concurrent: Option<u32>,
-    /// GPU model string from agent telemetry (e.g. "NVIDIA GeForce RTX 5090").
-    /// Feeds the scored router's `gpu_class_affinity` dimension (dim 22). None for
-    /// static/enrolled backends or agents that don't report a GPU → dim absent.
-    pub gpu_model: Option<String>,
     /// Per-model last-served wall-clock instant (model name → when this backend
     /// last successfully served or warmed it). Feeds the scored router's
     /// `warm_model_recency` dimension (dim 23). Empty until the warmer or a
@@ -103,7 +99,6 @@ impl BackendPool {
                 ttft_p50_ms: None,
                 vram_free_mb: None,
                 max_concurrent: None,
-                gpu_model: None,
                 last_served: BTreeMap::new(),
             })
             .collect();
@@ -353,7 +348,6 @@ impl BackendPool {
         ttft_p50_ms: Option<u32>,
         vram_free_mb: u64,
         max_concurrent: Option<u32>,
-        gpu_model: Option<String>,
     ) {
         let mut backends = self.backends.write().await;
         if let Some(backend) = backends.iter_mut().find(|b| b.config.name == name) {
@@ -361,7 +355,6 @@ impl BackendPool {
             backend.ttft_p50_ms = ttft_p50_ms;
             backend.vram_free_mb = Some(vram_free_mb);
             backend.max_concurrent = max_concurrent;
-            backend.gpu_model = gpu_model;
         }
     }
 
@@ -382,7 +375,6 @@ impl BackendPool {
             ttft_p50_ms: None,
             vram_free_mb: None,
             max_concurrent: None,
-            gpu_model: None,
             last_served: BTreeMap::new(),
         });
     }
